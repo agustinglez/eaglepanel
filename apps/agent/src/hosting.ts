@@ -4,6 +4,7 @@ import { installDeployKey } from "./apps";
 import { activateRelease, appLogs, appStatus, controlApp, deployKey, fetchRepo, prepareApp, pruneReleases, releaseDir, removeApp, runBuild, saveRelease, unpackRelease, writeEnv } from "./apps";
 import { CLOUDFLARE_ORIGIN_PULL_CA } from "./cloudflare-ca";
 import { runFiles } from "./files-runner";
+import { olsSynced, withOlsLock } from "./htaccess-watcher";
 import { createExport, deleteExport } from "./exports";
 import { backupAccount, forgetOld, initRepository, listSnapshots, purgeAccount, readManifest, restoreDatabase, restoreFiles } from "./backups";
 import { sandboxBackupAccount, sandboxCheck, sandboxManifest, sandboxPurge, sandboxSnapshots } from "./backups-sandbox";
@@ -160,6 +161,64 @@ async function withSql<T>(host: Host, work: (sql: SqlClient) => Promise<T>): Pro
   } finally {
     await sql.close();
   }
+}
+
+async function syncOls({ sites, restart, hooks = null }: AgentOpParams<"ols.sync">, host: Host): Promise<AgentOpResult<"ols.sync">> {
+  const current = (await host.readFile(HTTPD_CONFIG)) ?? "";
+  const next = applyBlock(current, sites, hooks);
+  // Its vhost.conf can change without the block changing: the certificate, for example.
+  const hooksConf = hooks ? renderHooksVhost(hooks) : null;
+  const hooksChanged = hooksConf !== null && (await host.readFile(`${hooksVhostDir()}/vhost.conf`)) !== hooksConf;
+  if (next === current && !restart && !hooksChanged) return { changed: false };
+
+  // Also before validating. Without a hooks domain the directory is deleted at the end, once OLS no longer uses it.
+  if (hooksConf) {
+    await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", "/var/log/eaglepanel"]);
+    await makeDir(host, HOOKS_LOG_DIR, "root", "nogroup", "750");
+    await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "711", "/srv/eaglepanel"]);
+    await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", SUSPENDED_DOC_ROOT]);
+    await host.writeFileAtomic(`${hooksVhostDir()}/vhost.conf`, hooksConf, 0o640);
+    await must(host, "chown", ["-R", `--reference=${LSWS}/conf/vhosts`, hooksVhostDir()]);
+    await must(host, "chmod", ["750", hooksVhostDir()]);
+  }
+
+  // Before validating: `openlitespeed -t` would reject a configuration pointing to a missing file.
+  if (sites.some((site) => site.originPull)) {
+    await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "700", CERTS_DIR]);
+    await host.writeFileAtomic(ORIGIN_PULL_CA_PATH, CLOUDFLARE_ORIGIN_PULL_CA, 0o600);
+  }
+
+  await host.writeFileAtomic(HTTPD_CONFIG, next, 0o640);
+  await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
+
+  const test = await host.run(`${LSWS}/bin/openlitespeed`, ["-t"]);
+  const error = firstConfigError(`${test.stdout}\n${test.stderr}`);
+  if (error) {
+    await host.writeFileAtomic(HTTPD_CONFIG, current, 0o640);
+    await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
+    throw new Error(`OLS rejected the configuration and the previous one was restored: ${error}`);
+  }
+
+  const removed = removedListeners(current, next);
+  if (removed.length === 0) {
+    await must(host, `${LSWS}/bin/lswsctrl`, ["restart"]);
+    if (!hooks) await must(host, "rm", ["-rf", "--", hooksVhostDir()]);
+    return { changed: true };
+  }
+
+  try {
+    await stopOlsFully(host);
+    await must(host, "systemctl", ["start", OLS_UNIT]);
+    await assertNotListening(host, removed);
+  } catch (error) {
+    await host.writeFileAtomic(HTTPD_CONFIG, current, 0o640);
+    await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
+    // If it did get stopped, the sites cannot stay down. If it is still running, this does nothing.
+    await host.run("systemctl", ["start", OLS_UNIT]);
+    throw error;
+  }
+  if (!hooks) await must(host, "rm", ["-rf", "--", hooksVhostDir()]);
+  return { changed: true };
 }
 
 export const hostingHandlers: HostingHandlers = {
@@ -517,62 +576,11 @@ export const hostingHandlers: HostingHandlers = {
     return { lines: result.stdout.slice(-MAX_LOG_BYTES).split("\n").filter(Boolean) };
   },
 
-  "ols.sync": async ({ sites, restart, hooks = null }, host) => {
-    const current = (await host.readFile(HTTPD_CONFIG)) ?? "";
-    const next = applyBlock(current, sites, hooks);
-    // Its vhost.conf can change without the block changing: the certificate, for example.
-    const hooksConf = hooks ? renderHooksVhost(hooks) : null;
-    const hooksChanged = hooksConf !== null && (await host.readFile(`${hooksVhostDir()}/vhost.conf`)) !== hooksConf;
-    if (next === current && !restart && !hooksChanged) return { changed: false };
-
-    // Also before validating. Without a hooks domain the directory is deleted at the end, once OLS no longer uses it.
-    if (hooksConf) {
-      await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", "/var/log/eaglepanel"]);
-      await makeDir(host, HOOKS_LOG_DIR, "root", "nogroup", "750");
-      await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "711", "/srv/eaglepanel"]);
-      await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", SUSPENDED_DOC_ROOT]);
-      await host.writeFileAtomic(`${hooksVhostDir()}/vhost.conf`, hooksConf, 0o640);
-      await must(host, "chown", ["-R", `--reference=${LSWS}/conf/vhosts`, hooksVhostDir()]);
-      await must(host, "chmod", ["750", hooksVhostDir()]);
-    }
-
-    // Before validating: `openlitespeed -t` would reject a configuration pointing to a missing file.
-    if (sites.some((site) => site.originPull)) {
-      await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "700", CERTS_DIR]);
-      await host.writeFileAtomic(ORIGIN_PULL_CA_PATH, CLOUDFLARE_ORIGIN_PULL_CA, 0o600);
-    }
-
-    await host.writeFileAtomic(HTTPD_CONFIG, next, 0o640);
-    await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
-
-    const test = await host.run(`${LSWS}/bin/openlitespeed`, ["-t"]);
-    const error = firstConfigError(`${test.stdout}\n${test.stderr}`);
-    if (error) {
-      await host.writeFileAtomic(HTTPD_CONFIG, current, 0o640);
-      await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
-      throw new Error(`OLS rejected the configuration and the previous one was restored: ${error}`);
-    }
-
-    const removed = removedListeners(current, next);
-    if (removed.length === 0) {
-      await must(host, `${LSWS}/bin/lswsctrl`, ["restart"]);
-      if (!hooks) await must(host, "rm", ["-rf", "--", hooksVhostDir()]);
-      return { changed: true };
-    }
-
-    try {
-      await stopOlsFully(host);
-      await must(host, "systemctl", ["start", OLS_UNIT]);
-      await assertNotListening(host, removed);
-    } catch (error) {
-      await host.writeFileAtomic(HTTPD_CONFIG, current, 0o640);
-      await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
-      // If it did get stopped, the sites cannot stay down. If it is still running, this does nothing.
-      await host.run("systemctl", ["start", OLS_UNIT]);
-      throw error;
-    }
-    if (!hooks) await must(host, "rm", ["-rf", "--", hooksVhostDir()]);
-    return { changed: true };
+  "ols.sync": async (params, host) => {
+    const result = await withOlsLock(() => syncOls(params, host));
+    // Restarting OLS also reloads every .htaccess, and a site may now read them or not.
+    olsSynced(result.changed);
+    return result;
   },
 
   "cert.write": async ({ zone, certPem, keyPem }, host) => {

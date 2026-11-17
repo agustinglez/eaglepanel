@@ -1,5 +1,6 @@
 import { chmodSync, chownSync, rmSync } from "node:fs";
 import { SandboxHost, SystemHost } from "./host";
+import { startHtaccessWatcher } from "./htaccess-watcher";
 import { MAX_REQUEST_BYTES, handle } from "./server";
 
 if (process.env.EAGLEPANEL_SANDBOX === "1") {
@@ -24,4 +25,5 @@ if (process.env.EAGLEPANEL_SANDBOX === "1") {
   chownSync(socketPath, 0, socketGid);
   chmodSync(socketPath, 0o660);
   console.log(`[agent] listening on ${socketPath}`);
+  startHtaccessWatcher(host);
 }

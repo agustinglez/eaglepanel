@@ -52,6 +52,8 @@ LITESPEED_KEYS=(
 )
 MYSQL_KEY="https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 BCA43417C3B485DD128EC6D4B7B3B788A8D3785C"
 PHP_VERSION=85
+# inotify watches for the .htaccess watcher: one per folder of the sites that read .htaccess.
+INOTIFY_WATCHES=524288
 
 # ---------------------------------------------------------------------------- Paths
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -285,8 +287,13 @@ ufw_would_close() {
   command -v ufw >/dev/null && status="$(ufw status 2>/dev/null | grep -w ALLOW || true)"
   # Bound UDP sockets in the ephemeral range are clients (DNS, a VPN, cloudflared), not services: replies get through.
   read -r low high </proc/sys/net/ipv4/ip_local_port_range
-  for entry in $(ss -H -tuln | awk '{ split($5, a, ":"); port = a[length(a)]; addr = substr($5, 1, length($5) - length(port) - 1) }
-      addr !~ /^(127\.|\[::1\]|::1)/ && port !~ /^(80|443|21)$/ { print port "/" $1 }' | sort -u); do
+  # Addresses on the loopback interface are unreachable from the network, and ufw always accepts traffic on lo: WSL
+  # puts its DNS proxy on 10.255.255.254.
+  local loopback
+  loopback=" $(ip -o addr show dev lo 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }' | paste -sd' ' -) "
+  for entry in $(ss -H -tuln | awk -v lo="$loopback" '{ split($5, a, ":"); port = a[length(a)]; addr = substr($5, 1, length($5) - length(port) - 1)
+      bare = addr; gsub(/^\[|\]$/, "", bare); sub(/%.*/, "", bare) }
+      addr !~ /^(127\.|\[::1\]|::1)/ && addr !~ /%lo$/ && !index(lo, " " bare " ") && port !~ /^(80|443|21)$/ { print port "/" $1 }' | sort -u); do
     port="${entry%/*}" proto="${entry#*/}"
     [[ "$port" =~ ^[0-9]+$ ]] || continue
     [ "$port" -ge "$PASV_MIN" ] && [ "$port" -le "$PASV_MAX" ] && continue
@@ -670,7 +677,8 @@ installation_plan() {
 base_packages() {
   step "Base packages"
   apt_get update -q
-  apt_install ca-certificates curl gnupg openssl quota zip unzip bzip2 util-linux nftables git ufw iproute2
+  # inotify-tools: the agent watches the .htaccess files with inotifywait.
+  apt_install ca-certificates curl gnupg openssl quota zip unzip bzip2 util-linux nftables git ufw iproute2 inotify-tools
   apt_install db-util 2>/dev/null || apt_install db5.3-util
 }
 
@@ -696,6 +704,9 @@ system_hardening() {
   fstype="$(findmnt -no FSTYPE /)"
   [ "$fstype" = "ext4" ] || die "/ is $fstype: the installer quotas are for ext4"
   if ! findmnt -no OPTIONS / | grep -q usrquota; then
+    # WSL and some containers mount / without an fstab line: there is nothing to add the options to.
+    awk '$2 == "/" && $1 !~ /^#/' /etc/fstab | grep -q . ||
+      die "/etc/fstab has no line for /, so quotas cannot be enabled for good. Add one, or for a test system: mount -o remount,usrquota,grpquota /"
     backup /etc/fstab
     awk '$2 == "/" && $1 !~ /^#/ && $4 !~ /usrquota/ { $4 = $4 ",usrquota,grpquota" } { print }' /etc/fstab >/etc/fstab.eaglepanel
     findmnt --verify --tab-file /etc/fstab.eaglepanel >/dev/null 2>&1 || { rm -f /etc/fstab.eaglepanel; die "the / line in fstab could not be adjusted automatically"; }
@@ -807,6 +818,16 @@ EOF
   fi
   systemctl is-active --quiet lshttpd || die "OpenLiteSpeed did not start"
   ok "OpenLiteSpeed running"
+
+  step "OpenLiteSpeed: .htaccess changes"
+  # OLS keeps each .htaccess until it restarts: the agent watches every folder of the sites that read them, and
+  # restarts it gracefully when one changes. Each folder is one inotify watch; the kernel default depends on the RAM
+  # (about 20000 with 2 GB) and WordPress sites have thousands of folders. A watch only uses memory while it exists.
+  if [ "$(cat /proc/sys/fs/inotify/max_user_watches)" -lt "$INOTIFY_WATCHES" ]; then
+    printf 'fs.inotify.max_user_watches=%s\n' "$INOTIFY_WATCHES" | write_file /etc/sysctl.d/90-eaglepanel-inotify.conf 644 || true
+    sysctl -q -w "fs.inotify.max_user_watches=$INOTIFY_WATCHES"
+  fi
+  ok "up to $(cat /proc/sys/fs/inotify/max_user_watches) watched folders"
 }
 
 cloudflare_ips() {
@@ -1631,6 +1652,7 @@ verify() {
   mysql --protocol=socket -uroot -N -e 'SELECT 1' >/dev/null 2>&1 && ok "MySQL responds" || bad "MySQL does not respond"
   [ "$(systemctl show mysql.service -p RuntimeDirectoryPreserve --value)" = "yes" ] && ok "MySQL keeps its socket directory (apps)" || bad "MySQL deletes /run/mysqld when it stops: apps would lose the socket"
   systemctl is-active --quiet vsftpd && ok "vsftpd running" || bad "vsftpd stopped"
+  command -v inotifywait >/dev/null && ok "inotifywait (.htaccess changes)" || bad "inotifywait is missing: .htaccess changes need a manual OLS restart"
   command -v restic >/dev/null && ok "restic $(restic version | awk '{ print $2 }')" || bad "restic is missing"
   ufw status | grep -q "Status: active" && ok "ufw enabled" || bad "ufw disabled"
   local ping='{"op":"system.ping","params":{}}'

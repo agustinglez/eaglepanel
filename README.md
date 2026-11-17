@@ -60,7 +60,7 @@ The server where EaglePanel is installed:
 ## Features
 
 - **Accounts** with disk quotas, suspension (sites answer 503, services stop, FTP and MySQL are blocked, nothing is deleted) and per-account limits.
-- **Environments**: PHP sites and subdomains with their own PHP version and options, logs and `.htaccess`.
+- **Environments**: PHP sites and subdomains with their own PHP version and options, logs and `.htaccess` (picked up a few seconds after it changes, without restarting by hand).
 - **App deployments** from Git in Podman containers: static sites or server apps, push-to-deploy webhooks, release history and one-click rollback.
 - **Certificates**: Cloudflare Origin CA, with optional Authenticated Origin Pulls.
 - **FTP** (FTPS) per account.
