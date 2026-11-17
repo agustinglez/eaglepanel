@@ -514,7 +514,7 @@ force_local_data_ssl=YES
 allow_anon_ssl=NO
 rsa_cert_file=$FTP_CERT
 rsa_private_key_file=$FTP_CERT
-seccomp_sandbox=YES
+seccomp_sandbox=NO
 xferlog_enable=YES
 EOF
 }
@@ -925,6 +925,10 @@ ftp_server() {
   # Self-signed on purpose: FTP does not go through Cloudflare; the certificate encrypts, it does not identify a domain.
   # No ssl_tlsv1_2: the Ubuntu 26.04 vsftpd does not recognize it and does not start (measured). The TLS 1.2 minimum is
   # already set by OpenSSL in these versions.
+  # seccomp_sandbox=NO: its filter is older than the kernel and glibc of these distributions and kills the session
+  # with SIGSYS on alarm() (after login) and utimensat() (the MFMT that FileZilla sends after each upload). The child
+  # dies inside the TLS session, vsftpd answers "500 OOPS" in plain text and the client sees "bad record type"
+  # (measured on Ubuntu 26.04, kernel 7.0). Chroot and privilege separation still apply.
   [ -f "$FTP_CERT" ] || (umask 077; openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -subj "/CN=$PUBLIC_IP" -keyout "$FTP_CERT" -out "$FTP_CERT" 2>/dev/null)
   local changed=0
   write_file /etc/pam.d/eaglepanel-ftp 644 <<EOF && changed=1
