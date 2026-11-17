@@ -1,0 +1,33 @@
+[Unit]
+Description=EaglePanel API and web
+After=network.target eaglepanel-agent.service
+Wants=eaglepanel-agent.service
+
+[Service]
+User=eaglepanel
+Group=eaglepanel
+WorkingDirectory=/opt/eaglepanel
+Environment=EAGLEPANEL_DB=/var/lib/eaglepanel/eaglepanel.db
+Environment=AGENT_SOCKET=/run/eaglepanel/agent.sock
+Environment=API_PORT=8090
+# Where the administrator connects (IP, port and certificate): written by the installer or `eagle net`.
+EnvironmentFile=-/etc/eaglepanel/panel.env
+# Optional: where to check for new versions (EAGLEPANEL_UPDATE_REPO=owner/repo or EAGLEPANEL_UPDATE_URL=https://...).
+EnvironmentFile=-/etc/eaglepanel/update.env
+Environment=BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
+ExecStart=/usr/local/bin/bun apps/api/src/index.ts
+StateDirectory=eaglepanel
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

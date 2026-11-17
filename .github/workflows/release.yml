@@ -1,0 +1,53 @@
+name: Release
+
+# To publish: set "version" in package.json (SemVer), commit, then tag it: git tag v0.2.0 && git push origin v0.2.0
+# A version with a hyphen (v1.0.0-rc.1) is published as a pre-release: installations do not see it as an update.
+# Installations check the latest release (apps/api/src/updates.ts) and compare it with their VERSION file.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release
+  id-token: write # sign the attestation
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4 # the same Bun the installer puts on servers
+      - run: bun install --frozen-lockfile
+
+      - name: Build the package (tests, typecheck and build run first)
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          expected="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' package.json)"
+          [ "$version" = "$expected" ] || { echo "::error::Tag $GITHUB_REF_NAME does not match package.json ($expected)"; exit 1; }
+          echo "VERSION=$version" >>"$GITHUB_ENV"
+          EAGLEPANEL_VERSION="$version" bash deploy/package.sh
+
+      - name: Attest the package provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist-deploy/eaglepanel-${{ env.VERSION }}.tar.gz
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist-deploy
+          sha256sum -c "eaglepanel-$VERSION.tar.gz.sha256"
+          # Also under a fixed name, so releases/latest/download/eaglepanel.tar.gz always points to the newest one.
+          cp "eaglepanel-$VERSION.tar.gz" eaglepanel.tar.gz
+          sha256sum eaglepanel.tar.gz >eaglepanel.tar.gz.sha256
+          # The one-line installer: curl -fsSL .../releases/latest/download/get.sh | sudo bash -s -- [options]
+          cp ../deploy/get.sh get.sh
+          prerelease=()
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" "eaglepanel-$VERSION.tar.gz" "eaglepanel-$VERSION.tar.gz.sha256" \
+            eaglepanel.tar.gz eaglepanel.tar.gz.sha256 get.sh \
+            --repo "$GITHUB_REPOSITORY" --title "EaglePanel $VERSION" --generate-notes --verify-tag "${prerelease[@]}"

@@ -1,0 +1,22 @@
+[Unit]
+Description=EaglePanel agent (privileged operations)
+After=network.target
+
+[Service]
+# Runs as root because it manages users, quotas and OLS. It only listens on a Unix socket.
+User=root
+Group=eaglepanel
+WorkingDirectory=/opt/eaglepanel/apps/agent
+EnvironmentFile=/etc/eaglepanel/agent.env
+Environment=AGENT_SOCKET=/run/eaglepanel/agent.sock
+Environment=BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
+ExecStart=/usr/local/bin/bun src/index.ts
+RuntimeDirectory=eaglepanel
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=3
+# If the agent starts OLS, restarting the agent must not kill OLS.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,238 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <img src="docs/logo-light.svg" width="360" alt="EaglePanel">
+  </picture>
+</p>
+
+<p align="center"><strong>Your servers, sites and deploys. Seen from above.</strong></p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: AGPL-3.0-or-later" src="https://img.shields.io/badge/license-AGPL--3.0--or--later-6331FB"></a>
+  <a href="#supported-systems"><img alt="Supported OS: Linux" src="https://img.shields.io/badge/supported%20OS-Linux-1B1B33"></a>
+  <img alt="Built with Bun" src="https://img.shields.io/badge/built%20with-Bun-1B1B33">
+</p>
+
+# EaglePanel
+
+A lightweight control panel to manage hosting accounts on a single VPS running OpenLiteSpeed.
+
+## Quick install
+
+On a fresh [supported server](#supported-systems):
+
+```bash
+curl -fsSL https://github.com/agustinglez/eaglepanel/releases/latest/download/get.sh | sudo bash -s -- --firewall cloudflare
+```
+
+Use `--firewall open` instead if your sites are not behind Cloudflare. The script downloads the latest release, checks its SHA256 and runs the installer, which shows its plan before changing anything, asks how the panel will be reached and, at the end, prints the panel address and the admin password (only once).
+
+To update, the same line without options (the choices are saved):
+
+```bash
+curl -fsSL https://github.com/agustinglez/eaglepanel/releases/latest/download/get.sh | sudo bash
+```
+
+<details>
+<summary>Without piping a script into bash</summary>
+
+```bash
+curl -fLO https://github.com/agustinglez/eaglepanel/releases/latest/download/eaglepanel.tar.gz
+curl -fLO https://github.com/agustinglez/eaglepanel/releases/latest/download/eaglepanel.tar.gz.sha256
+sha256sum -c eaglepanel.tar.gz.sha256
+tar -xzf eaglepanel.tar.gz && cd eaglepanel
+sudo bash deploy/install.sh --firewall cloudflare
+```
+
+</details>
+
+More options in [Installer options and updates](#installer-options-and-updates).
+
+## Supported systems
+
+The server where EaglePanel is installed:
+
+| OS | Versions | Architectures |
+|---|---|---|
+| Ubuntu | 24.04, 26.04 | amd64, arm64 |
+| Debian | 12, 13 | amd64, arm64 |
+
+## Features
+
+- **Accounts** with disk quotas, suspension (sites answer 503, services stop, FTP and MySQL are blocked, nothing is deleted) and per-account limits.
+- **Environments**: PHP sites and subdomains with their own PHP version and options, logs and `.htaccess`.
+- **App deployments** from Git in Podman containers: static sites or server apps, push-to-deploy webhooks, release history and one-click rollback.
+- **Certificates**: Cloudflare Origin CA, with optional Authenticated Origin Pulls.
+- **FTP** (FTPS) per account.
+- **MySQL** databases with a built-in explorer: tables, structure, rows, SQL console, row editing, table forms, processes, export and import.
+- **Redis and Memcached** per account.
+- **File manager** with uploads.
+- **Encrypted backups** with restic, scheduled daily.
+- **Overview**: CPU and memory history (last hour, day or week), live health of every environment, latest jobs and a real "all systems healthy" status.
+- **Jobs with rollback**: every change runs as a job with steps; if one fails, the previous steps are undone.
+- **Two-factor authentication** (TOTP) for the administrator.
+
+## Security
+
+- The web UI and the API run as an unprivileged user. Only `apps/agent` runs as root, and it only accepts the operations defined in `packages/shared`: it never runs arbitrary commands.
+- The database explorer never runs SQL written in the browser: values go as parameters and table or column names are checked against `information_schema`. The SQL console, row editing and table forms, as well as imports, run as a temporary MySQL user with privileges on that database only (read-only for a suspended account, read-and-delete for one over its limit), objects are reassigned to the database user, and a copy taken first puts the database back if the import fails.
+- The panel is served over HTTPS on the address chosen at install time (private, public or VPN IP), with a strict Content Security Policy: every script, style and font is served by the panel itself.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    admin(["Administrator<br/>(browser)"])
+    visitors(["Site visitors"])
+    github(["GitHub"])
+    cf["Cloudflare<br/>(optional)"]
+
+    subgraph vps["VPS"]
+        direction LR
+        api["<b>apps/api</b><br/>Hono · unprivileged<br/>web UI, auth, jobs"]
+        data[("SQLite<br/>metrics.json")]
+        agent["<b>apps/agent</b><br/>root · only the operations<br/>defined in packages/shared"]
+        ols["OpenLiteSpeed<br/>:80 · :443"]
+        services["MySQL · vsftpd · Podman<br/>Redis · Memcached · restic"]
+    end
+
+    admin -- "HTTPS · private, public or VPN IP" --> api
+    visitors --> cf
+    github -- "push webhook" --> cf
+    cf -- "HTTP / HTTPS" --> ols
+    ols -- "webhooks · 127.0.0.1:8090" --> api
+    api --- data
+    api -- "Unix socket" --> agent
+    api -. "health checks · 127.0.0.1:80" .-> ols
+    agent -- "configures" --> ols
+    agent -- "manages" --> services
+
+    classDef brand fill:#6331FB,stroke:#6331FB,color:#FFFFFF
+    classDef root fill:#1A0B4D,stroke:#6331FB,color:#F1EEFF
+    class api brand
+    class agent root
+```
+
+- `apps/web`: React, Vite and shadcn/ui.
+- `apps/api`: authentication, SQLite (Drizzle), jobs with rollback, the CPU and memory history and the environment health checks.
+- `apps/agent`: the only privileged part. It never runs arbitrary commands.
+- `packages/shared`: validators, the API-agent protocol and translations.
+- `deploy/`: the unified installer (`install.sh`), the one-line installer (`get.sh`), the `eagle` server command, the systemd units and the packaging script (`package.sh`).
+
+The installer asks how the panel will be reached and generates a self-signed certificate. To change it later, on the server: `eagle net` (menu) or `eagle net status`.
+
+### Overview data
+
+- **CPU and memory history**: the API samples the host every 15 s and keeps the history in `/var/lib/eaglepanel/metrics.json`, next to the database: raw samples for the last 24 h and 5-minute averages for the last 7 days. `GET /api/system/metrics?range=1h|24h|7d`.
+- **Environment health**: every environment is checked against OpenLiteSpeed on `127.0.0.1:80` by its name, at most once a minute. An environment is `down` when it does not answer, answers 5xx, or its app failed; `inactive` when its app is stopped or was never deployed. Environments with a certificate answer a redirect to HTTPS there, so the check confirms OLS serves them, not the app behind. `GET /api/environments/health`.
+- **System status**: "All systems healthy" is shown only when the agent answers, no environment is down, CPU and memory are under 90 % and no job failed in the last 24 h.
+
+## Installer options and updates
+
+Release packages are built by GitHub Actions with a signed provenance attestation. To check it with the [GitHub CLI](https://cli.github.com):
+
+```bash
+gh attestation verify eaglepanel.tar.gz --repo agustinglez/eaglepanel
+```
+
+To build the package yourself instead (it runs the tests first; the result is in `dist-deploy/`):
+
+```bash
+bash deploy/package.sh
+```
+
+`--firewall cloudflare` allows ports 80 and 443 from Cloudflare ranges only; `--firewall open`, from any source. The choice is saved.
+
+Before changing anything, the installer shows its plan: what is already on the server and what it will install or change. What already existed (a running MySQL, an active ufw, vsftpd with its own configuration, `/etc/fstab`) is listed with the exact changes. On a first installation with a terminal, each of those is confirmed: apply it, or print the steps to do it by hand and stop without changing anything. The next run detects what was done by hand and leaves it alone. `--yes` applies everything without asking, and so does a run without a terminal. To see the plan only:
+
+```bash
+bash deploy/install.sh --plan --firewall cloudflare
+```
+
+To update, run the installer from a new package. The installer can be run as many times as needed: it only changes what is missing, backs up every file it touches to `/var/backups/eaglepanel-installer` and, if the new panel does not start, rolls back to the previous version and its database. On the first run it shows the admin password once, outside the log (`/var/log/eaglepanel-install.log`).
+
+To check a server without changing anything:
+
+```bash
+bash deploy/install.sh --check
+```
+
+### Update notifications
+
+The panel shows a notice when a newer version is published. Every 6 hours the API compares the installed version (the `VERSION` file that `deploy/package.sh` writes, such as `0.2.0`) with the latest release of this repository. The notice links to the release; to install it, run the [update line](#quick-install).
+
+To check another source on a server, set it in `/etc/eaglepanel/update.env` and run `systemctl restart eaglepanel-api`:
+
+```bash
+EAGLEPANEL_UPDATE_REPO=your-user/eaglepanel
+# or, instead, any HTTPS URL that returns { "version", "url", "notes", "publishedAt" }:
+EAGLEPANEL_UPDATE_URL=https://example.com/eaglepanel/latest.json
+```
+
+### Versions and releases
+
+EaglePanel follows [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PATCH`. While the version is `0.x`, a minor version can include changes that need attention when updating; the release notes say so.
+
+To publish a release, set `version` in `package.json`, commit it and push a tag with the same version. The release workflow checks that both match, runs the tests, builds the package, attests it and publishes it:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+A version with a hyphen (`v1.0.0-rc.1`) is published as a pre-release: installations do not offer it as an update. A package built with `deploy/package.sh` outside a release carries the build time (`0.2.0+202611162215`): it is the same version for update notices, but the installer still updates the panel.
+
+## Languages
+
+All text in the code is in English, the default language. Translations live in `packages/shared/src/i18n`, gettext style: the key is the English text.
+
+- `es/web.ts`: interface texts. In components, use `t("…")` from `react-i18next`.
+- `es/server.ts`: messages sent by the API or the agent (errors, jobs, steps). They always arrive in English and the web UI translates them for display with `serverText(…)`, even when they carry values (`Deploy {{fqdn}}`).
+- `en.ts`: English plural forms only.
+
+Only English is enabled for now. To enable a language, add its code to `ENABLED_LOCALES` in `packages/shared/src/i18n/index.ts`; the user picks it in the interface and the choice is kept in the browser.
+
+## Development
+
+Requires [Bun](https://bun.sh). In sandbox mode, the agent records commands in `apps/agent/.sandbox/commands.log` without running them.
+
+```bash
+bun install
+```
+
+```bash
+cp .env.example .env
+```
+
+Create the admin. The password is read from stdin and must be at least 12 characters long:
+
+```bash
+printf '%s' 'a-long-password' | bun run admin:set -- admin
+```
+
+Start everything (web UI at http://localhost:5173):
+
+```bash
+bun run dev
+```
+
+Checks:
+
+```bash
+bun test
+```
+
+```bash
+bun run typecheck
+```
+
+After changing `apps/api/src/db/schema.ts`, generate the migration from `apps/api`:
+
+```bash
+bun run db:generate
+```
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE) or later. You can use, study, modify and share EaglePanel. If you distribute a modified version, or let others use one over a network (for example, offering it to hosting customers), you must make its source code available to them under the same license.
+
+Fonts: Inter, Exo 2 and JetBrains Mono, under the SIL Open Font License 1.1 (license files next to each font).

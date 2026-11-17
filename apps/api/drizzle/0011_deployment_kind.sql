@@ -1,0 +1,1 @@
+ALTER TABLE `deployments` ADD `kind` text DEFAULT 'server' NOT NULL;

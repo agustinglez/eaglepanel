@@ -1,0 +1,1 @@
+ALTER TABLE `certificates` ADD `origin_pull` integer DEFAULT false NOT NULL;

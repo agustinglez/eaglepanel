@@ -1,0 +1,216 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+/* Inter — UI text, same as the landing page. Self-hosted (the panel CSP blocks external and data: fonts). */
+@font-face {
+    font-family: "Inter";
+    src: url("./assets/fonts/Inter-Light.woff") format("woff");
+    font-weight: 300;
+    font-style: normal;
+    font-display: swap;
+}
+@font-face {
+    font-family: "Inter";
+    src: url("./assets/fonts/Inter-Regular.woff") format("woff");
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+}
+@font-face {
+    font-family: "Inter";
+    src: url("./assets/fonts/Inter-Medium.woff") format("woff");
+    font-weight: 500;
+    font-style: normal;
+    font-display: swap;
+}
+@font-face {
+    font-family: "Inter";
+    src: url("./assets/fonts/Inter-SemiBold.woff") format("woff");
+    font-weight: 600;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* JetBrains Mono — technical values (IPs, metrics, regions), same as the landing page. Self-hosted. */
+@font-face {
+    font-family: "JetBrains Mono";
+    src: url("./assets/fonts/JetBrainsMono-VariableFont_wght.ttf") format("truetype");
+    font-weight: 100 800;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Exo 2 — headings (EaglePanel identity). Self-hosted: the panel CSP blocks external and data: fonts. */
+@font-face {
+    font-family: "Exo 2 Variable";
+    src: url("./assets/fonts/Exo2-VariableFont_wght.ttf") format("truetype");
+    font-weight: 100 900;
+    font-style: normal;
+    font-display: swap;
+}
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --font-heading: 'Exo 2 Variable', sans-serif;
+    --font-sans: 'Inter', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --color-success: var(--success);
+    --color-success-foreground: var(--success-foreground);
+    --color-success-muted: var(--success-muted);
+    --color-warning: var(--warning);
+    --color-warning-muted: var(--warning-muted);
+    --color-info: var(--info);
+    --color-mint: var(--brand-mint);
+    --color-lilac: var(--brand-lilac);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+    /* EaglePanel palette: Onyx · Electric Indigo #6331FB · Tropical Mint #88F9C0 · Lilac #CDBDFF */
+    --background: #F6F5FB;
+    --foreground: #11101F;
+    --card: #FFFFFF;
+    --card-foreground: #11101F;
+    --popover: #FFFFFF;
+    --popover-foreground: #11101F;
+    --primary: #6331FB;
+    --primary-foreground: #FFFFFF;
+    --secondary: #EEECF7;
+    --secondary-foreground: #11101F;
+    --muted: #EEECF7;
+    --muted-foreground: #5E5970;
+    --accent: #EEECF7;
+    --accent-foreground: #11101F;
+    --destructive: #E5394B;
+    --border: #E3E0EC;
+    --input: #E3E0EC;
+    --ring: #6331FB;
+    --chart-1: #6331FB;
+    --chart-2: #9C82F7;
+    --chart-3: #0E8F5A;
+    --chart-4: #8E8AA8;
+    --chart-5: #2F7FD8;
+    --radius: 0.8125rem;
+    --sidebar: #FFFFFF;
+    --sidebar-foreground: #11101F;
+    --sidebar-primary: #6331FB;
+    --sidebar-primary-foreground: #FFFFFF;
+    --sidebar-accent: #EEECF7;
+    --sidebar-accent-foreground: #11101F;
+    --sidebar-border: #E3E0EC;
+    --sidebar-ring: #6331FB;
+    --success: #0E8F5A;
+    --success-foreground: #FFFFFF;
+    --success-muted: #DDF8EC;
+    --warning: #B7791F;
+    --warning-muted: #FDF1DC;
+    --info: #2F7FD8;
+    --brand-mint: #88F9C0;
+    --brand-lilac: #CDBDFF;
+}
+
+.dark {
+    color-scheme: dark;
+    --background: #0B0B1A;
+    --foreground: #F1EEFF;
+    --card: #14142A;
+    --card-foreground: #F1EEFF;
+    --popover: #14142A;
+    --popover-foreground: #F1EEFF;
+    --primary: #6331FB;
+    --primary-foreground: #FFFFFF;
+    --secondary: #1B1B33;
+    --secondary-foreground: #F1EEFF;
+    --muted: #1B1B33;
+    --muted-foreground: #A7A5C2;
+    --accent: #1B1B33;
+    --accent-foreground: #F1EEFF;
+    --destructive: #FF4D5E;
+    --border: #24243D;
+    --input: #2C2C48;
+    --ring: #6331FB;
+    --chart-1: #CDBDFF;
+    --chart-2: #6331FB;
+    --chart-3: #88F9C0;
+    --chart-4: #6B6890;
+    --chart-5: #4DA3FF;
+    --sidebar: #08081A;
+    --sidebar-foreground: #F1EEFF;
+    --sidebar-primary: #6331FB;
+    --sidebar-primary-foreground: #FFFFFF;
+    --sidebar-accent: #1B1B33;
+    --sidebar-accent-foreground: #F1EEFF;
+    --sidebar-border: #24243D;
+    --sidebar-ring: #6331FB;
+    --success: #88F9C0;
+    --success-foreground: #01010D;
+    --success-muted: rgb(136 249 192 / 0.10);
+    --warning: #FFB224;
+    --warning-muted: rgb(255 178 36 / 0.10);
+    --info: #4DA3FF;
+    --brand-mint: #88F9C0;
+    --brand-lilac: #CDBDFF;
+}
+
+/* Diagonal corners — EaglePanel's signature shape (top-left + bottom-right rounded, like the logo bars). */
+@utility rounded-ep-chip { border-radius: 8px 2px 8px 2px; }
+@utility rounded-ep { border-radius: 13px 3px 13px 3px; }
+@utility rounded-ep-card { border-radius: 21px 6px 21px 6px; }
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans antialiased;
+    }
+  /* Text selection in mint, like the landing page. */
+  ::selection {
+    background-color: var(--brand-mint);
+    color: #01010D;
+    }
+  h1, h2, h3 {
+    @apply font-heading;
+    }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@eaglepanel/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --env-file=../../.env --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "db:generate": "bunx drizzle-kit generate",
+    "admin:set": "bun --env-file=../../.env src/cli/set-admin.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@eaglepanel/shared": "workspace:*",
+    "@hono/bun": "^1.0.1",
+    "drizzle-orm": "^0.45.4",
+    "hono": "^4.13.16",
+    "otpauth": "^9.6.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.11"
+  }
+}
