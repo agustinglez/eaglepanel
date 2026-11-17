@@ -27,10 +27,10 @@ curl -fsSL https://github.com/agustinglez/eaglepanel/releases/latest/download/ge
 
 Use `--firewall open` instead if your sites are not behind Cloudflare. The script downloads the latest release, checks its SHA256 and runs the installer, which shows its plan before changing anything, asks how the panel will be reached and, at the end, prints the panel address and the admin password (only once).
 
-To update, the same line without options (the choices are saved):
+To update, on the server (the choices are saved; `eagle upgrade --check` only tells whether there is a newer release):
 
 ```bash
-curl -fsSL https://github.com/agustinglez/eaglepanel/releases/latest/download/get.sh | sudo bash
+sudo eagle upgrade
 ```
 
 <details>
@@ -159,7 +159,7 @@ bash deploy/install.sh --check
 
 ### Update notifications
 
-The panel shows a notice when a newer version is published. Every 6 hours the API compares the installed version (the `VERSION` file that `deploy/package.sh` writes, such as `0.2.0`) with the latest release of this repository. The notice links to the release; to install it, run the [update line](#quick-install).
+The panel shows a notice when a newer version is published. Every 6 hours the API compares the installed version (the `VERSION` file that `deploy/package.sh` writes, such as `0.2.0`) with the latest release of this repository. The notice links to the release; to install it, run `sudo eagle upgrade` on the server. It downloads the release from the same repository, checks its SHA256 and runs its installer. `eagle upgrade --version 0.2.0` installs a specific release, and `--force` reinstalls it or goes back to an older one.
 
 To check another source on a server, set it in `/etc/eaglepanel/update.env` and run `systemctl restart eaglepanel-api`:
 

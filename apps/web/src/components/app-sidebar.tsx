@@ -91,6 +91,9 @@ function UpdateNotice() {
           <p className="mt-0.5 truncate font-mono text-xs text-sidebar-foreground/55">
             {data.current} → {latest}
           </p>
+          <p className="mt-1.5 text-xs text-sidebar-foreground/55">
+            {t("On the server:")} <code className="font-mono text-sidebar-foreground/80">sudo eagle upgrade</code>
+          </p>
         </div>
         <button
           type="button"
