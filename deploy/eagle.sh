@@ -19,6 +19,7 @@ Usage: eagle <command>
   eagle upgrade              install the latest release (the saved choices are kept)
   eagle upgrade --check      only say whether there is a newer release
   eagle upgrade --version V  install that release (--force to reinstall it or go back to an older one)
+  eagle upgrade --full       also run every stack step (only the panel is replaced when the installer did not change)
   eagle version              installed panel version
 
   Option for net: --port PORT
@@ -50,11 +51,12 @@ net() {
 # The latest release of the update repository: the same one the panel checks (apps/api/src/updates.ts, or
 # EAGLEPANEL_UPDATE_REPO in /etc/eaglepanel/update.env). The package is verified against its SHA256 before installing.
 upgrade() {
-  local check_only=0 force=0 target="" repo="" current latest order work
+  local check_only=0 force=0 mode=(--upgrade) target="" repo="" current latest order work
   while [ $# -gt 0 ]; do
     case "$1" in
       --check) check_only=1 ;;
       --force) force=1 ;;
+      --full) mode=() ;;
       --version) target="${2:-}"; shift ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown option for upgrade: $1" >&2; usage; exit 2 ;;
@@ -115,7 +117,8 @@ upgrade() {
   [ "$(cat "$work/eaglepanel/VERSION" 2>/dev/null)" = "$latest" ] || { echo "The package is not version $latest: not installed." >&2; exit 1; }
 
   # Not exec: the trap removes the download when the installer ends. The installer replaces this command too.
-  bash "$work/eaglepanel/deploy/install.sh" </dev/null
+  # --upgrade: when its installer is the one that last completed here, only the panel is replaced.
+  bash "$work/eaglepanel/deploy/install.sh" "${mode[@]}" </dev/null
 }
 
 case "${1:-}" in

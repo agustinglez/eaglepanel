@@ -14,6 +14,9 @@
 #   bash deploy/install.sh --firewall cloudflare|open [--public-ip IP] [--admin USERNAME]
 #   bash deploy/install.sh --plan         shows what would be installed and changed, changes nothing
 #   bash deploy/install.sh --check        checks an installed server, changes nothing
+#   bash deploy/install.sh --upgrade      used by `eagle upgrade`: if this installer is the same one that last
+#                                         completed on the server, only the panel is replaced (seconds); otherwise
+#                                         everything runs, as on any other run
 #
 #   Before changing anything the installer shows its plan. What already exists on the server (MySQL, ufw, vsftpd,
 #   /etc/fstab...) is listed with the exact changes; on a first installation with a terminal each one is confirmed:
@@ -65,6 +68,8 @@ CONF_DIR=/etc/eaglepanel
 SETTINGS="$CONF_DIR/install.conf"
 BACKUPS=/var/backups/eaglepanel-installer
 DB=/var/lib/eaglepanel/eaglepanel.db
+# Hash of the installer that last completed without failures. Same hash: the stack is already as this installer leaves it.
+STACK_HASH_FILE="$CONF_DIR/installer.sha256"
 LOG=/var/log/eaglepanel-install.log
 FTP_DIR="$CONF_DIR/ftp"
 FTP_CERT=/etc/ssl/private/eaglepanel-ftp.pem
@@ -87,6 +92,7 @@ PANEL_IP=""
 PANEL_PORT=""
 NET_ONLY=0
 NET_STATUS=0
+UPGRADE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) CHECK_ONLY=1 ;;
@@ -102,6 +108,8 @@ while [ $# -gt 0 ]; do
     # Used by `eagle net`: panel access only, on an existing installation.
     --net-only) NET_ONLY=1 ;;
     --net-status) NET_STATUS=1 ;;
+    # Used by `eagle upgrade`.
+    --upgrade) UPGRADE=1 ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1 (see --help)"; exit 2 ;;
   esac
@@ -1670,6 +1678,45 @@ verify() {
   fi
 }
 
+# ---------------------------------------------------------------------------- Fast upgrade
+installer_hash() { sha256sum "$HERE/install.sh" | cut -d' ' -f1; }
+save_stack_hash() { install -d -m 755 "$CONF_DIR"; installer_hash >"$STACK_HASH_FILE"; }
+# The stack steps only change something when the installer changes (pinned versions, configurations, packages). An
+# upgrade whose installer is byte-identical to the last one that completed only needs the new panel.
+stack_unchanged() {
+  [ -f "$SETTINGS" ] && [ -d "$APP" ] && [ -f "$STACK_HASH_FILE" ] && [ "$(cat "$STACK_HASH_FILE")" = "$(installer_hash)" ]
+}
+
+upgrade_panel_only() {
+  CURRENT="upgrade"
+  printf 'Installer unchanged since the last run: only the panel is replaced (full run: eagle upgrade --full)
+'
+  FIREWALL="$(setting FIREWALL)"
+  PUBLIC_IP="$(setting PUBLIC_IP)"
+  ADMIN_USER="$(setting ADMIN_USER)"
+  PANEL_ACCESS="$(setting PANEL_ACCESS)"
+  PANEL_ACCESS="${PANEL_ACCESS:-private}"
+  {
+    choose_panel_access 0
+    panel
+  } >>"$LOG"
+  # What follows goes to the screen too: a short check instead of the full verification.
+  CURRENT="checking the panel"
+  local ping='{"op":"system.ping","params":{}}'
+  curl -s -m 5 --unix-socket /run/eaglepanel/agent.sock -H 'content-type: application/json' -d "$ping" http://agent/op 2>/dev/null | grep -q '"sandbox":false' || bad "the agent does not respond"
+  local tries=0
+  until panel_https_ok || [ "$tries" -ge 10 ]; do tries=$((tries + 1)); sleep 1; done
+  panel_https_ok || bad "the panel does not respond over HTTPS at $(url_for "$PANEL_ADDRESS" "$PANEL_PORT")"
+  if [ "$FAILS" -ne 0 ]; then
+    printf '
+FINISHED WITH %s FAILURE(S). Details in %s; full check: sudo bash %s/deploy/install.sh --check
+' "$FAILS" "$LOG" "$APP"
+    exit 1
+  fi
+  printf 'OK    EaglePanel %s running at %s
+' "$(cat "$APP/VERSION")" "$(url_for "$PANEL_URL_HOST" "$PANEL_PORT")"
+}
+
 # ---------------------------------------------------------------------------- Main
 main() {
   if [ "$NET_STATUS" -eq 1 ]; then
@@ -1694,12 +1741,16 @@ main() {
   # fd 3 is the original output: what goes there does not end up in the log.
   exec 3>&1
   exec > >(tee -a "$LOG") 2>&1
-  printf '\n######## EaglePanel: installation %s ########\n' "$STAMP"
+  printf '\n######## EaglePanel: %s %s ########\n' "$([ "$UPGRADE" -eq 1 ] && echo upgrade || echo installation)" "$STAMP"
   # With a terminal, the installer can ask (through /dev/tty: stdin is /dev/null).
   if [ -t 3 ] && { : </dev/tty; } 2>/dev/null; then INTERACTIVE=1; fi
 
   if [ "$NET_ONLY" -eq 1 ]; then
     net_only
+    exit 0
+  fi
+  if [ "$UPGRADE" -eq 1 ] && stack_unchanged; then
+    upgrade_panel_only
     exit 0
   fi
 
@@ -1726,6 +1777,7 @@ main() {
     printf '\nFINISHED WITH %s FAILURE(S): review the items marked above.\n' "$FAILS"
     exit 1
   fi
+  save_stack_hash
   printf '\nDONE.\n'
   panel_access_summary
 }

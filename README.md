@@ -159,7 +159,7 @@ bash deploy/install.sh --check
 
 ### Update notifications
 
-The panel shows a notice when a newer version is published. Every 6 hours the API compares the installed version (the `VERSION` file that `deploy/package.sh` writes, such as `0.2.0`) with the latest release of this repository. The notice links to the release; to install it, run `sudo eagle upgrade` on the server. It downloads the release from the same repository, checks its SHA256 and runs its installer. `eagle upgrade --version 0.2.0` installs a specific release, and `--force` reinstalls it or goes back to an older one.
+The panel shows a notice when a newer version is published. Every 6 hours the API compares the installed version (the `VERSION` file that `deploy/package.sh` writes, such as `0.2.0`) with the latest release of this repository. The notice links to the release; to install it, run `sudo eagle upgrade` on the server. It downloads the release from the same repository, checks its SHA256 and runs its installer. `eagle upgrade --version 0.2.0` installs a specific release, and `--force` reinstalls it or goes back to an older one. When the release's installer is the same one that last completed on the server, only the panel is replaced (a few seconds); when it changed, every step runs as on a first installation. `eagle upgrade --full` always runs every step.
 
 To check another source on a server, set it in `/etc/eaglepanel/update.env` and run `systemctl restart eaglepanel-api`:
 
