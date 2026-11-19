@@ -1,4 +1,4 @@
-import { METRICS_RANGES, type AuditEntryDto, type JobDto, type MeDto, type MetricsRange } from "@eaglepanel/shared";
+import { METRICS_RANGES, systemComponent, systemComponentIdSchema, type AuditEntryDto, type JobCreatedDto, type JobDto, type MeDto, type MetricsRange } from "@eaglepanel/shared";
 import { desc } from "drizzle-orm";
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
@@ -34,6 +34,7 @@ import { registerWebhookRoutes } from "./webhooks";
 import { createEnvironmentHealth } from "./environment-health";
 import { createMetricsMonitor } from "./metrics";
 import { createUpdateChecker, readCurrentVersion, updateSourceFromEnv } from "./updates";
+import { createPackageMonitor } from "./system-packages";
 import type { JobRunner } from "./jobs";
 
 const CSRF_HEADER = "x-eaglepanel";
@@ -249,6 +250,27 @@ export function createApp({ db, agent, jobs, webDist, secureCookie = false, loca
   if (schedule) updates.start();
   api.get("/system/update", (c) => c.json(updates.get()));
   api.post("/system/update/check", async (c) => c.json(await updates.check()));
+
+  // System packages: versions, pending updates and known vulnerabilities. Tests make no outside requests.
+  const packages = createPackageMonitor({ agent });
+  if (schedule) packages.start();
+  api.get("/system/packages", (c) => c.json(packages.get()));
+  api.post("/system/packages/check", async (c) => c.json(await packages.check({ refresh: true, force: true })));
+  api.post("/system/packages/:id/upgrade", (c) => {
+    const id = systemComponentIdSchema.safeParse(c.req.param("id"));
+    const def = id.success ? systemComponent(id.data) : undefined;
+    if (!id.success || !def) return c.json({ error: "Unknown component" }, 404);
+    if (def.packages.length === 0) return c.json({ error: "It is updated with eagle upgrade" }, 400);
+    const { id: jobId, done } = jobs.enqueue({
+      type: "package.upgrade",
+      title: `Update ${def.name}`,
+      steps: [{ name: "Install the update", run: async () => void (await agent.call("packages.upgrade", { id: id.data })) }],
+    });
+    // Whatever the result, the screen shows the versions as they were left.
+    void done.finally(() => packages.check({ refresh: false }));
+    audit(db, "package.upgrade", def.name);
+    return c.json({ jobId } satisfies JobCreatedDto, 202);
+  });
 
   const environmentHealth = createEnvironmentHealth({ db, agent });
   api.get("/environments/health", async (c) => c.json(await environmentHealth.get()));

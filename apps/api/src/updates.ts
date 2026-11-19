@@ -8,8 +8,8 @@ import { join } from "node:path";
  */
 const DEFAULT_UPDATE_REPO = "agustinglez/eaglepanel";
 
-/** Every 6 h, and 1 min after start (the server may still be bringing up its network). */
-const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+/** Every 30 min, and 1 min after start (the server may still be bringing up its network). */
+const CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const FIRST_CHECK_MS = 60 * 1000;
 const TIMEOUT_MS = 10_000;
 const MAX_NOTES = 4000;

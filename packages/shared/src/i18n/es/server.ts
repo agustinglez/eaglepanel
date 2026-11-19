@@ -469,4 +469,10 @@ export const server: Record<string, string> = {
   "The backup has two environments for the same domain": "El backup tiene dos entornos para el mismo dominio",
   "Environment {{id}} is not in the account or in the backup": "El entorno {{id}} no está en la cuenta o en el backup",
   "The backup has domains that do not match its environments": "El backup tiene dominios que no coinciden con sus entornos",
+  "Update {{def_name}}": "Actualizar {{def_name}}",
+  "Install the update": "Instalar la actualización",
+  "Unknown component": "Componente desconocido",
+  "It is updated with eagle upgrade": "Se actualiza con eagle upgrade",
+  "{{id}} is not updated with apt": "{{id}} no se actualiza con apt",
+  "{{def_name}} is not installed": "{{def_name}} no está instalado",
 };

@@ -2,6 +2,7 @@ import { Outlet, useRouterState } from "@tanstack/react-router";
 import type { CSSProperties, ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { AppSidebar } from "@/components/app-sidebar";
+import { UpdatesBanner, UpdatesDialog } from "@/components/updates-notice";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
@@ -22,6 +23,7 @@ function titleFor(pathname: string): string {
   if (pathname.startsWith("/accounts")) return "Accounts";
   if (pathname.startsWith("/jobs")) return "Jobs";
   if (pathname.startsWith("/activity")) return "Activity";
+  if (pathname.startsWith("/updates")) return "Updates";
   if (pathname.startsWith("/settings")) return "Settings";
   return "EaglePanel";
 }
@@ -102,6 +104,8 @@ export function AppShell() {
       <AppSidebar />
       <SidebarInset>
         <SiteHeader />
+        <UpdatesBanner />
+        <UpdatesDialog />
         <div className="flex flex-1 flex-col">
           <div className="@container/main flex flex-1 flex-col gap-2">
             <Outlet />

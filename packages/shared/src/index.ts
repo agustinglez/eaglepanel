@@ -3,4 +3,5 @@ export * from "./protocol";
 export * from "./files";
 export * from "./backups";
 export * from "./dbadmin";
+export * from "./packages";
 export * from "./i18n/index";

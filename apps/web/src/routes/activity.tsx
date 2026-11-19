@@ -23,6 +23,7 @@ const ACTION_LABELS: Record<string, string> = {
   "domain.delete": "Delete subdomain",
   "domain.php": "Change PHP version",
   "certificate.set": "Install certificate",
+  "package.upgrade": "Update package",
 };
 
 export function ActivityPage() {

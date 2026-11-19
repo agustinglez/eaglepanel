@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { hostname, loadavg, platform, release, totalmem, freemem, uptime } from "node:os";
 import type { Host } from "./host";
 import { hostingHandlers } from "./hosting";
+import { packageHandlers } from "./packages";
 
 /** PRETTY_NAME from /etc/os-release, read once: it only changes with a distribution upgrade, which restarts the agent. */
 let osName: string | null | undefined;
@@ -41,6 +42,7 @@ const handlers: Handlers = {
     sandbox: host.sandbox,
   }),
   ...hostingHandlers,
+  ...packageHandlers,
 };
 
 function isOpName(op: string): op is AgentOpName {

@@ -19,4 +19,6 @@ export const en: Record<string, string> = {
   "First {{count}} rows, in {{ms}} ms. Add a LIMIT or a WHERE to see others._other": "First {{count}} rows, in {{ms}} ms. Add a LIMIT or a WHERE to see others.",
   "{{count}} rows in {{ms}} ms._one": "{{count}} row in {{ms}} ms.",
   "{{count}} rows in {{ms}} ms._other": "{{count}} rows in {{ms}} ms.",
+  "{{count}} known vulnerabilities in {{names}}_one": "{{count}} known vulnerability in {{names}}",
+  "{{count}} known vulnerabilities in {{names}}_other": "{{count}} known vulnerabilities in {{names}}",
 };

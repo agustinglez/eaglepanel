@@ -9,6 +9,7 @@ import { DatabaseExplorerPage, validateExplorerSearch } from "@/routes/database-
 import { JobsPage } from "@/routes/jobs";
 import { NewAccountPage } from "@/routes/new-account";
 import { SettingsPage } from "@/routes/settings";
+import { UpdatesPage } from "@/routes/updates";
 import { validateVhostSearch, VhostDetailPage } from "@/routes/vhost-detail";
 
 const rootRoute = createRootRoute({ component: AppShell });
@@ -25,6 +26,7 @@ const routeTree = rootRoute.addChildren([
   createRoute({ getParentRoute: () => rootRoute, path: "/accounts/$username/databases/$database", component: DatabaseExplorerPage, validateSearch: validateExplorerSearch }),
   createRoute({ getParentRoute: () => rootRoute, path: "/jobs", component: JobsPage }),
   createRoute({ getParentRoute: () => rootRoute, path: "/activity", component: ActivityPage }),
+  createRoute({ getParentRoute: () => rootRoute, path: "/updates", component: UpdatesPage }),
   createRoute({ getParentRoute: () => rootRoute, path: "/settings", component: SettingsPage }),
 ]);
 

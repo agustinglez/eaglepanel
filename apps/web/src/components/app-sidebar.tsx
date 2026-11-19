@@ -3,19 +3,17 @@ import { Link, useRouterState } from "@tanstack/react-router";
 import type { AccountDto, JobDto, MeDto } from "@eaglepanel/shared";
 import {
   ActivityIcon,
-  ArrowUpIcon,
-  ArrowUpRightIcon,
   EllipsisVerticalIcon,
   LayoutDashboardIcon,
   ListChecksIcon,
   LogOutIcon,
+  PackageIcon,
   ServerIcon,
   Settings2Icon,
   UserCircleIcon,
   UsersIcon,
-  XIcon,
 } from "lucide-react";
-import { useState, type ComponentProps } from "react";
+import type { ComponentProps } from "react";
 import { useTranslation } from "react-i18next";
 import { LanguageSelect } from "@/components/language-select";
 import { Wordmark } from "@/components/logo";
@@ -42,7 +40,7 @@ import {
 } from "@/components/ui/sidebar";
 import { api } from "@/lib/api";
 import { useSystemInfo } from "@/lib/system-info";
-import { dismissedVersion, dismissVersion, useUpdateStatus } from "@/lib/update-status";
+import { useAttention } from "@/lib/system-packages";
 
 function useIsActive() {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
@@ -67,57 +65,6 @@ function ServerCard() {
           {info.isError ? t("Agent not responding") : info.data ? (info.data.osName ?? `${info.data.platform} ${info.data.release}`) : t("Connecting…")}
         </p>
       </div>
-    </div>
-  );
-}
-
-/** Shown when the configured source has a newer version than the installed one. */
-function UpdateNotice() {
-  const { t } = useTranslation();
-  const status = useUpdateStatus();
-  const [hidden, setHidden] = useState<string | null>(() => dismissedVersion());
-  const data = status.data;
-  if (!data?.updateAvailable || !data.latest || hidden === data.latest) return null;
-  const latest = data.latest;
-
-  return (
-    <div className="mx-3 mb-3 rounded-ep border border-primary/40 bg-primary/10 p-3" role="status">
-      <div className="flex items-start gap-2.5">
-        <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-ep-chip bg-primary text-white">
-          <ArrowUpIcon className="size-3.5" aria-hidden="true" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <p className="text-sm text-sidebar-foreground">{t("Update available")}</p>
-          <p className="mt-0.5 truncate font-mono text-xs text-sidebar-foreground/55">
-            {data.current} → {latest}
-          </p>
-          <p className="mt-1.5 text-xs text-sidebar-foreground/55">
-            {t("On the server:")} <code className="font-mono text-sidebar-foreground/80">sudo eagle upgrade</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          aria-label={t("Hide until the next version")}
-          onClick={() => {
-            dismissVersion(latest);
-            setHidden(latest);
-          }}
-          className="rounded-ep-chip p-0.5 text-sidebar-foreground/45 transition hover:bg-white/5 hover:text-sidebar-foreground"
-        >
-          <XIcon className="size-3.5" aria-hidden="true" />
-        </button>
-      </div>
-      {data.releaseUrl && (
-        <a
-          href={data.releaseUrl}
-          target="_blank"
-          rel="noreferrer noopener"
-          className="mt-3 flex items-center justify-center gap-1.5 rounded-ep bg-primary px-3 py-2 text-xs text-white transition hover:bg-[#5226e0]"
-        >
-          {t("View release")}
-          <ArrowUpRightIcon className="size-3.5" aria-hidden="true" />
-        </a>
-      )}
     </div>
   );
 }
@@ -186,12 +133,14 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => api.get<AccountDto[]>("/accounts") });
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => api.get<JobDto[]>("/jobs") });
   const running = jobs.data?.filter((job) => job.status === "running" || job.status === "pending").length ?? 0;
+  const attention = useAttention();
 
   const nav = [
     { to: "/", title: "Overview", icon: LayoutDashboardIcon, badge: null },
     { to: "/accounts", title: "Accounts", icon: UsersIcon, badge: accounts.data ? pad(accounts.data.length) : null },
     { to: "/jobs", title: "Jobs", icon: ListChecksIcon, badge: running > 0 ? String(running) : null },
     { to: "/activity", title: "Activity", icon: ActivityIcon, badge: null },
+    { to: "/updates", title: "Updates", icon: PackageIcon, badge: attention?.total ? String(attention.total) : null },
   ] as const;
 
   return (
@@ -234,7 +183,6 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
-      <UpdateNotice />
       <SidebarFooter className="px-3 pt-0 pb-4">
         <div className="border-t border-white/10 pt-3">
         <NavUser />
