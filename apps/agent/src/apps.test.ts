@@ -50,9 +50,9 @@ class FakeHost implements Host {
 }
 
 const call = (host: Host, op: string, params: unknown) => dispatch({ op, params }, host);
-const base = { appId: 7, username: "acme", fqdn: "api.example.com" };
+const base = { appId: 7, username: "acme" };
 const activate = { ...base, release: 3, startCommand: "bun run start", memoryMb: 256, healthPath: "/health", sinceMs: 1_793_000_000_000 } as const;
-const BUILD = "/srv/eaglepanel/apps/acme/api.example.com/build";
+const BUILD = "/srv/eaglepanel/apps/acme/7/build";
 
 describe("variables", () => {
   test("format tested on the VPS: double quotes, \\ and \" escaped, real line breaks", () => {
@@ -108,7 +108,7 @@ describe("network and firewall", () => {
   test("prepares root directories, data as the account, firewall and namespace", async () => {
     const host = new FakeHost();
     expect(await call(host, "app.prepare", { ...base, runtime: "bun", runtimeVersion: "1" })).toMatchObject({ ok: true });
-    const data = host.commands.find(({ command, args }) => command === "setpriv" && args.includes("/home/acme/data/api.example.com"));
+    const data = host.commands.find(({ command, args }) => command === "setpriv" && args.includes("/home/acme/data/app-7"));
     expect(data?.args.slice(0, 4)).toEqual(["--reuid=acme", "--regid=acme", "--clear-groups", "mkdir"]);
     // OLS traverses to the static files without being able to list them.
     expect(host.commands.find(({ command, args }) => command === "install" && args.includes("/srv/eaglepanel/apps/acme"))?.args).toEqual(expect.arrayContaining(["711"]));
@@ -251,7 +251,7 @@ describe("build", () => {
     await call(host, "app.build", build);
     const args = podmanArgs(host);
     expect(args.join(" ")).not.toContain("/home/acme/data");
-    expect(args).toContain("--volume=/home/acme/.build/api.example.com:/cache");
+    expect(args).toContain("--volume=/home/acme/.build/app-7:/cache");
     expect(args).toContain("--env=HOME=/cache");
     // With NODE_ENV=production, the development dependencies the build needs are not installed.
     expect(args.some((arg) => arg.includes("NODE_ENV"))).toBe(false);
@@ -292,7 +292,7 @@ describe("build", () => {
 
 describe("versiones", () => {
   const release = { ...base, release: 3, runtime: "bun", runtimeVersion: "1" } as const;
-  const DEST = "/srv/eaglepanel/apps/acme/api.example.com/releases/3";
+  const DEST = "/srv/eaglepanel/apps/acme/7/releases/3";
 
   test("static: copies without following symlinks, without special or dot files, owned by root", async () => {
     const host = new FakeHost();
@@ -361,7 +361,7 @@ describe("start", () => {
     expect(unit).toContain("--uidmap=0:1001:1");
     expect(unit).toContain("--env=PORT=3002");
     expect(unit).toContain("--env=SECRET");
-    expect(unit).toContain("--volume=/home/acme/data/api.example.com:/data");
+    expect(unit).toContain("--volume=/home/acme/data/app-7:/data");
     expect(unit).toContain("localhost/eaglepanel/app-7:3 /bin/sh /eaglepanel/start.sh");
     expect(unit).toContain("EnvironmentFile=-/etc/eaglepanel/apps/7/runtime.env");
     expect(unit).toContain("MemoryMax=256M");
@@ -424,7 +424,7 @@ describe("start", () => {
 });
 
 describe("OLS and cleanup", () => {
-  const site = { username: "acme", fqdn: "api.example.com", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: null, originPull: false, logLevel: "ERROR", logDays: 30, suspended: false, hooks: false } as const;
+  const site = { username: "acme", site: "api", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: null, originPull: false, logLevel: "ERROR", logDays: 30, suspended: false, hooks: false } as const;
 
   test("the environment is a proxy to the app, with WebSocket, logs and certificate", () => {
     const conf = renderVhost({ ...site, certZone: "example.com", originPull: true, app: { kind: "server", id: 7 } });
@@ -447,7 +447,7 @@ describe("OLS and cleanup", () => {
   });
 
   test("static: OLS serves the release, without PHP, with the SPA only for navigations and dot files blocked", () => {
-    const root = "/srv/eaglepanel/apps/acme/api.example.com/releases/3";
+    const root = "/srv/eaglepanel/apps/acme/7/releases/3";
     const conf = renderVhost({ ...site, certZone: "example.com", app: { kind: "static", id: 7, release: 3, spaFallback: true } }, { staticRoot: root, immutableAssets: true });
     expect(conf).toContain(`docRoot                   ${root}`);
     expect(conf).toContain("RewriteCond %{HTTP_ACCEPT} text/html");
@@ -509,9 +509,9 @@ describe("OLS and cleanup", () => {
     host.respond = (command, args) => (args.includes("images") ? { stdout: "localhost/eaglepanel/app-7:3\nlocalhost/eaglepanel/app-7:4\n" } : respond(command, args));
     await call(host, "app.remove", base);
     const removed = host.commands.filter(({ command }) => command === "rm").map(({ args }) => args.at(-1));
-    expect(removed).toEqual(expect.arrayContaining(["/srv/eaglepanel/keys/7", "/srv/eaglepanel/repos/7.git", "/srv/eaglepanel/apps/acme/api.example.com", "/etc/eaglepanel/apps/7"]));
+    expect(removed).toEqual(expect.arrayContaining(["/srv/eaglepanel/keys/7", "/srv/eaglepanel/repos/7.git", "/srv/eaglepanel/apps/acme/7", "/etc/eaglepanel/apps/7"]));
     expect(removed.some((path) => path?.startsWith("/home/"))).toBe(false);
-    const cache = host.commands.find(({ command, args }) => command === "setpriv" && args.includes("/home/acme/.build/api.example.com"));
+    const cache = host.commands.find(({ command, args }) => command === "setpriv" && args.includes("/home/acme/.build/app-7"));
     expect(cache?.args.slice(0, 5)).toEqual(["--reuid=acme", "--regid=acme", "--clear-groups", "rm", "-rf"]);
     expect(host.find("systemctl")?.args).toEqual(["disable", "--now", "eaglepanel-app-7-a.service", "eaglepanel-app-7-b.service", "eaglepanel-build-7.service", "eaglepanel-netns-7.service"]);
     const rmi = host.commands.filter(({ args }) => args.includes("rmi")).map(({ args }) => args.at(-1));
@@ -526,9 +526,9 @@ describe("OLS and cleanup", () => {
       if (args.includes("images")) return { stdout: "2\n4\nlatest\n" };
       return respond(command, args);
     };
-    await call(host, "app.prune", { appId: 7, username: "acme", fqdn: "api.example.com", keep: [3, 4] });
+    await call(host, "app.prune", { appId: 7, username: "acme", keep: [3, 4] });
     const removed = host.commands.filter(({ command }) => command === "rm").map(({ args }) => args.at(-1));
-    expect(removed).toEqual(["/srv/eaglepanel/apps/acme/api.example.com/releases/1", "/srv/eaglepanel/apps/acme/api.example.com/releases/2"]);
+    expect(removed).toEqual(["/srv/eaglepanel/apps/acme/7/releases/1", "/srv/eaglepanel/apps/acme/7/releases/2"]);
     expect(host.commands.filter(({ args }) => args.includes("rmi")).map(({ args }) => args.at(-1))).toEqual(["localhost/eaglepanel/app-7:2"]);
   });
 });

@@ -1,4 +1,4 @@
-import type { AgentOpName, AgentOpParams, AgentOpResult } from "@eaglepanel/shared";
+import { siteDir, type AgentOpName, type AgentOpParams, type AgentOpResult } from "@eaglepanel/shared";
 import { X509Certificate, createPrivateKey } from "node:crypto";
 import { installDeployKey } from "./apps";
 import { activateRelease, appLogs, appStatus, controlApp, deployKey, fetchRepo, prepareApp, pruneReleases, releaseDir, removeApp, runBuild, saveRelease, unpackRelease, writeEnv } from "./apps";
@@ -52,6 +52,9 @@ import {
   setFtpHash,
   setFtpPassword,
   setFtpSuspended,
+  removeSiteFtp,
+  renameSiteFtp,
+  setSiteFtpPassword,
 } from "./services";
 
 /** Marker in GECOS: the agent only deletes or modifies users created by the panel. */
@@ -252,10 +255,9 @@ export const hostingHandlers: HostingHandlers = {
 
     // The nogroup group on the home directory lets OLS in; the account does not belong to that group.
     await makeDir(host, `/home/${username}`, username, "nogroup", "750");
-    await makeDir(host, `/home/${username}/public_html`, username, username, "755");
-    await makeDir(host, `/home/${username}/subdomains`, username, username, "755");
+    // Each environment gets its directory inside sites/ when it is created: an account may start without any.
+    await makeDir(host, `/home/${username}/sites`, username, username, "755");
     await makeDir(host, `/home/${username}/tmp`, username, username, "700");
-    await makeDir(host, `/home/${username}/logs`, username, username, "750");
     await setQuota(host, username, quotaMb);
     return { ok: true };
   },
@@ -288,6 +290,17 @@ export const hostingHandlers: HostingHandlers = {
   "ftp.setPassword": async ({ username, password }, host) => {
     await requireManaged(host, username);
     await setFtpPassword(host, username, password);
+    return { ok: true };
+  },
+
+  "ftp.setSitePassword": async ({ username, site, password }, host) => {
+    await requireManaged(host, username);
+    await setSiteFtpPassword(host, username, site, password);
+    return { ok: true };
+  },
+
+  "ftp.removeSite": async ({ username, site }, host) => {
+    await removeSiteFtp(host, username, site);
     return { ok: true };
   },
 
@@ -350,19 +363,24 @@ export const hostingHandlers: HostingHandlers = {
       throw new Error(`lsphp${site.phpVersion} is not installed`);
     }
 
-    // Directory by directory: `install -d` would leave the intermediate ones owned by root.
-    let path = `/home/${site.username}`;
-    for (const part of site.docRoot.split("/")) {
-      path += `/${part}`;
-      await makeDir(host, path, site.username, site.username, "755");
-    }
+    // An app has no files in the home directory to publish: its code lives in /srv/eaglepanel/apps.
+    if (!site.app) {
+      // Directory by directory: `install -d` would leave the intermediate ones owned by root.
+      let path = `/home/${site.username}`;
+      for (const part of site.docRoot.split("/")) {
+        path += `/${part}`;
+        await makeDir(host, path, site.username, site.username, "755");
+      }
 
-    // Here too: accounts created before the log viewer existed do not have this directory.
-    await makeDir(host, `/home/${site.username}/logs`, site.username, site.username, "750");
+      // Its directory and logs/ always exist, even if docRoot points elsewhere: the PHP log and the FTP access live there.
+      await makeDir(host, `/home/${site.username}/sites`, site.username, site.username, "755");
+      await makeDir(host, `/home/${site.username}/${siteDir(site.site)}`, site.username, site.username, "755");
+      await makeDir(host, `/home/${site.username}/${siteDir(site.site)}/logs`, site.username, site.username, "750");
+    }
     await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", "/var/log/eaglepanel", "/var/log/eaglepanel/vhosts"]);
     // OLS opens its logs as root and hands them to its user. The group lets only that user in.
-    await makeDir(host, vhostLogDir(site.fqdn), "root", "nogroup", "750");
-    await host.writeFileAtomic(logrotatePath(site.fqdn), renderLogrotate(site), 0o644);
+    await makeDir(host, vhostLogDir(site.site), "root", "nogroup", "750");
+    await host.writeFileAtomic(logrotatePath(site.site), renderLogrotate(site), 0o644);
 
     await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", PHP_SYSTEM_INI_DIR]);
     // /srv/eaglepanel at 711: OLS traverses the directory without being able to list the rest.
@@ -370,29 +388,48 @@ export const hostingHandlers: HostingHandlers = {
     await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", SUSPENDED_DOC_ROOT]);
     await host.writeFileAtomic(PHP_SYSTEM_INI, PHP_SYSTEM_INI_CONTENT, 0o644);
     // It belongs to the account: created empty with its permissions and, if it already exists, its content is left alone.
-    await must(host, "setpriv", [`--reuid=${site.username}`, `--regid=${site.username}`, "--clear-groups", "touch", "-a", "--", userIniPath(site.username, site.docRoot)]);
+    if (!site.app) await must(host, "setpriv", [`--reuid=${site.username}`, `--regid=${site.username}`, "--clear-groups", "touch", "-a", "--", userIniPath(site.username, site.docRoot)]);
 
-    const staticRoot = site.app?.kind === "static" && site.app.release !== null ? releaseDir(site.username, site.fqdn, site.app.release) : null;
+    const staticRoot = site.app?.kind === "static" && site.app.release !== null ? releaseDir(site.username, site.app.id, site.app.release) : null;
     if (staticRoot && !host.sandbox && (await host.run("test", ["-d", staticRoot])).code !== 0) {
       throw new Error(`Release ${site.app?.kind === "static" ? site.app.release : ""} is no longer on the server`);
     }
     // OLS rejects a context whose directory does not exist: assets/ is cached only if the release has it.
     const immutableAssets = staticRoot !== null && !host.sandbox && (await host.run("test", ["-d", `${staticRoot}/assets`])).code === 0;
 
-    const dir = vhostDir(site.fqdn);
+    const dir = vhostDir(site.site);
     await host.writeFileAtomic(`${dir}/vhost.conf`, renderVhost(site, { staticRoot, immutableAssets }), 0o640);
     await must(host, "chown", ["-R", `--reference=${LSWS}/conf/vhosts`, dir]);
     await must(host, "chmod", ["750", dir]);
     return { ok: true };
   },
 
-  "site.remove": async ({ fqdn }, host) => {
+  "site.remove": async ({ site: fqdn }, host) => {
     // The site files stay in the home directory: deleting content is a separate decision.
     await must(host, "rm", ["-rf", "--", vhostDir(fqdn)]);
     await must(host, "rm", ["-f", "--", logrotatePath(fqdn)]);
     await must(host, "rm", ["-rf", "--", vhostLogDir(fqdn)]);
     return { ok: true };
   },
+  "site.rename": async ({ username, from, to }, host) => {
+    await requireManaged(host, username);
+    if (from === to) return { ok: true };
+    const home = `/home/${username}`;
+    const exists = async (path: string) => host.sandbox || (await host.run("test", ["-e", path])).code === 0;
+    if (await exists(vhostDir(to)) && !host.sandbox) throw new Error(`An environment named ${to} already exists`);
+    // Its files: an app has none in sites/. `mv -T` fails if the destination exists instead of moving inside it.
+    if (await exists(`${home}/${siteDir(from)}`)) {
+      if (!host.sandbox && (await host.run("test", ["-e", `${home}/${siteDir(to)}`])).code === 0) throw new Error(`${home}/${siteDir(to)} already exists`);
+      await must(host, "mv", ["-T", "--", `${home}/${siteDir(from)}`, `${home}/${siteDir(to)}`]);
+    }
+    if (await exists(vhostLogDir(from))) await must(host, "mv", ["-T", "--", vhostLogDir(from), vhostLogDir(to)]);
+    // site.write creates the new configuration; the old one would keep a vhost and a rotation pointing to nothing.
+    await must(host, "rm", ["-rf", "--", vhostDir(from)]);
+    await must(host, "rm", ["-f", "--", logrotatePath(from)]);
+    await renameSiteFtp(host, username, from, to);
+    return { ok: true };
+  },
+
 
   "app.prepare": async (params, host) => {
     await requireManaged(host, params.username);
@@ -559,7 +596,7 @@ export const hostingHandlers: HostingHandlers = {
     return runFiles(host, username, request);
   },
 
-  "logs.read": async ({ username, fqdn, source, lines }, host) => {
+  "logs.read": async ({ username, site: fqdn, source, lines }, host) => {
     await requireManaged(host, username);
     const count = String(lines);
     // The PHP log lives in an account directory, where it can put anything. It is read with the account permissions,

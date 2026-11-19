@@ -1,4 +1,5 @@
 import { DEFAULT_LIMITS, type AgentOpName, type BackupRunDto, type BackupSettingsDto, type JobDto } from "@eaglepanel/shared";
+import type { AccountDto as AccountDtoForVid } from "@eaglepanel/shared";
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +9,7 @@ import { SandboxHost } from "../../agent/src/host";
 import { HTTPD_CONFIG } from "../../agent/src/ols";
 import type { AgentClient } from "./agent-client";
 import { createApp } from "./app";
+import { createSiteAccount, addEnvironment } from "./test-support";
 import { hashPassword, setAdminCredentials } from "./auth";
 import { createBackups, runIdOf } from "./backups";
 import { openDb, type Db } from "./db";
@@ -37,6 +39,17 @@ const agent: AgentClient = {
     return response.result;
   }) as AgentClient["call"],
 };
+
+
+/** The API names an environment by its id: the one that answers for that hostname. */
+async function vid(hostname: string): Promise<number> {
+  const response = await app.request("/api/accounts", { headers: { cookie } });
+  for (const item of (await response.json()) as AccountDtoForVid[]) {
+    const found = item.vhosts.find((vhost) => vhost.hostname === hostname);
+    if (found) return found.id;
+  }
+  throw new Error(`No environment answers for ${hostname}`);
+}
 
 const post = (path: string, body: unknown = {}) => app.request(`/api${path}`, { method: "POST", headers: { "content-type": "application/json", "x-eaglepanel": "1", cookie }, body: JSON.stringify(body) });
 const get = (path: string) => app.request(`/api${path}`, { headers: { cookie } });
@@ -72,7 +85,7 @@ beforeEach(async () => {
   await host.writeFileAtomic(HTTPD_CONFIG, "serverName test\n");
   const login = await app.request("/api/auth/login", { method: "POST", headers: { "content-type": "application/json", "x-eaglepanel": "1" }, body: JSON.stringify({ username: "admin", password: PASSWORD }) });
   cookie = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
-  expect((await runJob("/accounts", { username: "acme", domain: "example.com", phpVersion: "85", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
+  expect((await createSiteAccount(runJob, { username: "acme", domain: "example.com", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
   expect((await runJob("/accounts/acme/databases", { name: "tienda" })).status).toBe("succeeded");
 });
 
@@ -132,7 +145,7 @@ describe("backups", () => {
   });
 
   test("a failing account does not stop the others, and the job is marked", async () => {
-    expect((await runJob("/accounts", { username: "otra", domain: "otra.com", phpVersion: "85", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
+    expect((await createSiteAccount(runJob, { username: "otra", domain: "otra.com", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
     const original = agent.call;
     agent.call = (async (op: AgentOpName, params: Record<string, unknown>) => {
       if (op === "backup.account" && params.username === "acme") throw new Error("connection lost");
@@ -150,7 +163,7 @@ describe("backups", () => {
 
   test("restores files and databases only from backups of the same account", async () => {
     await runJob("/backups/run");
-    expect((await runJob("/accounts", { username: "otra", domain: "otra.com", phpVersion: "85", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
+    expect((await createSiteAccount(runJob, { username: "otra", domain: "otra.com", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
     const [run] = (await (await get("/accounts/acme/backups")).json()) as BackupRunDto[];
     expect((await runJob("/accounts/acme/backups/restore-files", { snapshot: run!.files, path: "public_html", mode: "folder" })).status).toBe("succeeded");
     expect((await runJob("/accounts/acme/backups/restore-database", { snapshot: run!.databases[0]!.snapshot, database: "acme_tienda" })).status).toBe("succeeded");
@@ -205,7 +218,7 @@ describe("etapa 2", () => {
   });
 
   test("does not back up suspended accounts", async () => {
-    expect((await runJob("/accounts", { username: "otra", domain: "otra.com", phpVersion: "85", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
+    expect((await createSiteAccount(runJob, { username: "otra", domain: "otra.com", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
     expect((await runJob("/accounts/otra/suspend", { suspended: true })).status).toBe("succeeded");
     calls = [];
     expect((await runJob("/backups/run")).status).toBe("succeeded");
@@ -221,7 +234,7 @@ describe("etapa 2", () => {
     expect(calls.some(({ op, params }) => op === "backup.purge" && params.username === "acme")).toBe(true);
     expect((await (await get("/settings/backups")).json() as BackupSettingsDto).pendingPurges).toEqual([]);
 
-    expect((await runJob("/accounts", { username: "acme", domain: "example.com", phpVersion: "85", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
+    expect((await createSiteAccount(runJob, { username: "acme", domain: "example.com", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
     expect(((await (await get("/accounts/acme/backups")).json()) as BackupRunDto[])).toHaveLength(0);
     await runJob("/accounts/acme/backups/run");
     expect(((await (await get("/accounts/acme/backups")).json()) as BackupRunDto[])).toHaveLength(1);
@@ -260,26 +273,27 @@ describe("etapa 2", () => {
   });
 
   test("restores environment options and app variables, and does not mix accounts", async () => {
-    expect((await runJob("/accounts/acme/vhosts", { fqdn: "web.example.com", domain: "example.com", phpVersion: "85" })).status).toBe("succeeded");
+    expect((await addEnvironment(runJob, "acme", "web.example.com")).status).toBe("succeeded");
     const app = { kind: "static", repoUrl: "https://github.com/acme/front.git", branch: "main", subdir: "", runtime: "bun", runtimeVersion: "1", buildCommand: "bun run build", startCommand: "", outputDir: "dist", spaFallback: true, healthPath: "/", memoryMb: 0 };
-    expect((await runJob("/vhosts/web.example.com/app", app)).status).toBe("succeeded");
-    expect((await runJob("/vhosts/web.example.com/env", { vars: [{ key: "API_URL", value: "https://api.example.com", scope: "build" }] })).status).toBe("succeeded");
+    expect((await runJob(`/vhosts/${await vid("web.example.com")}/app`, app)).status).toBe("succeeded");
+    expect((await runJob(`/vhosts/${await vid("web.example.com")}/env`, { vars: [{ key: "API_URL", value: "https://api.example.com", scope: "build" }] })).status).toBe("succeeded");
     await runJob("/backups/run");
     const [run] = (await (await get("/accounts/acme/backups")).json()) as BackupRunDto[];
 
-    expect((await runJob("/vhosts/web.example.com/env", { vars: [] })).status).toBe("succeeded");
-    const summary = await (await get(`/accounts/acme/backups/manifest/${run!.manifest}`)).json() as { vhosts: { fqdn: string; envKeys: string[]; app: boolean }[] };
-    expect(summary.vhosts.find(({ fqdn }) => fqdn === "web.example.com")).toMatchObject({ envKeys: ["API_URL"], app: true });
+    expect((await runJob(`/vhosts/${await vid("web.example.com")}/env`, { vars: [] })).status).toBe("succeeded");
+    const web = await vid("web.example.com");
+    const summary = await (await get(`/accounts/acme/backups/manifest/${run!.manifest}`)).json() as { vhosts: { id: number | null; name: string; envKeys: string[]; app: boolean }[] };
+    expect(summary.vhosts.find(({ id }) => id === web)).toMatchObject({ name: "web.example.com", envKeys: ["API_URL"], app: true });
     expect(JSON.stringify(summary)).not.toContain("https://api.example.com");
 
-    const job = await runJob("/accounts/acme/backups/restore-config", { manifest: run!.manifest, fqdns: ["web.example.com"], parts: ["env", "app"] });
+    const job = await runJob("/accounts/acme/backups/restore-config", { manifest: run!.manifest, vhosts: [web], parts: ["env", "app"] });
     expect(job.status).toBe("succeeded");
-    const vhost = (await (await get("/accounts/acme")).json() as { vhosts: { fqdn: string; app: { env: { key: string; value: string; scope: string }[] } | null }[] }).vhosts.find(({ fqdn }) => fqdn === "web.example.com");
+    const vhost = (await (await get("/accounts/acme")).json() as { vhosts: { id: number; app: { env: { key: string; value: string; scope: string }[] } | null }[] }).vhosts.find(({ id }) => id === web);
     expect(vhost?.app?.env).toEqual([{ key: "API_URL", value: "https://api.example.com", scope: "build" }]);
 
-    expect((await runJob("/accounts", { username: "otra", domain: "otra.com", phpVersion: "85", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
+    expect((await createSiteAccount(runJob, { username: "otra", domain: "otra.com", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
     expect((await get(`/accounts/otra/backups/manifest/${run!.manifest}`)).status).toBe(400);
-    expect((await post("/accounts/otra/backups/restore-config", { manifest: run!.manifest, fqdns: ["web.example.com"], parts: ["env"] })).status).toBe(400);
+    expect((await post("/accounts/otra/backups/restore-config", { manifest: run!.manifest, vhosts: [web], parts: ["env"] })).status).toBe(400);
   });
 });
 
@@ -301,7 +315,7 @@ describe("downloadable copy", () => {
     const list = (await (await get("/accounts/acme/exports")).json()) as { id: string }[];
     expect(list).toHaveLength(1);
     expect(list[0]!.id).not.toBe(first!.id);
-    expect((await runJob("/accounts", { username: "otra", domain: "otra.com", phpVersion: "85", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
+    expect((await createSiteAccount(runJob, { username: "otra", domain: "otra.com", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
     expect((await get(`/accounts/otra/exports/${list[0]!.id}/download`)).status).toBe(404);
   });
 

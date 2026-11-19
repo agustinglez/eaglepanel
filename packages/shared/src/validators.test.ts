@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { docRootSchema, fqdnSchema, usernameSchema } from "./validators";
+import { docRootSchema, fqdnSchema, isPublishableDocRoot, usernameSchema } from "./validators";
 
 describe("usernameSchema", () => {
   test.each(["acme", "cliente01", "abc"])("acepta %s", (value) => {
@@ -50,5 +50,15 @@ describe("fqdnSchema", () => {
     "1.2.3.4",
   ])("rechaza %j", (value) => {
     expect(fqdnSchema.safeParse(value).success).toBe(false);
+  });
+});
+
+describe("isPublishableDocRoot", () => {
+  test.each(["sites/example.com/public_html", "sites/example.com/public_html/web", "public_html", "otra"])("publica %s", (value) => {
+    expect(isPublishableDocRoot(value)).toBe(true);
+  });
+
+  test.each(["sites", "sites/example.com", "sites/example.com/logs", "sites/example.com/logs/x", "logs", "tmp", "data/app"])("no publica %s", (value) => {
+    expect(isPublishableDocRoot(value)).toBe(false);
   });
 });

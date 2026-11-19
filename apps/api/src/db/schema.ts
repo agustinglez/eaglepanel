@@ -1,5 +1,5 @@
 import { DEFAULT_LOG_DAYS, DEFAULT_LOG_LEVEL, DEFAULT_PHP_OPTIONS, DEFAULT_SERVICE_MEMORY_MB, type AppKind, type AppRuntime, type AppStatus, type DeploymentStatus, type EnvScope, type JobStatus, type JobStepStatus, type LogLevel, type PhpOptions, type VhostType } from "@eaglepanel/shared";
-import { index, integer, primaryKey, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text, unique, type AnySQLiteColumn } from "drizzle-orm/sqlite-core";
 
 export const admin = sqliteTable("admin", {
   id: integer("id").primaryKey(),
@@ -24,7 +24,7 @@ export const accounts = sqliteTable("accounts", {
   username: text("username").primaryKey(),
   quotaMb: integer("quota_mb").notNull(),
   maxDomains: integer("max_domains").notNull().default(1),
-  /** Excluding the primary environment of each domain. */
+  /** Every environment counts. */
   maxVhosts: integer("max_vhosts").notNull().default(10),
   maxDatabases: integer("max_databases").notNull().default(5),
   dbStorageMb: integer("db_storage_mb").notNull().default(1024),
@@ -36,8 +36,8 @@ export const accounts = sqliteTable("accounts", {
   redisMemoryMb: integer("redis_memory_mb").notNull().default(DEFAULT_SERVICE_MEMORY_MB),
   memcachedEnabled: integer("memcached_enabled", { mode: "boolean" }).notNull().default(false),
   memcachedMemoryMb: integer("memcached_memory_mb").notNull().default(DEFAULT_SERVICE_MEMORY_MB),
-  /** Account environment where its webhook URL is published. Cleared when that environment is deleted. */
-  hookDomain: text("hook_domain"),
+  /** Account environment whose hostname publishes its webhook URL. Cleared when that environment is deleted. */
+  hookVhost: integer("hook_vhost").references((): AnySQLiteColumn => vhosts.id, { onDelete: "set null" }),
   createdAt: integer("created_at").notNull(),
 });
 
@@ -61,12 +61,26 @@ export const domains = sqliteTable("domains", {
   createdAt: integer("created_at").notNull(),
 }, (table) => [index("domains_username").on(table.username)]);
 
-/** Called "environments" in the interface. */
-export const vhosts = sqliteTable("vhosts", {
+/** Domains and subdomains of an account, like the `map` of an OLS listener. Only the environment that uses it answers for it. */
+export const hostnames = sqliteTable("hostnames", {
   fqdn: text("fqdn").primaryKey(),
   username: text("username").notNull().references(() => accounts.username, { onDelete: "cascade" }),
   domain: text("domain").notNull().references(() => domains.fqdn, { onDelete: "cascade" }),
-  isMain: integer("is_main", { mode: "boolean" }).notNull(),
+  createdAt: integer("created_at").notNull(),
+}, (table) => [index("hostnames_username").on(table.username), index("hostnames_domain").on(table.domain)]);
+
+/**
+ * Called "environments" in the interface. `id` never changes: the other tables, the API and the panel URLs use it.
+ * `slug` is unique on the server and names everything on disk and in OLS (`~/sites/<slug>`, its vhost, its logs, its
+ * FTP login); it can be renamed. Each environment answers for exactly one hostname, which can be changed.
+ */
+export const vhosts = sqliteTable("vhosts", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  username: text("username").notNull().references(() => accounts.username, { onDelete: "cascade" }),
+  slug: text("slug").notNull().unique(),
+  name: text("name").notNull(),
+  /** A domain with an environment cannot be deleted: the environment has to go first. */
+  hostname: text("hostname").notNull().unique().references(() => hostnames.fqdn, { onDelete: "restrict" }),
   type: text("type").$type<VhostType>().notNull(),
   /** Relative to the account home directory. */
   docRoot: text("doc_root").notNull(),
@@ -74,8 +88,10 @@ export const vhosts = sqliteTable("vhosts", {
   phpOptions: text("php_options", { mode: "json" }).$type<PhpOptions>().notNull().default(DEFAULT_PHP_OPTIONS),
   logLevel: text("log_level").$type<LogLevel>().notNull().default(DEFAULT_LOG_LEVEL),
   logDays: integer("log_days").notNull().default(DEFAULT_LOG_DAYS),
+  /** Its own FTP access, limited to its directory. Null while it has none. */
+  ftpPasswordChangedAt: integer("ftp_password_changed_at"),
   createdAt: integer("created_at").notNull(),
-}, (table) => [index("vhosts_username").on(table.username), index("vhosts_domain").on(table.domain)]);
+}, (table) => [index("vhosts_username").on(table.username)]);
 
 export const certificates = sqliteTable("certificates", {
   zone: text("zone").primaryKey(),
@@ -116,7 +132,7 @@ export const auditLog = sqliteTable("audit_log", {
 
 /** An app-type environment. `id` defines its namespace and private address: it is not reused while it exists. */
 export const apps = sqliteTable("apps", {
-  fqdn: text("fqdn").primaryKey().references(() => vhosts.fqdn, { onDelete: "cascade" }),
+  vhost: integer("vhost").primaryKey().references(() => vhosts.id, { onDelete: "cascade" }),
   id: integer("id").notNull().unique(),
   repoUrl: text("repo_url").notNull(),
   branch: text("branch").notNull(),
@@ -142,15 +158,15 @@ export const apps = sqliteTable("apps", {
 
 /** Values are stored here so they can be edited: only the panel user can read the database. */
 export const appEnv = sqliteTable("app_env", {
-  fqdn: text("fqdn").notNull().references(() => apps.fqdn, { onDelete: "cascade" }),
+  vhost: integer("vhost").notNull().references(() => apps.vhost, { onDelete: "cascade" }),
   key: text("key").notNull(),
   value: text("value").notNull(),
   scope: text("scope").$type<EnvScope>().notNull(),
-}, (table) => [primaryKey({ columns: [table.fqdn, table.key] })]);
+}, (table) => [primaryKey({ columns: [table.vhost, table.key] })]);
 
 export const deployments = sqliteTable("deployments", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  fqdn: text("fqdn").notNull().references(() => apps.fqdn, { onDelete: "cascade" }),
+  vhost: integer("vhost").notNull().references(() => apps.vhost, { onDelete: "cascade" }),
   release: integer("release").notNull(),
   /** A release of one type does not work for the other: output directory or image. */
   kind: text("kind").$type<AppKind>().notNull().default("server"),
@@ -160,7 +176,7 @@ export const deployments = sqliteTable("deployments", {
   log: text("log").notNull().default(""),
   startedAt: integer("started_at").notNull(),
   finishedAt: integer("finished_at"),
-}, (table) => [index("deployments_fqdn").on(table.fqdn)]);
+}, (table) => [index("deployments_vhost").on(table.vhost)]);
 
 /**
  * Requested deployments waiting for the previous one of the same app to finish, in order. It lives in the database, not
@@ -168,13 +184,13 @@ export const deployments = sqliteTable("deployments", {
  */
 export const deployQueue = sqliteTable("deploy_queue", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  fqdn: text("fqdn").notNull().references(() => apps.fqdn, { onDelete: "cascade" }),
+  vhost: integer("vhost").notNull().references(() => apps.vhost, { onDelete: "cascade" }),
   /** Who requested it: the panel or the webhook, with the branch and the commit. */
   trigger: text("trigger").notNull(),
   /** The push commit. Without it, the branch tip at start time is deployed. */
   commit: text("commit"),
   requestedAt: integer("requested_at").notNull(),
-}, (table) => [index("deploy_queue_fqdn").on(table.fqdn)]);
+}, (table) => [index("deploy_queue_vhost").on(table.vhost)]);
 
 /** Downloadable copies of an account. The file lives on the server until it expires. */
 export const accountExports = sqliteTable("account_exports", {

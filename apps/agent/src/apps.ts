@@ -83,17 +83,18 @@ const podman = (args: string[]): [string, string[]] => ["env", [...PODMAN_ENV, P
 
 // ---------------------------------------------------------------------------- Paths
 
-export const appDir = (username: string, fqdn: string) => `${APPS_ROOT}/apps/${username}/${fqdn}`;
+/** By app id, not by environment: renaming the environment moves nothing and does not touch its container. */
+export const appDir = (username: string, appId: number) => `${APPS_ROOT}/apps/${username}/${appId}`;
 /** Code of the release being built, owned by the account. Emptied at the start and end of every deployment. */
-export const buildDir = (username: string, fqdn: string) => `${appDir(username, fqdn)}/build`;
+export const buildDir = (username: string, appId: number) => `${appDir(username, appId)}/build`;
 /** Static sites only: what OLS serves, owned by root. Servers store each release as an image. */
-export const releaseDir = (username: string, fqdn: string, release: number) => `${appDir(username, fqdn)}/releases/${release}`;
-export const dataDir = (username: string, fqdn: string) => `/home/${username}/data/${fqdn}`;
+export const releaseDir = (username: string, appId: number, release: number) => `${appDir(username, appId)}/releases/${release}`;
+export const dataDir = (username: string, appId: number) => `/home/${username}/data/app-${appId}`;
 /**
  * Build HOME and cache, separate from DATA_DIR: a malicious install script must not be able to touch the app's
  * persistent data. Owned by the account and counted toward its quota; it can be deleted without losing anything.
  */
-export const buildHome = (username: string, fqdn: string) => `/home/${username}/.build/${fqdn}`;
+export const buildHome = (username: string, appId: number) => `/home/${username}/.build/app-${appId}`;
 export type Slot = "a" | "b";
 const SLOT_PORT: Record<Slot, number> = { a: 3001, b: 3002 };
 export const appUnit = (id: number, slot: Slot) => `eaglepanel-app-${id}-${slot}`;
@@ -287,15 +288,15 @@ async function assertServerReady(host: Host): Promise<void> {
 
 // ---------------------------------------------------------------------------- Prepare
 
-export async function prepareApp(host: Host, { appId, username, fqdn, runtime, runtimeVersion }: AgentOpParams<"app.prepare">): Promise<void> {
+export async function prepareApp(host: Host, { appId, username, runtime, runtimeVersion }: AgentOpParams<"app.prepare">): Promise<void> {
   await assertServerReady(host);
 
   // 711: OLS can traverse to the published static files without being able to list anything.
-  await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "711", APPS_ROOT, `${APPS_ROOT}/apps`, `${APPS_ROOT}/apps/${username}`, appDir(username, fqdn), `${appDir(username, fqdn)}/releases`]);
+  await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "711", APPS_ROOT, `${APPS_ROOT}/apps`, `${APPS_ROOT}/apps/${username}`, appDir(username, appId), `${appDir(username, appId)}/releases`]);
   await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "700", REPOS, KEYS, PODMAN_STORAGE]);
   await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", APPS_CONFIG, PODMAN_CONFIG]);
   await must(host, "install", ["-d", "-o", "root", "-g", username, "-m", "750", configDir(appId)]);
-  for (const dir of [`/home/${username}/data`, dataDir(username, fqdn), `/home/${username}/.build`, buildHome(username, fqdn)]) {
+  for (const dir of [`/home/${username}/data`, dataDir(username, appId), `/home/${username}/.build`, buildHome(username, appId)]) {
     await must(host, ...asUserInstall(username, dir));
   }
   await host.writeFileAtomic(STORAGE_CONF, storageConf, 0o644);
@@ -381,8 +382,8 @@ export async function fetchRepo(host: Host, { appId, repoUrl, branch, commit: wa
 }
 
 /** root builds the archive, but it is extracted as the account: a tar with symlinks cannot write where the account cannot. */
-export async function unpackRelease(host: Host, { appId, username, fqdn, commit, subdir }: AgentOpParams<"app.unpack">): Promise<void> {
-  const dest = buildDir(username, fqdn);
+export async function unpackRelease(host: Host, { appId, username, commit, subdir }: AgentOpParams<"app.unpack">): Promise<void> {
+  const dest = buildDir(username, appId);
   const tar = `${configDir(appId)}/code.tar`;
   // rm does not follow symlinks: deleting as root what the account left does not leave the directory.
   await must(host, "rm", ["-rf", "--", dest]);
@@ -434,7 +435,7 @@ async function writeScript(host: Host, appId: number, username: string, name: st
 }
 
 export async function runBuild(host: Host, params: AgentOpParams<"app.build">): Promise<{ code: number; log: string }> {
-  const { appId, username, fqdn, command, runtime, runtimeVersion } = params;
+  const { appId, username, command, runtime, runtimeVersion } = params;
   if (!command.trim()) return { code: 0, log: "" };
   const scriptPath = await writeScript(host, appId, username, "build.sh", script(command));
   const { uid, gid } = await accountIds(host, username);
@@ -448,7 +449,7 @@ export async function runBuild(host: Host, params: AgentOpParams<"app.build">): 
     "-p", `EnvironmentFile=-${configDir(appId)}/build.env`,
     ...PODMAN_ENV.map((value) => `--setenv=${value}`),
     PODMAN, "run", "--rm", "--replace", `--name=${buildUnit(appId)}`, ...containerArgs(appId, uid, gid), "--pids-limit=1024",
-    `--volume=${buildDir(username, fqdn)}:/app`, `--volume=${buildHome(username, fqdn)}:/cache`, `--volume=${scriptPath}:/eaglepanel/build.sh:ro`,
+    `--volume=${buildDir(username, appId)}:/app`, `--volume=${buildHome(username, appId)}:/cache`, `--volume=${scriptPath}:/eaglepanel/build.sh:ro`,
     // NODE_ENV is left out on purpose: with production, the build's development dependencies are not installed.
     "--env=HOME=/cache", "--env=CI=1", "--env=NEXT_TELEMETRY_DISABLED=1", ...(await envFlags(host, appId, "build")),
     "--workdir=/app", baseImage(runtime, runtimeVersion), "/bin/sh", "/eaglepanel/build.sh",
@@ -464,10 +465,10 @@ export async function runBuild(host: Host, params: AgentOpParams<"app.build">): 
  * an image with the code. Then the build directory is emptied: its size stops counting toward the quota.
  */
 export async function saveRelease(host: Host, params: AgentOpParams<"app.release">): Promise<{ files: number; bytes: number }> {
-  const { appId, username, fqdn, release, kind, outputDir, runtime, runtimeVersion } = params;
-  const source = buildDir(username, fqdn);
+  const { appId, username, release, kind, outputDir, runtime, runtimeVersion } = params;
+  const source = buildDir(username, appId);
   let summary = { files: 0, bytes: 0 };
-  if (kind === "static") summary = await publishStatic(host, source, outputDir, releaseDir(username, fqdn, release));
+  if (kind === "static") summary = await publishStatic(host, source, outputDir, releaseDir(username, appId, release));
   else {
     const containerfile = `${configDir(appId)}/Containerfile`;
     await host.writeFileAtomic(containerfile, `FROM ${baseImage(runtime, runtimeVersion)}\nCOPY . /app\nWORKDIR /app\n`, 0o644);
@@ -522,7 +523,6 @@ async function publishStatic(host: Host, source: string, outputDir: string, dest
 export interface UnitParams {
   appId: number;
   username: string;
-  fqdn: string;
   release: number;
   memoryMb: number;
   slot: Slot;
@@ -535,18 +535,18 @@ export interface UnitParams {
  * Like a Quadlet unit: conmon stays as the main process and notifies systemd when the container has started.
  * With `--rm`, every start is a new container from the image: whatever the app wrote into its code is lost.
  */
-export function renderAppUnit({ appId, username, fqdn, release, memoryMb, slot, uid, gid, envFlags: keys }: UnitParams): string {
+export function renderAppUnit({ appId, username, release, memoryMb, slot, uid, gid, envFlags: keys }: UnitParams): string {
   const name = containerName(appId, slot);
   const run = [
     PODMAN, "run", "--rm", "--detach", "--replace", `--name=${name}`, "--sdnotify=conmon", ...containerArgs(appId, uid, gid), "--pids-limit=256",
     `--env=PORT=${SLOT_PORT[slot]}`, "--env=HOSTNAME=0.0.0.0", "--env=NODE_ENV=production", "--env=DATA_DIR=/data", "--env=HOME=/data",
     "--env=NEXT_TELEMETRY_DISABLED=1", ...keys,
-    `--volume=${dataDir(username, fqdn)}:/data`, `--volume=${configDir(appId)}/start.sh:/eaglepanel/start.sh:ro`,
+    `--volume=${dataDir(username, appId)}:/data`, `--volume=${configDir(appId)}/start.sh:/eaglepanel/start.sh:ro`,
     `--volume=${MYSQL_RUN}:${MYSQL_RUN}:ro`,
     "--tmpfs=/tmp:rw,size=128m,mode=1777", releaseImage(appId, release), "/bin/sh", "/eaglepanel/start.sh",
   ];
   return `[Unit]
-Description=EaglePanel: app ${fqdn} (slot ${slot}, release ${release})
+Description=EaglePanel: app ${appId} (slot ${slot}, release ${release})
 After=${netnsUnit(appId)}.service mysql.service
 Requires=${netnsUnit(appId)}.service
 StartLimitIntervalSec=120
@@ -605,7 +605,7 @@ async function healthy(host: Host, appId: number, slot: Slot, path: string): Pro
  * respond, the active one stays as it was. Also used to roll back to a previous release: its image is still on the server.
  */
 export async function activateRelease(host: Host, params: AgentOpParams<"app.activate">): Promise<{ healthy: boolean; log: string }> {
-  const { appId, username, fqdn, release, startCommand, memoryMb, healthPath } = params;
+  const { appId, username, release, startCommand, memoryMb, healthPath } = params;
   if (!host.sandbox && (await host.run(...podman(["image", "exists", releaseImage(appId, release)]))).code !== 0) {
     throw new Error(`Release ${release} is no longer on the server`);
   }
@@ -614,7 +614,7 @@ export async function activateRelease(host: Host, params: AgentOpParams<"app.act
   const slot: Slot = previous === "a" ? "b" : "a";
   const unit = `${appUnit(appId, slot)}.service`;
   const { uid, gid } = await accountIds(host, username);
-  const unitParams = { appId, username, fqdn, release, memoryMb, slot, uid, gid, envFlags: await envFlags(host, appId, "runtime") };
+  const unitParams = { appId, username, release, memoryMb, slot, uid, gid, envFlags: await envFlags(host, appId, "runtime") };
 
   await host.run("systemctl", ["stop", unit]);
   await host.writeFileAtomic(`${UNITS}/${unit}`, renderAppUnit(unitParams), 0o644);
@@ -678,11 +678,11 @@ export async function appStatus(host: Host, appId: number) {
 }
 
 /** Deletes the releases not in `keep`: directories of a static site or images of a server. */
-export async function pruneReleases(host: Host, { appId, username, fqdn, keep }: AgentOpParams<"app.prune">): Promise<void> {
+export async function pruneReleases(host: Host, { appId, username, keep }: AgentOpParams<"app.prune">): Promise<void> {
   const kept = new Set(keep.map(String));
-  const { stdout } = await host.run("ls", ["-1", "--", `${appDir(username, fqdn)}/releases`]);
+  const { stdout } = await host.run("ls", ["-1", "--", `${appDir(username, appId)}/releases`]);
   for (const name of stdout.split("\n").map((line) => line.trim()).filter((line) => /^\d+$/.test(line) && !kept.has(line))) {
-    await must(host, "rm", ["-rf", "--", releaseDir(username, fqdn, Number(name))]);
+    await must(host, "rm", ["-rf", "--", releaseDir(username, appId, Number(name))]);
   }
   const images = (await host.run(...podman(["images", "--format", "{{.Tag}}", "--filter", `reference=${imageRepo(appId)}`]))).stdout;
   for (const tag of images.split("\n").map((line) => line.trim()).filter((line) => /^\d+$/.test(line) && !kept.has(line))) {
@@ -691,7 +691,7 @@ export async function pruneReleases(host: Host, { appId, username, fqdn, keep }:
 }
 
 /** Deletes code, releases, images, key and configuration. The app data stays in the account home. */
-export async function removeApp(host: Host, { appId, username, fqdn }: AgentOpParams<"app.remove">): Promise<void> {
+export async function removeApp(host: Host, { appId, username }: AgentOpParams<"app.remove">): Promise<void> {
   const units = (["a", "b"] as const).map((slot) => `${appUnit(appId, slot)}.service`);
   await host.run("systemctl", ["disable", "--now", ...units, `${buildUnit(appId)}.service`, `${netnsUnit(appId)}.service`]);
   for (const slot of ["a", "b"] as const) await host.run(...podman(["rm", "--force", "--ignore", containerName(appId, slot)]));
@@ -703,11 +703,11 @@ export async function removeApp(host: Host, { appId, username, fqdn }: AgentOpPa
   for (const path of [...units.map((unit) => `${UNITS}/${unit}`), `${UNITS}/${netnsUnit(appId)}.service`, keyPath(appId), `${keyPath(appId)}.pub`, knownHosts(appId)]) {
     await must(host, "rm", ["-f", "--", path]);
   }
-  for (const path of [configDir(appId), repoDir(appId), appDir(username, fqdn)]) {
+  for (const path of [configDir(appId), repoDir(appId), appDir(username, appId)]) {
     await must(host, "rm", ["-rf", "--", path]);
   }
   // The build cache is in the home directory: it is deleted with the account permissions, never as root.
-  const [command, ...args] = asUser(username, ["rm", "-rf", "--", buildHome(username, fqdn)]);
+  const [command, ...args] = asUser(username, ["rm", "-rf", "--", buildHome(username, appId)]);
   await host.run(command!, args);
   await must(host, "systemctl", ["daemon-reload"]);
   await host.run("systemctl", ["reset-failed", ...units]);

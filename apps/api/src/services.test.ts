@@ -13,6 +13,7 @@ import { openDb, type Db } from "./db";
 import { createDbUsageMonitor } from "./db-usage";
 import { auditLog, certificates, jobSteps } from "./db/schema";
 import { JobRunner } from "./jobs";
+import { createSiteAccount, addEnvironment, testSlug } from "./test-support";
 
 const PASSWORD = "test-password-value";
 const passwordHash = await hashPassword(PASSWORD);
@@ -47,6 +48,17 @@ const agent: AgentClient = {
     return response.result;
   }) as AgentClient["call"],
 };
+
+
+/** The API names an environment by its id: the one that answers for that hostname. */
+async function vid(hostname: string): Promise<number> {
+  const response = await app.request("/api/accounts", { headers: { cookie } });
+  for (const item of (await response.json()) as AccountDto[]) {
+    const found = item.vhosts.find((vhost) => vhost.hostname === hostname);
+    if (found) return found.id;
+  }
+  throw new Error(`No environment answers for ${hostname}`);
+}
 
 function post(path: string, body: unknown = {}, withCookie = cookie) {
   return app.request(`/api${path}`, {
@@ -91,7 +103,7 @@ beforeEach(async () => {
   await host.writeFileAtomic(HTTPD_CONFIG, "serverName test\n");
   const login = await post("/auth/login", { username: "admin", password: PASSWORD }, "");
   cookie = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
-  const created = await runJob("/accounts", { username: "acme", domain: "example.com", phpVersion: "85", limits: { ...DEFAULT_LIMITS, quotaMb: 500, databases: 2, dbStorageMb: 10 } });
+  const created = await createSiteAccount(runJob, { username: "acme", domain: "example.com", limits: { ...DEFAULT_LIMITS, quotaMb: 500, databases: 2, dbStorageMb: 10 } });
   expect(created.status).toBe("succeeded");
   calls = [];
 });
@@ -103,7 +115,7 @@ function persisted(): string {
 
 describe("FTP", () => {
   test("creating the account creates its FTP and returns the password only once", async () => {
-    const created = await runJob("/accounts", { username: "otra", domain: "otra.com", phpVersion: "85" });
+    const created = await runJob("/accounts", { username: "otra", limits: DEFAULT_LIMITS });
     expect(created.status).toBe("succeeded");
     expect(created.secret).toMatch(/^[A-Za-z0-9_-]{32}$/);
     expect((await account("otra")).ftpPasswordChangedAt).toBeNumber();
@@ -123,7 +135,7 @@ describe("FTP", () => {
 
   test("if FTP fails while creating the account, nothing is left", async () => {
     failOn = "ftp.setPassword";
-    const job = await runJob("/accounts", { username: "falla", domain: "falla.com", phpVersion: "85" });
+    const job = await createSiteAccount(runJob, { username: "falla", domain: "falla.com", limits: DEFAULT_LIMITS });
     expect(job.status).toBe("rolled_back");
     expect((await app.request("/api/accounts/falla", { headers: { cookie } })).status).toBe(404);
     expect(callsTo("account.delete")).toEqual([{ username: "falla" }]);
@@ -150,7 +162,7 @@ describe("databases", () => {
   });
 
   test("does not operate on another account's database", async () => {
-    await runJob("/accounts", { username: "otra", domain: "otra.com", phpVersion: "85" });
+    await createSiteAccount(runJob, { username: "otra", domain: "otra.com", limits: DEFAULT_LIMITS });
     await runJob("/accounts/otra/databases", { name: "privada" });
     calls = [];
     for (const action of ["password", "optimize", "delete"]) {
@@ -292,8 +304,8 @@ describe("Redis and Memcached", () => {
 });
 
 describe("accept connections from Cloudflare only", () => {
-  const conf = (fqdn: string) => readFileSync(host.resolvePath(`/usr/local/lsws/conf/vhosts/${fqdn}/vhost.conf`), "utf8");
-  const syncedSites = () => (callsTo("ols.sync").at(-1) as { sites: { fqdn: string; originPull: boolean }[] }).sites;
+  const conf = (fqdn: string) => readFileSync(host.resolvePath(`/usr/local/lsws/conf/vhosts/${testSlug(fqdn)}/vhost.conf`), "utf8");
+  const syncedSites = () => (callsTo("ols.sync").at(-1) as { sites: { hostname: string; originPull: boolean }[] }).sites;
   const installCertificate = () => db.insert(certificates).values({ zone: "example.com", username: "acme", names: ["example.com", "*.example.com"], notAfter: Date.now() + 86_400_000 }).run();
 
   test("cannot be enabled without a certificate", async () => {
@@ -302,29 +314,29 @@ describe("accept connections from Cloudflare only", () => {
 
   test("starts disabled: enabling it without the Cloudflare switch would take the domain down", async () => {
     installCertificate();
-    expect((await account()).certificates[0]?.originPull).toBe(false);
+    expect((await account()).domains[0]?.certificate?.originPull).toBe(false);
   });
 
   test("enables the requirement on every covered environment, and not on those left out", async () => {
     await runJob("/accounts/acme/limits", { ...DEFAULT_LIMITS, quotaMb: 500, databases: 2, dbStorageMb: 10 });
-    await runJob("/accounts/acme/vhosts", { fqdn: "blog.example.com", domain: "example.com", phpVersion: "85" });
-    await runJob("/accounts/acme/vhosts", { fqdn: "a.blog.example.com", domain: "example.com", phpVersion: "85" });
+    await addEnvironment(runJob, "acme", "blog.example.com");
+    await addEnvironment(runJob, "acme", "a.blog.example.com");
     installCertificate();
 
     const job = await runJob("/accounts/acme/domains/example.com/origin-pull", { enabled: true });
     expect(job.status).toBe("succeeded");
-    expect((await account()).certificates[0]?.originPull).toBe(true);
+    expect((await account()).domains[0]?.certificate?.originPull).toBe(true);
     expect(conf("example.com")).toContain("clientVerify            2");
     expect(conf("blog.example.com")).toContain("clientVerify            2");
     // The wildcard covers a single level: that environment is not on 443.
     expect(conf("a.blog.example.com")).not.toContain("clientVerify");
-    expect(syncedSites().find(({ fqdn }) => fqdn === "a.blog.example.com")?.originPull).toBe(false);
-    expect(syncedSites().find(({ fqdn }) => fqdn === "blog.example.com")?.originPull).toBe(true);
+    expect(syncedSites().find(({ hostname }) => hostname === "a.blog.example.com")?.originPull).toBe(false);
+    expect(syncedSites().find(({ hostname }) => hostname === "blog.example.com")?.originPull).toBe(true);
     expect(callsTo("ols.sync").at(-1)).toMatchObject({ restart: true });
   });
 
   test("does not affect another account, and cannot be enabled from another one", async () => {
-    await runJob("/accounts", { username: "otra", domain: "otra.com", phpVersion: "85" });
+    await createSiteAccount(runJob, { username: "otra", domain: "otra.com", limits: DEFAULT_LIMITS });
     installCertificate();
     expect((await post("/accounts/otra/domains/example.com/origin-pull", { enabled: true })).status).toBe(404);
     await runJob("/accounts/acme/domains/example.com/origin-pull", { enabled: true });
@@ -350,13 +362,13 @@ describe("accept connections from Cloudflare only", () => {
     failOn = "ols.sync";
     const job = await runJob("/accounts/acme/domains/example.com/origin-pull", { enabled: true });
     expect(job.status).toBe("rolled_back");
-    expect((await account()).certificates[0]?.originPull).toBe(false);
+    expect((await account()).domains[0]?.certificate?.originPull).toBe(false);
     expect(conf("example.com")).not.toContain("clientVerify");
   });
 });
 
 describe("suspend account", () => {
-  const conf = (fqdn = "example.com") => readFileSync(host.resolvePath(`/usr/local/lsws/conf/vhosts/${fqdn}/vhost.conf`), "utf8");
+  const conf = (fqdn = "example.com") => readFileSync(host.resolvePath(`/usr/local/lsws/conf/vhosts/${testSlug(fqdn)}/vhost.conf`), "utf8");
   const order = () => calls.map(({ op }) => op).filter((op) => ["site.write", "service.set", "ftp.setSuspended", "db.setLocked"].includes(op));
   const prepare = async () => {
     await runJob("/accounts/acme/databases", { name: "tienda" });
@@ -383,7 +395,7 @@ describe("suspend account", () => {
     const after = await account();
     expect(after.databases).toEqual([{ name: "acme_tienda", sizeBytes: 0 }]);
     expect(after.services.redis).toMatchObject({ enabled: true, memoryMb: 128 });
-    expect(after.vhosts[0]?.docRoot).toBe("public_html");
+    expect(after.vhosts[0]?.docRoot).toBe("sites/examplecom/public_html");
     expect(callsTo("db.delete")).toEqual([]);
     expect(callsTo("site.remove")).toEqual([]);
   });
@@ -397,7 +409,7 @@ describe("suspend account", () => {
     expect(order()).toEqual(["db.setLocked", "ftp.setSuspended", "service.set", "site.write"]);
     expect(callsTo("service.set")).toEqual([{ username: "acme", service: "redis", enabled: true, memoryMb: 128 }]);
     expect((await account()).suspended).toBe(false);
-    expect(conf()).toContain("/home/acme/public_html");
+    expect(conf()).toContain("/home/acme/sites/examplecom/public_html");
     expect(conf()).not.toContain("R=503");
   });
 
@@ -420,19 +432,19 @@ describe("suspend account", () => {
 
   test("while suspended, nothing can publish the site again", async () => {
     await runJob("/accounts/acme/suspend", { suspended: true });
-    const saved = await runJob("/vhosts/example.com/options", { docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, logLevel: "WARN", logDays: 14 });
+    const saved = await runJob(`/vhosts/${await vid("example.com")}/options`, { docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, logLevel: "WARN", logDays: 14 });
     expect(saved.status).toBe("succeeded");
     expect(conf()).toContain("R=503");
-    await runJob("/vhosts/example.com/php", { phpVersion: "84" });
+    await runJob(`/vhosts/${await vid("example.com")}/php`, { phpVersion: "84" });
     expect(conf()).toContain("R=503");
-    await runJob("/accounts/acme/vhosts", { fqdn: "blog.example.com", domain: "example.com", phpVersion: "85" });
+    await addEnvironment(runJob, "acme", "blog.example.com");
     expect(conf("blog.example.com")).toContain("R=503");
     expect(conf("blog.example.com")).not.toContain("extprocessor");
   });
 
   test("what was saved while suspended is applied on reactivation", async () => {
     await runJob("/accounts/acme/suspend", { suspended: true });
-    await runJob("/vhosts/example.com/options", { docRoot: "public_html", phpVersion: "85", phpOptions: { ...DEFAULT_PHP_OPTIONS, children: 9 }, logLevel: "ERROR", logDays: 30 });
+    await runJob(`/vhosts/${await vid("example.com")}/options`, { docRoot: "public_html", phpVersion: "85", phpOptions: { ...DEFAULT_PHP_OPTIONS, children: 9 }, logLevel: "ERROR", logDays: 30 });
     await runJob("/accounts/acme/suspend", { suspended: false });
     expect(conf()).toContain("PHP_LSAPI_CHILDREN=9");
   });
@@ -444,7 +456,7 @@ describe("suspend account", () => {
   });
 
   test("does not affect other accounts", async () => {
-    await runJob("/accounts", { username: "otra", domain: "otra.com", phpVersion: "85" });
+    await createSiteAccount(runJob, { username: "otra", domain: "otra.com", limits: DEFAULT_LIMITS });
     await runJob("/accounts/acme/suspend", { suspended: true });
     expect((await account("otra")).suspended).toBe(false);
     expect(conf("otra.com")).not.toContain("R=503");
@@ -465,20 +477,20 @@ describe("suspend account", () => {
 
 describe("restart PHP", () => {
   test("saving options restarts PHP: OLS does not", async () => {
-    const job = await runJob("/vhosts/example.com/options", { docRoot: "public_html", phpVersion: "85", phpOptions: { ...DEFAULT_PHP_OPTIONS, children: 2 }, logLevel: "ERROR", logDays: 30 });
+    const job = await runJob(`/vhosts/${await vid("example.com")}/options`, { docRoot: "public_html", phpVersion: "85", phpOptions: { ...DEFAULT_PHP_OPTIONS, children: 2 }, logLevel: "ERROR", logDays: 30 });
     expect(job.status).toBe("succeeded");
     expect(callsTo("php.restart")).toEqual([{ username: "acme" }]);
   });
 
   test("also when changing the version", async () => {
-    const job = await runJob("/vhosts/example.com/php", { phpVersion: "84" });
+    const job = await runJob(`/vhosts/${await vid("example.com")}/php`, { phpVersion: "84" });
     expect(job.status).toBe("succeeded");
     expect(callsTo("php.restart")).toEqual([{ username: "acme" }]);
   });
 
   test("if the restart fails, the options are undone", async () => {
     failOn = "php.restart";
-    const job = await runJob("/vhosts/example.com/options", { docRoot: "public_html", phpVersion: "85", phpOptions: { ...DEFAULT_PHP_OPTIONS, children: 2 }, logLevel: "ERROR", logDays: 30 });
+    const job = await runJob(`/vhosts/${await vid("example.com")}/options`, { docRoot: "public_html", phpVersion: "85", phpOptions: { ...DEFAULT_PHP_OPTIONS, children: 2 }, logLevel: "ERROR", logDays: 30 });
     expect(job.status).toBe("rolled_back");
     expect((await account()).vhosts[0]?.phpOptions.children).toBe(5);
   });
@@ -497,17 +509,17 @@ describe("restart PHP", () => {
 });
 
 describe("environment logs", () => {
-  const logs = (query: string, fqdn = "example.com") => app.request(`/api/vhosts/${fqdn}/logs${query}`, { headers: { cookie } });
+  const logs = async (query: string, fqdn = "example.com") => app.request(`/api/vhosts/${fqdn === "other.com" ? 999 : await vid(fqdn)}/logs${query}`, { headers: { cookie } });
 
   test("asks the agent for that environment log, for its account", async () => {
     const response = await logs("?source=php&lines=20");
     expect(response.status).toBe(200);
-    expect(callsTo("logs.read")).toEqual([{ username: "acme", fqdn: "example.com", source: "php", lines: 20 }]);
+    expect(callsTo("logs.read")).toEqual([{ username: "acme", site: "examplecom", source: "php", lines: 20 }]);
   });
 
   test("returns 200 lines by default", async () => {
     await logs("?source=access");
-    expect(callsTo("logs.read")).toEqual([{ username: "acme", fqdn: "example.com", source: "access", lines: 200 }]);
+    expect(callsTo("logs.read")).toEqual([{ username: "acme", site: "examplecom", source: "access", lines: 200 }]);
   });
 
   test("an unknown environment does not reach the agent", async () => {
@@ -521,7 +533,7 @@ describe("environment logs", () => {
   });
 
   test("requires a session", async () => {
-    expect((await app.request("/api/vhosts/example.com/logs?source=access")).status).toBe(401);
+    expect((await app.request("/api/vhosts/1/logs?source=access")).status).toBe(401);
   });
 
   test("reports the agent error without crashing", async () => {
@@ -532,29 +544,29 @@ describe("environment logs", () => {
   });
 
   test("level and days are stored and reach the vhost and logrotate", async () => {
-    const job = await runJob("/vhosts/example.com/options", { docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, logLevel: "WARN", logDays: 14 });
+    const job = await runJob(`/vhosts/${await vid("example.com")}/options`, { docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, logLevel: "WARN", logDays: 14 });
     expect(job.status).toBe("succeeded");
     expect((await account()).vhosts[0]).toMatchObject({ logLevel: "WARN", logDays: 14 });
-    expect(readFileSync(host.resolvePath("/usr/local/lsws/conf/vhosts/example.com/vhost.conf"), "utf8")).toContain("logLevel                WARN");
-    expect(readFileSync(host.resolvePath("/etc/logrotate.d/eaglepanel-example.com.conf"), "utf8")).toContain("rotate 14");
+    expect(readFileSync(host.resolvePath("/usr/local/lsws/conf/vhosts/examplecom/vhost.conf"), "utf8")).toContain("logLevel                WARN");
+    expect(readFileSync(host.resolvePath("/etc/logrotate.d/eaglepanel-examplecom.conf"), "utf8")).toContain("rotate 14");
   });
 
   test.each([[{ logLevel: "TODO", logDays: 14 }], [{ logLevel: "WARN", logDays: 0 }], [{ logLevel: "WARN", logDays: 1000 }]])("rejects invalid values %j", async (values) => {
-    const response = await post("/vhosts/example.com/options", { docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, ...values });
+    const response = await post(`/vhosts/${await vid("example.com")}/options`, { docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, ...values });
     expect(response.status).toBe(400);
   });
 });
 
 describe("environment options", () => {
   const options = { ...DEFAULT_PHP_OPTIONS, children: 8, directives: { ...DEFAULT_PHP_OPTIONS.directives, memory_limit: "128M" } };
-  const vhostFile = () => readFileSync(host.resolvePath("/usr/local/lsws/conf/vhosts/example.com/vhost.conf"), "utf8");
+  const vhostFile = () => readFileSync(host.resolvePath("/usr/local/lsws/conf/vhosts/examplecom/vhost.conf"), "utf8");
 
   test("a new environment starts with the default options", async () => {
     expect((await account()).vhosts[0]?.phpOptions).toEqual(DEFAULT_PHP_OPTIONS);
   });
 
   test("stores, writes the vhost and restarts OLS", async () => {
-    const job = await runJob("/vhosts/example.com/options", { docRoot: "public_html/web", phpVersion: "85", phpOptions: options, logLevel: "WARN", logDays: 14 });
+    const job = await runJob(`/vhosts/${await vid("example.com")}/options`, { docRoot: "public_html/web", phpVersion: "85", phpOptions: options, logLevel: "WARN", logDays: 14 });
     expect(job.status).toBe("succeeded");
     const vhost = (await account()).vhosts[0];
     expect(vhost?.docRoot).toBe("public_html/web");
@@ -566,22 +578,22 @@ describe("environment options", () => {
 
   test("if OLS fails, it restores the previous state", async () => {
     failOn = "ols.sync";
-    const job = await runJob("/vhosts/example.com/options", { docRoot: "public_html", phpVersion: "85", phpOptions: options, logLevel: "ERROR", logDays: 30 });
+    const job = await runJob(`/vhosts/${await vid("example.com")}/options`, { docRoot: "public_html", phpVersion: "85", phpOptions: options, logLevel: "ERROR", logDays: 30 });
     expect(job.status).toBe("rolled_back");
     expect((await account()).vhosts[0]?.phpOptions).toEqual(DEFAULT_PHP_OPTIONS);
     expect(vhostFile()).toContain("PHP_LSAPI_CHILDREN=5");
   });
 
   test.each([["tmp"], ["tmp/sesiones"], ["data"], ["logs"], ["run"]])("does not publish the private directory %s", async (docRoot) => {
-    expect((await post("/vhosts/example.com/options", { docRoot, phpVersion: "85", phpOptions: options, logLevel: "ERROR", logDays: 30 })).status).toBe(400);
+    expect((await post(`/vhosts/${await vid("example.com")}/options`, { docRoot, phpVersion: "85", phpOptions: options, logLevel: "ERROR", logDays: 30 })).status).toBe(400);
   });
 
   test.each([["../otra"], ["/etc"], ["a/../../b"], [".."]])("rejects the directory %s", async (docRoot) => {
-    expect((await post("/vhosts/example.com/options", { docRoot, phpVersion: "85", phpOptions: options, logLevel: "ERROR", logDays: 30 })).status).toBe(400);
+    expect((await post(`/vhosts/${await vid("example.com")}/options`, { docRoot, phpVersion: "85", phpOptions: options, logLevel: "ERROR", logDays: 30 })).status).toBe(400);
   });
 
   test("rejects a security directive sent as an option", async () => {
-    const response = await post("/vhosts/example.com/options", {
+    const response = await post(`/vhosts/${await vid("example.com")}/options`, {
       docRoot: "public_html",
       phpVersion: "85",
       phpOptions: { ...options, directives: { ...options.directives, open_basedir: "/" } },

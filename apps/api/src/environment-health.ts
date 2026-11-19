@@ -14,7 +14,7 @@ interface Probe {
 }
 
 /**
- * Asks OLS on 127.0.0.1:80 for each environment, by its name (Host header), without following redirects.
+ * Asks OLS on 127.0.0.1:80 for each environment, by its hostname (Host header), without following redirects.
  * An environment with a certificate answers 301 to HTTPS there: that confirms OLS serves it, not that the app behind
  * is healthy. The app status (failed, stopped) comes from the panel database.
  */
@@ -39,10 +39,10 @@ export function createEnvironmentHealth({ db, agent }: { db: Db; agent: AgentCli
 
   async function check(): Promise<EnvironmentHealthDto[]> {
     const rows = db
-      .select({ fqdn: vhosts.fqdn, suspended: accounts.suspended, appStatus: apps.status })
+      .select({ id: vhosts.id, name: vhosts.name, hostname: vhosts.hostname, suspended: accounts.suspended, appStatus: apps.status })
       .from(vhosts)
       .innerJoin(accounts, eq(vhosts.username, accounts.username))
-      .leftJoin(apps, eq(apps.fqdn, vhosts.fqdn))
+      .leftJoin(apps, eq(apps.vhost, vhosts.id))
       .all();
 
     // In sandbox mode there is no OLS: nothing is checked.
@@ -50,15 +50,15 @@ export function createEnvironmentHealth({ db, agent }: { db: Db; agent: AgentCli
     const checkedAt = Date.now();
 
     return Promise.all(
-      rows.map(async ({ fqdn, suspended, appStatus }): Promise<EnvironmentHealthDto> => {
-        if (suspended) return { fqdn, health: "suspended", httpStatus: null, responseMs: null, checkedAt };
-        if (appStatus === "deploying") return { fqdn, health: "deploying", httpStatus: null, responseMs: null, checkedAt };
-        if (appStatus === "stopped" || appStatus === "new") return { fqdn, health: "inactive", httpStatus: null, responseMs: null, checkedAt };
-        if (sandbox) return { fqdn, health: appStatus === "failed" ? "down" : "unknown", httpStatus: null, responseMs: null, checkedAt: null };
+      rows.map(async ({ id, name, hostname, suspended, appStatus }): Promise<EnvironmentHealthDto> => {
+        if (suspended) return { id, name, health: "suspended", httpStatus: null, responseMs: null, checkedAt };
+        if (appStatus === "deploying") return { id, name, health: "deploying", httpStatus: null, responseMs: null, checkedAt };
+        if (appStatus === "stopped" || appStatus === "new") return { id, name, health: "inactive", httpStatus: null, responseMs: null, checkedAt };
+        if (sandbox) return { id, name, health: appStatus === "failed" ? "down" : "unknown", httpStatus: null, responseMs: null, checkedAt: null };
 
-        const { status, ms } = await probe(fqdn);
+        const { status, ms } = await probe(hostname);
         const health: EnvironmentHealth = appStatus === "failed" || status === null || status >= 500 ? "down" : "online";
-        return { fqdn, health, httpStatus: status, responseMs: ms, checkedAt };
+        return { id, name, health, httpStatus: status, responseMs: ms, checkedAt };
       }),
     );
   }

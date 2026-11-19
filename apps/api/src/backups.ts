@@ -34,7 +34,7 @@ import { z } from "zod";
 import type { AgentClient } from "./agent-client";
 import { audit } from "./audit";
 import type { Db } from "./db";
-import { accountExports, accounts, appEnv, apps, certificates, databases, domains, settings, vhosts } from "./db/schema";
+import { accountExports, accounts, appEnv, apps, certificates, databases, domains, hostnames, settings, vhosts } from "./db/schema";
 import type { JobRunner, JobStep } from "./jobs";
 
 /**
@@ -64,19 +64,25 @@ export interface BackupDeps {
   jobs: JobRunner;
   /** To apply restored environment options: the same functions the rest of the panel uses. */
   writeSite?: (row: VhostRow) => Promise<void>;
-  syncSites?: (options?: { exclude?: string[]; restart?: boolean }) => Promise<void>;
+  syncSites?: (options?: { exclude?: number[]; restart?: boolean }) => Promise<void>;
 }
 
 const restoreFilesSchema = z.object({ snapshot: snapshotIdSchema, path: filePathSchema, mode: restoreModeSchema }).strict();
 /** `manifest` is needed only if the database no longer exists: its user with the original password comes from there. */
 const restoreDatabaseSchema = z.object({ snapshot: snapshotIdSchema, database: dbFullNameSchema, manifest: snapshotIdSchema.optional() }).strict();
 const configPartSchema = z.enum(["env", "options", "app"]);
-const restoreConfigSchema = z.object({ manifest: snapshotIdSchema, fqdns: z.array(fqdnSchema).min(1).max(1000), parts: z.array(configPartSchema).min(1) }).strict();
+const restoreConfigSchema = z.object({ manifest: snapshotIdSchema, vhosts: z.array(z.number().int().positive()).min(1).max(1000), parts: z.array(configPartSchema).min(1) }).strict();
 
-/** Manifest rows come from an own, encrypted backup; they are validated anyway before going back into the database. */
-const manifestVhostSchema = z.object({ fqdn: fqdnSchema, type: z.enum(["php", "app"]), docRoot: docRootSchema, phpVersion: phpVersionSchema, phpOptions: phpOptionsSchema, logLevel: logLevelSchema, logDays: logDaysSchema }).loose();
-const manifestEnvSchema = z.object({ fqdn: fqdnSchema, key: envKeySchema, value: envValueSchema, scope: envScopeSchema });
-const manifestAppSchema = z.object({ fqdn: fqdnSchema, config: appConfigSchema });
+/**
+ * Manifest rows come from an own, encrypted backup; they are validated anyway before going back into the database.
+ * Since 0.3.0 an environment is its `id`, which survives a rename; older backups only have `fqdn`, its hostname then.
+ */
+const manifestVhostSchema = z.object({
+  id: z.number().int().positive().optional(), fqdn: fqdnSchema.optional(), name: z.string().optional(),
+  type: z.enum(["php", "app"]), docRoot: docRootSchema, phpVersion: phpVersionSchema, phpOptions: phpOptionsSchema, logLevel: logLevelSchema, logDays: logDaysSchema,
+}).loose();
+const manifestEnvSchema = z.object({ vhost: z.number().int().positive().optional(), fqdn: fqdnSchema.optional(), key: envKeySchema, value: envValueSchema, scope: envScopeSchema });
+const manifestAppSchema = z.object({ vhost: z.number().int().positive().nullable(), config: appConfigSchema });
 /** To connect a new server to an existing repository: the password it was created with. */
 const settingsBodySchema = backupSettingsSchema.extend({ repositoryPassword: z.string().min(16).max(256).optional() }).strict();
 
@@ -163,16 +169,17 @@ export function createBackups({ db, agent, jobs, writeSite, syncSites }: BackupD
   function panelPart(username: string) {
     const account = db.select().from(accounts).where(eq(accounts.username, username)).get();
     const accountVhosts = db.select().from(vhosts).where(eq(vhosts.username, username)).all();
-    const fqdns = accountVhosts.map(({ fqdn }) => fqdn);
-    const accountApps = fqdns.length ? db.select().from(apps).where(inArray(apps.fqdn, fqdns)).all() : [];
+    const ids = accountVhosts.map(({ id }) => id);
+    const accountApps = ids.length ? db.select().from(apps).where(inArray(apps.vhost, ids)).all() : [];
     return {
       account,
       domains: db.select().from(domains).where(eq(domains.username, username)).all(),
+      hostnames: db.select().from(hostnames).where(eq(hostnames.username, username)).all(),
       vhosts: accountVhosts,
       certificates: db.select().from(certificates).where(eq(certificates.username, username)).all(),
       databases: db.select().from(databases).where(eq(databases.username, username)).all(),
       apps: accountApps,
-      appEnv: fqdns.length ? db.select().from(appEnv).where(inArray(appEnv.fqdn, fqdns)).all() : [],
+      appEnv: ids.length ? db.select().from(appEnv).where(inArray(appEnv.vhost, ids)).all() : [],
     };
   }
 
@@ -351,20 +358,22 @@ export function createBackups({ db, agent, jobs, writeSite, syncSites }: BackupD
       if (!repository || !snapshot.success) return c.json({ error: "Not found" }, 404);
       try {
         const manifest = await manifestOf(repository, snapshot.data, username);
-        const current = new Map(db.select().from(vhosts).where(eq(vhosts.username, username)).all().map((row) => [row.fqdn, row]));
-        const envRows = rowsOf(manifest, "appEnv", manifestEnvSchema);
-        const appRows = appsOf(manifest);
+        const current = new Map(db.select().from(vhosts).where(eq(vhosts.username, username)).all().map((row) => [row.id, row]));
+        const envRows = envOf(manifest, username);
+        const appRows = appsOf(manifest, username);
         const users = new Map(manifest.server.mysqlUsers.map((user) => [user.database, authHashOf(user.createUser) !== null]));
         return c.json({
-          vhosts: rowsOf(manifest, "vhosts", manifestVhostSchema).map((row) => {
-            const saved = appRows.find((app) => app.fqdn === row.fqdn);
-            const now = db.select().from(apps).where(eq(apps.fqdn, row.fqdn)).get();
+          vhosts: vhostsOf(manifest, username).map((row) => {
+            const saved = row.current === null ? undefined : appRows.find((app) => app.vhost === row.current);
+            const now = row.current === null ? undefined : db.select().from(apps).where(eq(apps.vhost, row.current)).get();
+            const exists = row.current !== null && current.has(row.current);
             return {
-              fqdn: row.fqdn,
+              id: exists ? row.current : null,
+              name: (exists ? current.get(row.current!)?.name : null) ?? row.name ?? row.fqdn ?? "?",
               type: row.type,
-              exists: current.has(row.fqdn),
-              sameType: current.get(row.fqdn)?.type === row.type,
-              envKeys: envRows.filter((env) => env.fqdn === row.fqdn).map(({ key }) => key),
+              exists,
+              sameType: exists && current.get(row.current!)?.type === row.type,
+              envKeys: envRows.filter((env) => env.vhost !== null && env.vhost === row.current).map(({ key }) => key),
               app: saved !== undefined && now?.kind === saved.config.kind,
             };
           }),
@@ -388,26 +397,27 @@ export function createBackups({ db, agent, jobs, writeSite, syncSites }: BackupD
       if (!account) return c.json({ error: "Not found" }, 404);
       const body = restoreConfigSchema.safeParse(await c.req.json().catch(() => null));
       if (!body.success) return c.json({ error: body.error.issues[0]?.message ?? "Invalid data" }, 400);
-      const { manifest: snapshot, fqdns, parts } = body.data;
+      const { manifest: snapshot, vhosts: ids, parts } = body.data;
       let manifest: BackupManifest;
       try {
         manifest = await manifestOf(repository, snapshot, username);
       } catch (error) {
         return c.json({ error: error instanceof Error ? error.message : "Could not read the backup" }, 400);
       }
-      const savedVhosts = rowsOf(manifest, "vhosts", manifestVhostSchema);
-      const savedEnv = rowsOf(manifest, "appEnv", manifestEnvSchema);
-      const savedApps = appsOf(manifest);
+      const savedVhosts = vhostsOf(manifest, username);
+      const savedEnv = envOf(manifest, username);
+      const savedApps = appsOf(manifest, username);
 
       const steps: JobStep[] = [];
-      for (const fqdn of fqdns) {
-        const now = db.select().from(vhosts).where(eq(vhosts.fqdn, fqdn)).get();
-        const then = savedVhosts.find((row) => row.fqdn === fqdn);
-        if (!now || now.username !== username || !then) return c.json({ error: `${fqdn} is not in the account or in the backup` }, 400);
-        if (now.type !== then.type) return c.json({ error: `${fqdn} changed type since that backup` }, 409);
+      for (const id of ids) {
+        const now = db.select().from(vhosts).where(eq(vhosts.id, id)).get();
+        const then = savedVhosts.find((row) => row.current === id);
+        if (!now || now.username !== username || !then) return c.json({ error: `Environment ${id} is not in the account or in the backup` }, 400);
+        const label = now.name;
+        if (now.type !== then.type) return c.json({ error: `${label} changed type since that backup` }, 409);
 
         if (parts.includes("options") && now.type === "php" && writeSite && syncSites) {
-          if (!isPublishableDocRoot(then.docRoot)) return c.json({ error: `${fqdn}: the backup directory is private` }, 400);
+          if (!isPublishableDocRoot(then.docRoot)) return c.json({ error: `${label}: the backup directory is private` }, 400);
           const previous = { docRoot: now.docRoot, phpVersion: now.phpVersion, phpOptions: now.phpOptions, logLevel: now.logLevel, logDays: now.logDays };
           const restored = { docRoot: then.docRoot, phpVersion: then.phpVersion, phpOptions: then.phpOptions, logLevel: then.logLevel, logDays: then.logDays };
           const site = { write: writeSite, sync: syncSites };
@@ -415,43 +425,43 @@ export function createBackups({ db, agent, jobs, writeSite, syncSites }: BackupD
             await site.write({ ...now, ...next });
             await site.sync({ restart: true });
             await agent.call("php.restart", { username });
-            db.update(vhosts).set(next).where(eq(vhosts.fqdn, fqdn)).run();
+            db.update(vhosts).set(next).where(eq(vhosts.id, id)).run();
           };
-          steps.push({ name: `Options of ${fqdn}`, run: () => apply(restored), compensate: () => apply(previous) });
+          steps.push({ name: `Options of ${label}`, run: () => apply(restored), compensate: () => apply(previous) });
         }
 
-        const appNow = db.select().from(apps).where(eq(apps.fqdn, fqdn)).get();
+        const appNow = db.select().from(apps).where(eq(apps.vhost, id)).get();
         if (parts.includes("env") && appNow) {
-          const previous = db.select().from(appEnv).where(eq(appEnv.fqdn, fqdn)).all();
+          const previous = db.select().from(appEnv).where(eq(appEnv.vhost, id)).all();
           const replace = async (rows: { key: string; value: string; scope: "runtime" | "build" | "both" }[]) => {
             db.transaction((tx) => {
-              tx.delete(appEnv).where(eq(appEnv.fqdn, fqdn)).run();
-              for (const row of rows) tx.insert(appEnv).values({ fqdn, key: row.key, value: row.value, scope: row.scope }).run();
+              tx.delete(appEnv).where(eq(appEnv.vhost, id)).run();
+              for (const row of rows) tx.insert(appEnv).values({ vhost: id, key: row.key, value: row.value, scope: row.scope }).run();
             });
-            await agent.call("app.env", { appId: appNow.id, ...envFor(fqdn) });
+            await agent.call("app.env", { appId: appNow.id, ...envFor(id) });
           };
           // They apply on the next deployment or restart, the same as when saved by hand.
-          steps.push({ name: `Variables of ${fqdn}`, run: () => replace(savedEnv.filter((row) => row.fqdn === fqdn)), compensate: () => replace(previous) });
+          steps.push({ name: `Variables of ${label}`, run: () => replace(savedEnv.filter((row) => row.vhost === id)), compensate: () => replace(previous) });
         }
 
-        const appThen = savedApps.find((row) => row.fqdn === fqdn);
+        const appThen = savedApps.find((row) => row.vhost === id);
         if (parts.includes("app") && appNow && appThen) {
-          if (appThen.config.kind !== appNow.kind) return c.json({ error: `${fqdn}: the app changed type since that backup` }, 409);
-          const accountFqdns = new Set(db.select({ fqdn: vhosts.fqdn }).from(vhosts).where(eq(vhosts.username, username)).all().map((row) => row.fqdn));
-          const used = db.select().from(apps).all().filter((row) => row.fqdn !== fqdn && accountFqdns.has(row.fqdn)).reduce((total, row) => total + appReservedMemory(row), 0);
-          if (used + appReservedMemory(appThen.config) > account.appMemoryMb) return c.json({ error: `${fqdn}: the backup memory exceeds what the account has available` }, 409);
+          if (appThen.config.kind !== appNow.kind) return c.json({ error: `${label}: the app changed type since that backup` }, 409);
+          const accountIds = new Set(db.select({ id: vhosts.id }).from(vhosts).where(eq(vhosts.username, username)).all().map((row) => row.id));
+          const used = db.select().from(apps).all().filter((row) => row.vhost !== id && accountIds.has(row.vhost)).reduce((total, row) => total + appReservedMemory(row), 0);
+          if (used + appReservedMemory(appThen.config) > account.appMemoryMb) return c.json({ error: `${label}: the backup memory exceeds what the account has available` }, 409);
           const previous = pickConfig(appNow) as typeof appThen.config;
           const apply = async (next: typeof previous) => {
-            db.update(apps).set(next).where(eq(apps.fqdn, fqdn)).run();
-            await agent.call("app.prepare", { appId: appNow.id, username, fqdn, runtime: next.runtime, runtimeVersion: next.runtimeVersion });
+            db.update(apps).set(next).where(eq(apps.vhost, id)).run();
+            await agent.call("app.prepare", { appId: appNow.id, username, runtime: next.runtime, runtimeVersion: next.runtimeVersion });
           };
           // The configuration applies from the next deployment: nothing is rebuilt here.
-          steps.push({ name: `App configuration of ${fqdn}`, run: () => apply(appThen.config), compensate: () => apply(previous) });
+          steps.push({ name: `App configuration of ${label}`, run: () => apply(appThen.config), compensate: () => apply(previous) });
         }
       }
       if (steps.length === 0) return c.json({ error: "Nothing to restore with that selection" }, 400);
       const { id } = jobs.enqueue({ type: "backup.restoreConfig", title: `Restore configuration of ${username}`, steps });
-      audit(db, "backup.restoreConfig", `${username}: ${parts.join(", ")} of ${fqdns.join(", ")} from ${snapshot.slice(0, 8)}`);
+      audit(db, "backup.restoreConfig", `${username}: ${parts.join(", ")} of ${ids.join(", ")} from ${snapshot.slice(0, 8)}`);
       return c.json({ jobId: id } satisfies JobCreatedDto, 202);
     });
 
@@ -588,14 +598,26 @@ export function createBackups({ db, agent, jobs, writeSite, syncSites }: BackupD
       return parsed.success ? [parsed.data] : [];
     });
 
+  /** The environment of this account a saved row refers to, now: by its id, or by its hostname in backups before 0.3.0. */
+  const currentVhost = (username: string, row: { id?: number; vhost?: number; fqdn?: string }): number | null => {
+    const id = row.id ?? row.vhost;
+    const found = id !== undefined
+      ? db.select().from(vhosts).where(eq(vhosts.id, id)).get()
+      : row.fqdn ? db.select().from(vhosts).where(eq(vhosts.hostname, row.fqdn)).get() : undefined;
+    return found && found.username === username ? found.id : null;
+  };
+  const vhostsOf = (manifest: BackupManifest, username: string) => rowsOf(manifest, "vhosts", manifestVhostSchema).map((row) => ({ ...row, current: currentVhost(username, row) }));
+  const envOf = (manifest: BackupManifest, username: string) => rowsOf(manifest, "appEnv", manifestEnvSchema).map((row) => ({ ...row, vhost: currentVhost(username, row) }));
+
   /** The manifest apps, with their configuration validated like the form's. */
-  const appsOf = (manifest: BackupManifest) => (Array.isArray(manifest.panel.apps) ? (manifest.panel.apps as Record<string, unknown>[]) : []).flatMap((row) => {
-    const parsed = manifestAppSchema.safeParse({ fqdn: row.fqdn, config: pickConfig(row) });
+  const appsOf = (manifest: BackupManifest, username: string) => (Array.isArray(manifest.panel.apps) ? (manifest.panel.apps as Record<string, unknown>[]) : []).flatMap((row) => {
+    const key = { vhost: typeof row.vhost === "number" ? row.vhost : undefined, fqdn: typeof row.fqdn === "string" ? row.fqdn : undefined };
+    const parsed = manifestAppSchema.safeParse({ vhost: currentVhost(username, key), config: pickConfig(row) });
     return parsed.success ? [parsed.data] : [];
   });
 
-  const envFor = (fqdn: string) => {
-    const rows = db.select().from(appEnv).where(eq(appEnv.fqdn, fqdn)).all();
+  const envFor = (vhostId: number) => {
+    const rows = db.select().from(appEnv).where(eq(appEnv.vhost, vhostId)).all();
     const pick = (scope: "runtime" | "build") => Object.fromEntries(rows.filter((row) => row.scope === scope || row.scope === "both").map(({ key, value }) => [key, value]));
     return { runtime: pick("runtime"), build: pick("build") };
   };

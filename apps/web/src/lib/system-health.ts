@@ -35,7 +35,7 @@ export function useSystemHealth(): SystemHealth {
   if (info.isError) issues.push({ text: "The agent is not responding", severity: "critical" });
 
   const down = environments.data?.filter((e) => e.health === "down") ?? [];
-  if (down.length === 1) issues.push({ text: "{{fqdn}} is down", values: { fqdn: down[0]!.fqdn }, severity: "critical" });
+  if (down.length === 1) issues.push({ text: "{{fqdn}} is down", values: { fqdn: down[0]!.name }, severity: "critical" });
   else if (down.length > 1) issues.push({ text: "{{count}} environments are down", values: { count: down.length }, severity: "critical" });
 
   const cpu = metrics.data?.points.at(-1)?.cpu;

@@ -340,7 +340,7 @@ function DestinationDialog({ open, title, description, initial, busy, onClose, o
           </DialogHeader>
           <div className="grid gap-2">
             <Label htmlFor="file-destination">{t("Folder")}</Label>
-            <Input id="file-destination" className="font-mono" placeholder="public_html" value={to} autoFocus onChange={(event) => setTo(event.target.value)} />
+            <Input id="file-destination" className="font-mono" placeholder="sites/example.com/public_html" value={to} autoFocus onChange={(event) => setTo(event.target.value)} />
           </div>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={onClose}>{t("Cancel")}</Button>

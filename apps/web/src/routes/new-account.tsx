@@ -14,23 +14,19 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { api } from "@/lib/api";
-import { PhpSelect, PreflightWarning, usePhpVersions } from "@/routes/accounts";
+import { PreflightWarning } from "@/routes/accounts";
 
 export function NewAccountPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const versions = usePhpVersions();
   const [username, setUsername] = useState("");
-  const [domain, setDomain] = useState("");
   const [limits, setLimits] = useState(() => limitsToForm(DEFAULT_LIMITS));
-  const [phpVersion, setPhpVersion] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [ftpPassword, setFtpPassword] = useState<string | null>(null);
   const goToAccount = () => void navigate({ to: "/accounts/$username", params: { username } });
 
-  const php = phpVersion || versions.data?.versions[0] || "";
   const create = useMutation({
-    mutationFn: () => api.post<JobCreatedDto>("/accounts", { username, domain, phpVersion: php, limits: limitsFromForm(limits) }),
+    mutationFn: () => api.post<JobCreatedDto>("/accounts", { username, limits: limitsFromForm(limits) }),
     onMutate: () => setJobId(null),
     onSuccess: ({ jobId: id }) => setJobId(id),
   });
@@ -46,7 +42,7 @@ export function NewAccountPage() {
       <Card className="max-w-2xl">
         <CardHeader>
           <CardTitle>{t("New account")}</CardTitle>
-          <CardDescription>{t("Creates the user, its home directory, the disk quota, the FTP account and the primary PHP environment.")}</CardDescription>
+          <CardDescription>{t("Creates the user, its home directory, the disk quota and the general FTP account. Domains and environments are added from the account.")}</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={submit} className="flex flex-col gap-6">
@@ -54,14 +50,6 @@ export function NewAccountPage() {
               <div className="grid gap-2">
                 <Label htmlFor="username">{t("Username")}</Label>
                 <Input id="username" value={username} onChange={(event) => setUsername(event.target.value.toLowerCase())} placeholder="acme" autoComplete="off" spellCheck={false} required />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="domain">{t("Domain")}</Label>
-                <Input id="domain" value={domain} onChange={(event) => setDomain(event.target.value.toLowerCase().trim())} placeholder="example.com" autoComplete="off" spellCheck={false} required />
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="php">{t("PHP version")}</Label>
-                <PhpSelect id="php" value={php} onChange={setPhpVersion} />
               </div>
             </div>
             <Separator />
@@ -88,7 +76,7 @@ export function NewAccountPage() {
               />
             )}
             <div>
-              <Button type="submit" disabled={create.isPending || !php}>{t("Create account")}</Button>
+              <Button type="submit" disabled={create.isPending}>{t("Create account")}</Button>
             </div>
           </form>
         </CardContent>

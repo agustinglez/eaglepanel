@@ -1,4 +1,4 @@
-import type { AccountService, AgentOpParams } from "@eaglepanel/shared";
+import { siteDir, siteFtpLogin, type AccountService, type AgentOpParams } from "@eaglepanel/shared";
 import type { CommandResult, Host } from "./host";
 
 // ---------------------------------------------------------------------------- FTP
@@ -21,14 +21,21 @@ export function parseFtpUsers(content: string | null): Map<string, string> {
 const renderFtpUsers = (users: [string, string][]) => users.map(([username, hash]) => `${username}\n${hash}\n`).join("");
 const parseLines = (content: string | null) => new Set((content ?? "").split("\n").filter(Boolean));
 
+/** Account that owns an FTP login: the account itself, or what follows `@` for an environment (`slug@account`). */
+const ftpOwner = (login: string) => login.split("@")[1] ?? login;
+
 /**
  * The database is built separately and replaced as a whole: vsftpd never sees a half-written one. A suspended account keeps its
- * hash in `users.txt`, to come back with the same password, but it is not in the database used for login.
+ * hashes in `users.txt`, to come back with the same passwords, but neither it nor its environments are in the database used for login.
  */
 async function writeFtpUsers(host: Host, users: Map<string, string>): Promise<void> {
   await host.writeFileAtomic(FTP_USERS, renderFtpUsers([...users]), 0o600);
   const suspended = parseLines(await host.readFile(FTP_SUSPENDED));
-  const active = [...users].filter(([username]) => !suspended.has(username));
+  const active: [string, string][] = [];
+  for (const entry of users) {
+    const owner = ftpOwner(entry[0]);
+    if (owner && !suspended.has(owner)) active.push(entry);
+  }
   const next = `${FTP_DB}.new`;
   await check(host, "rm", ["-f", next]);
   if (active.length === 0) {
@@ -47,42 +54,87 @@ export async function setFtpSuspended(host: Host, username: string, suspended: b
   const list = parseLines(await host.readFile(FTP_SUSPENDED));
   if (suspended) list.add(username);
   else list.delete(username);
-  await host.writeFileAtomic(FTP_SUSPENDED, [...list].map((name) => `${name}\n`).join(""), 0o600);
+  await host.writeFileAtomic(FTP_SUSPENDED, [...list].map((name) => `${name}
+`).join(""), 0o600);
   await writeFtpUsers(host, parseFtpUsers(await host.readFile(FTP_USERS)));
   if (!suspended) return;
   // Removing it from the database only stops new logins. Measured on the VPS: an open session kept responding.
+  // Environment logins run as the same Linux user: this closes them too.
   const { code, stderr } = await host.run("pkill", ["-KILL", "-u", username, "-x", "vsftpd"]);
   if (code > 1) throw new Error(`Could not close the FTP sessions: ${stderr.trim().slice(0, 200)}`);
 }
 
-export async function setFtpPassword(host: Host, username: string, password: string): Promise<void> {
+async function hashPassword(host: Host, password: string): Promise<string> {
   const { stdout } = await check(host, "openssl", ["passwd", "-6", "-stdin"], password);
   const hash = host.sandbox ? "$6$sandbox" : stdout.trim();
   if (!hash.startsWith("$6$")) throw new Error("Could not generate the password hash");
+  return hash;
+}
 
+/**
+ * vsftpd shares the directory between the virtual user and its real owner, and locks the login inside it: the account
+ * sees its whole home directory, an environment only `sites/<slug>`.
+ */
+async function saveFtpUser(host: Host, login: string, owner: string, root: string, hash: string): Promise<void> {
   await check(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "700", FTP_DIR, `${FTP_DIR}/vusers`]);
-  // The root is the home directory: vsftpd shares it between the virtual user and its real owner.
-  await host.writeFileAtomic(ftpUserFile(username), `guest_username=${username}\nlocal_root=/home/${username}\n`, 0o600);
+  await host.writeFileAtomic(ftpUserFile(login), `guest_username=${owner}
+local_root=${root}
+`, 0o600);
   const users = parseFtpUsers(await host.readFile(FTP_USERS));
-  users.set(username, hash);
+  users.set(login, hash);
   await writeFtpUsers(host, users);
+}
+
+export async function setFtpPassword(host: Host, username: string, password: string): Promise<void> {
+  await saveFtpUser(host, username, username, `/home/${username}`, await hashPassword(host, password));
 }
 
 /** Migration: the same hash it had at the source, so the account keeps logging in with its password. */
 export async function setFtpHash(host: Host, username: string, hash: string): Promise<void> {
-  await check(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "700", FTP_DIR, `${FTP_DIR}/vusers`]);
-  await host.writeFileAtomic(ftpUserFile(username), `guest_username=${username}\nlocal_root=/home/${username}\n`, 0o600);
-  const users = parseFtpUsers(await host.readFile(FTP_USERS));
-  users.set(username, hash);
-  await writeFtpUsers(host, users);
+  await saveFtpUser(host, username, username, `/home/${username}`, hash);
 }
 
+/** The directory must exist: vsftpd rejects the login if it cannot enter it. */
+export async function setSiteFtpPassword(host: Host, username: string, site: string, password: string): Promise<void> {
+  const root = `/home/${username}/${siteDir(site)}`;
+  if (!host.sandbox && (await host.run("test", ["-d", root])).code !== 0) throw new Error(`${root} does not exist`);
+  await saveFtpUser(host, siteFtpLogin(site, username), username, root, await hashPassword(host, password));
+}
+
+async function dropFtpLogins(host: Host, logins: string[]): Promise<void> {
+  if (logins.length === 0) return;
+  const users = parseFtpUsers(await host.readFile(FTP_USERS));
+  let changed = false;
+  for (const login of logins) changed = users.delete(login) || changed;
+  if (changed) await writeFtpUsers(host, users);
+  for (const login of logins) await check(host, "rm", ["-f", "--", ftpUserFile(login)]);
+}
+
+export async function removeSiteFtp(host: Host, username: string, site: string): Promise<void> {
+  // An open session keeps working until it disconnects: its process runs as the account, like the others, and
+  // closing them all would cut the account and its other environments.
+  await dropFtpLogins(host, [siteFtpLogin(site, username)]);
+}
+
+/** A renamed environment keeps its FTP access and password, with the new login and directory. */
+export async function renameSiteFtp(host: Host, username: string, from: string, to: string): Promise<void> {
+  const users = parseFtpUsers(await host.readFile(FTP_USERS));
+  const hash = users.get(siteFtpLogin(from, username));
+  if (!hash) return;
+  await saveFtpUser(host, siteFtpLogin(to, username), username, `/home/${username}/${siteDir(to)}`, hash);
+  await dropFtpLogins(host, [siteFtpLogin(from, username)]);
+}
+
+/** The account login and those of its environments. */
 export async function removeFtpUser(host: Host, username: string): Promise<void> {
   const suspended = parseLines(await host.readFile(FTP_SUSPENDED));
-  if (suspended.delete(username)) await host.writeFileAtomic(FTP_SUSPENDED, [...suspended].map((name) => `${name}\n`).join(""), 0o600);
-  const users = parseFtpUsers(await host.readFile(FTP_USERS));
-  if (users.delete(username)) await writeFtpUsers(host, users);
-  await check(host, "rm", ["-f", "--", ftpUserFile(username)]);
+  if (suspended.delete(username)) await host.writeFileAtomic(FTP_SUSPENDED, [...suspended].map((name) => `${name}
+`).join(""), 0o600);
+  const logins = [username];
+  for (const login of parseFtpUsers(await host.readFile(FTP_USERS)).keys()) {
+    if (login !== username && ftpOwner(login) === username) logins.push(login);
+  }
+  await dropFtpLogins(host, logins);
 }
 
 // ---------------------------------------------------------------------------- MySQL

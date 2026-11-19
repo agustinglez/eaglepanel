@@ -259,7 +259,7 @@ function RestoreFilesDialog({ username, run, onClose }: { username: string; run:
         </DialogHeader>
         <div className="grid gap-2">
           <Label htmlFor="restore-path">{t("Directory or file")}</Label>
-          <Input id="restore-path" className="font-mono" value={path} onChange={(event) => setPath(event.target.value)} placeholder={t("Empty: the whole home directory. For example: public_html/wp-content")} spellCheck={false} />
+          <Input id="restore-path" className="font-mono" value={path} onChange={(event) => setPath(event.target.value)} placeholder={t("Empty: the whole home directory. For example: sites/example.com/public_html/wp-content")} spellCheck={false} />
         </div>
         <RadioGroup value={mode} onValueChange={(value) => setMode(value as "folder" | "inplace")} className="grid gap-3">
           <label className="flex items-start gap-2 text-sm">
@@ -291,16 +291,16 @@ const PARTS = [
 function RestoreConfigDialog({ username, run, manifest, onClose }: { username: string; run: BackupRunDto; manifest: string; onClose: () => void }) {
   const { t } = useTranslation();
   const summary = useQuery({ queryKey: ["backup-manifest", username, manifest], queryFn: () => api.get<BackupManifestSummaryDto>(`/accounts/${username}/backups/manifest/${manifest}`) });
-  const [fqdns, setFqdns] = useState<Set<string>>(new Set());
+  const [ids, setIds] = useState<Set<number>>(new Set());
   const [parts, setParts] = useState<Set<string>>(new Set(["options", "env"]));
-  const restore = useJobAction(() => api.post<JobCreatedDto>(`/accounts/${username}/backups/restore-config`, { manifest, fqdns: [...fqdns], parts: [...parts] }));
-  const toggle = (set: Set<string>, value: string, on: boolean) => {
+  const restore = useJobAction(() => api.post<JobCreatedDto>(`/accounts/${username}/backups/restore-config`, { manifest, vhosts: [...ids], parts: [...parts] }));
+  const toggle = <T,>(set: Set<T>, value: T, on: boolean) => {
     const next = new Set(set);
     if (on) next.add(value);
     else next.delete(value);
     return next;
   };
-  const usable = summary.data?.vhosts.filter((vhost) => vhost.exists && vhost.sameType) ?? [];
+  const usable = summary.data?.vhosts.flatMap((vhost) => (vhost.exists && vhost.sameType && vhost.id !== null ? [{ ...vhost, id: vhost.id }] : [])) ?? [];
   const missing = summary.data?.vhosts.filter((vhost) => !vhost.exists || !vhost.sameType) ?? [];
 
   return (
@@ -318,13 +318,13 @@ function RestoreConfigDialog({ username, run, manifest, onClose }: { username: s
               <Label>{t("Environments")}</Label>
               {usable.length === 0 && <p className="text-sm text-muted-foreground">{t("None of the environments in the backup still exist in the account.")}</p>}
               {usable.map((vhost) => (
-                <label key={vhost.fqdn} className="flex items-center gap-2 text-sm">
-                  <Checkbox checked={fqdns.has(vhost.fqdn)} onCheckedChange={(on) => setFqdns((current) => toggle(current, vhost.fqdn, on))} />
-                  <span className="font-mono">{vhost.fqdn}</span>
+                <label key={vhost.id} className="flex items-center gap-2 text-sm">
+                  <Checkbox checked={ids.has(vhost.id)} onCheckedChange={(on) => setIds((current) => toggle(current, vhost.id, on))} />
+                  <span>{vhost.name}</span>
                   <span className="text-muted-foreground">{vhost.type === "app" ? t("app · {{count}} variables", { count: vhost.envKeys.length }) : "PHP"}</span>
                 </label>
               ))}
-              {missing.length > 0 && <p className="text-xs text-muted-foreground">{t("Cannot be restored here: {{list}}.", { list: missing.map(({ fqdn }) => fqdn).join(", ") })}</p>}
+              {missing.length > 0 && <p className="text-xs text-muted-foreground">{t("Cannot be restored here: {{list}}.", { list: missing.map(({ name }) => name).join(", ") })}</p>}
             </div>
             <div className="grid gap-2">
               <Label>{t("What to restore")}</Label>
@@ -340,7 +340,7 @@ function RestoreConfigDialog({ username, run, manifest, onClose }: { username: s
         <ActionFeedback action={restore} />
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>{t("Close")}</Button>
-          <Button disabled={restore.isPending || fqdns.size === 0 || parts.size === 0} onClick={() => restore.mutate()}>{t("Restore")}</Button>
+          <Button disabled={restore.isPending || ids.size === 0 || parts.size === 0} onClick={() => restore.mutate()}>{t("Restore")}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

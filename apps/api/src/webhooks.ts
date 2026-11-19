@@ -38,7 +38,8 @@ export function parsePayload(contentType: string | undefined, body: Uint8Array):
 }
 
 export interface HookApp {
-  fqdn: string;
+  /** Its environment. */
+  vhost: number;
   username: string;
   repoUrl: string;
   branch: string;
@@ -52,7 +53,7 @@ export interface WebhookDeps {
   accountForHookDomain: (fqdn: string) => string | null;
   apps: () => HookApp[];
   /** Enters the app queue: starts now or when the running deployment finishes. */
-  deploy: (fqdn: string, trigger: string, commit?: string) => { jobId: string | null; position: number } | { error: string };
+  deploy: (vhost: number, trigger: string, commit?: string) => { jobId: string | null; position: number } | { error: string };
 }
 
 export function registerWebhookRoutes<E extends Env>(app: Hono<E>, { hooksDomain, accountForHookDomain, apps, deploy }: WebhookDeps) {
@@ -78,7 +79,7 @@ export function registerWebhookRoutes<E extends Env>(app: Hono<E>, { hooksDomain
     if (verified.length === 0) return c.json({ error: "Invalid signature" }, 401);
 
     const event = c.req.header("x-github-event");
-    if (event === "ping") return c.json({ ok: true, apps: verified.map(({ fqdn }) => fqdn) });
+    if (event === "ping") return c.json({ ok: true, apps: verified.map(({ vhost }) => vhost) });
     if (event !== "push") return c.json({ ignored: `evento ${event ?? "desconocido"}` }, 202);
     const ref = typeof payload?.ref === "string" ? payload.ref : "";
     if (payload?.deleted === true || !ref.startsWith("refs/heads/")) return c.json({ ignored: "not a push to a branch" }, 202);
@@ -86,14 +87,14 @@ export function registerWebhookRoutes<E extends Env>(app: Hono<E>, { hooksDomain
     // The push commit is deployed, not the branch tip: if it is queued, each push gets its own release.
     const commit = typeof payload?.after === "string" && /^[0-9a-f]{40}$/.test(payload.after) ? payload.after : undefined;
 
-    const deployed: string[] = [];
-    const queued: { fqdn: string; position: number }[] = [];
-    const skipped: { fqdn: string; reason: string }[] = [];
+    const deployed: number[] = [];
+    const queued: { vhost: number; position: number }[] = [];
+    const skipped: { vhost: number; reason: string }[] = [];
     for (const item of verified.filter((candidate) => candidate.branch === branch)) {
-      const result = deploy(item.fqdn, `GitHub webhook, ${branch} ${commit?.slice(0, 7) ?? ""}`.trim(), commit);
-      if ("error" in result) skipped.push({ fqdn: item.fqdn, reason: result.error });
-      else if (result.jobId) deployed.push(item.fqdn);
-      else queued.push({ fqdn: item.fqdn, position: result.position });
+      const result = deploy(item.vhost, `GitHub webhook, ${branch} ${commit?.slice(0, 7) ?? ""}`.trim(), commit);
+      if ("error" in result) skipped.push({ vhost: item.vhost, reason: result.error });
+      else if (result.jobId) deployed.push(item.vhost);
+      else queued.push({ vhost: item.vhost, position: result.position });
     }
     return c.json({ deployed, queued, skipped }, 202);
   });

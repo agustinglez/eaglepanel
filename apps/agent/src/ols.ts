@@ -32,7 +32,7 @@ const ERROR_REPORTING_VALUES: Record<ErrorLevel, number> = { E_ALL: 32767, "E_AL
 
 export interface SiteConfig {
   username: string;
-  fqdn: string;
+  site: string;
   /** Relative to the account home directory. */
   docRoot: string;
   phpVersion: string;
@@ -55,8 +55,9 @@ export interface SiteFacts {
 }
 
 export interface SyncedSite {
-  fqdn: string;
+  site: string;
   username: string;
+  hostname: string;
   certZone: string | null;
   originPull: boolean;
 }
@@ -68,27 +69,28 @@ const originPullSsl = `  clientVerify            2
   CACertFile              ${ORIGIN_PULL_CA_PATH}
 `;
 
-export const vhostDir = (fqdn: string) => `${LSWS}/conf/vhosts/${fqdn}`;
+export const vhostDir = (site: string) => `${LSWS}/conf/vhosts/${site}`;
 /** Outside the home directory: the account cannot change or delete what OLS writes, which runs with more privileges. */
-export const vhostLogDir = (fqdn: string) => `/var/log/eaglepanel/vhosts/${fqdn}`;
+export const vhostLogDir = (site: string) => `/var/log/eaglepanel/vhosts/${site}`;
 /** Initial value, in the home directory. It belongs to the account, as on any hosting: it can change or delete it. If moved, the panel stops rotating it. */
-export const phpLogPath = (username: string, fqdn: string) => `/home/${username}/logs/${fqdn}.php_error.log`;
-/** `.conf` because logrotate skips certain suffixes, and a domain could end in one of them. */
-export const logrotatePath = (fqdn: string) => `/etc/logrotate.d/eaglepanel-${fqdn}.conf`;
+export const phpLogDir = (username: string, site: string) => `/home/${username}/sites/${site}/logs`;
+export const phpLogPath = (username: string, site: string) => `${phpLogDir(username, site)}/php_error.log`;
+/** `.conf` because logrotate skips certain suffixes. */
+export const logrotatePath = (site: string) => `/etc/logrotate.d/eaglepanel-${site}.conf`;
 
 /**
  * OLS logs: its own rotation did not act at 10 KB on the VPS, not even with the directory owned by its user. With
  * copytruncate, OLS keeps writing without leaving a sparse file.
  *
- * PHP error_log: packed into a tar.gz when it reaches 20 MB or once a month, inside logs/, and the panel does not
+ * PHP error_log: packed into a tar.gz when it reaches 20 MB or once a month, inside the environment logs/, and the panel does not
  * delete those files: they belong to the account and count toward its quota. `su` is not enough for packing: tested on
  * the VPS, postrotate still runs as root, in a directory the account controls. That is why it uses setpriv.
  */
-export function renderLogrotate({ username, fqdn, logDays }: Pick<SiteConfig, "username" | "fqdn" | "logDays">): string {
-  const phpLog = phpLogPath(username, fqdn);
+export function renderLogrotate({ username, site, logDays, app }: Pick<SiteConfig, "username" | "site" | "logDays" | "app">): string {
+  const phpLog = phpLogPath(username, site);
   const phpLogName = phpLog.slice(phpLog.lastIndexOf("/") + 1);
-  const pack = `cd /home/${username}/logs || exit 1; for f in ${phpLogName}-*; do case "$f" in *.tar.gz) continue ;; esac; if [ -f "$f" ] && [ ! -L "$f" ]; then tar -czf "$f.tar.gz" -- "$f" && rm -f -- "$f"; fi; done`;
-  return `${vhostLogDir(fqdn)}/*.log {
+  const pack = `cd ${phpLogDir(username, site)} || exit 1; for f in ${phpLogName}-*; do case "$f" in *.tar.gz) continue ;; esac; if [ -f "$f" ] && [ ! -L "$f" ]; then tar -czf "$f.tar.gz" -- "$f" && rm -f -- "$f"; fi; done`;
+  return `${vhostLogDir(site)}/*.log {
   daily
   rotate ${logDays}
   maxage ${logDays}
@@ -98,7 +100,7 @@ export function renderLogrotate({ username, fqdn, logDays }: Pick<SiteConfig, "u
   delaycompress
   copytruncate
 }
-
+${app ? "" : `
 ${phpLog} {
   su ${username} ${username}
   monthly
@@ -114,7 +116,7 @@ ${phpLog} {
     /usr/bin/setpriv --reuid=${username} --regid=${username} --clear-groups /bin/sh -c '${pack}'
   endscript
 }
-`;
+`}`;
 }
 export const certPath = (zone: string) => `${CERTS_DIR}/${zone}/origin.crt`;
 export const keyPath = (zone: string) => `${CERTS_DIR}/${zone}/origin.key`;
@@ -126,16 +128,16 @@ export const keyPath = (zone: string) => `${CERTS_DIR}/${zone}/origin.key`;
 export const SUSPENDED_DOC_ROOT = "/srv/eaglepanel/empty";
 
 /** Keeps certificate and logs: without the certificate, Cloudflare would answer 526 instead of the 503. */
-function renderSuspendedVhost({ fqdn, logLevel, ssl }: Pick<SiteConfig, "fqdn" | "logLevel"> & { ssl: string }): string {
+function renderSuspendedVhost({ site, logLevel, ssl }: Pick<SiteConfig, "site" | "logLevel"> & { ssl: string }): string {
   return `docRoot                   ${SUSPENDED_DOC_ROOT}
 
-errorlog ${vhostLogDir(fqdn)}/error.log {
+errorlog ${vhostLogDir(site)}/error.log {
   useServer               0
   logLevel                ${logLevel}
   rollingSize             0
 }
 
-accesslog ${vhostLogDir(fqdn)}/access.log {
+accesslog ${vhostLogDir(site)}/access.log {
   useServer               0
   logFormat               %h %l %u %t "%r" %>s %b
   rollingSize             0
@@ -156,11 +158,11 @@ ${ssl}`;
  * The port is always the same: inside the namespace it is redirected to the active slot, so switching releases does not
  * touch this file or restart OLS.
  */
-function renderAppVhost({ fqdn, logLevel, appId, redirect, ssl, hooks }: Pick<SiteConfig, "fqdn" | "logLevel" | "hooks"> & { appId: number; redirect: string; ssl: string }): string {
+function renderAppVhost({ site, logLevel, appId, redirect, ssl, hooks }: Pick<SiteConfig, "site" | "logLevel" | "hooks"> & { appId: number; redirect: string; ssl: string }): string {
   const address = `${appAddresses(appId).app}:${APP_PORT}`;
   return `docRoot                   ${SUSPENDED_DOC_ROOT}
 enableGzip                1
-${logBlocks(fqdn, logLevel)}
+${logBlocks(site, logLevel)}
 extprocessor app-${appId} {
   type                    proxy
   address                 ${address}
@@ -196,14 +198,14 @@ RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
  * 403. The fallback looks at Accept, like the Workers SPA mode: only a navigation receives index.html, and a missing
  * script or image does not arrive as a 200 with HTML inside.
  */
-function renderStaticVhost({ fqdn, logLevel, root, spaFallback, immutableAssets, certZone, ssl, hooks }: Pick<SiteConfig, "fqdn" | "logLevel" | "certZone" | "hooks"> & {
+function renderStaticVhost({ site, logLevel, root, spaFallback, immutableAssets, certZone, ssl, hooks }: Pick<SiteConfig, "site" | "logLevel" | "certZone" | "hooks"> & {
   root: string | null; spaFallback: boolean; immutableAssets: boolean; ssl: string;
 }): string {
   const redirect = certZone ? HTTPS_REDIRECT : "";
   // No published release yet: the same as an app before its first deployment.
   if (!root) {
     return `docRoot                   ${SUSPENDED_DOC_ROOT}
-${logBlocks(fqdn, logLevel)}
+${logBlocks(site, logLevel)}
 rewrite  {
   enable                  1
   rules                   <<<END_rules
@@ -230,7 +232,7 @@ context /assets/ {
     : "";
   return `docRoot                   ${root}
 enableGzip                1
-${logBlocks(fqdn, logLevel)}
+${logBlocks(site, logLevel)}
 index  {
   useServer               0
   indexFiles              index.html
@@ -251,15 +253,15 @@ ${spa}END_rules
 ${ssl}`;
 }
 
-function logBlocks(fqdn: string, logLevel: LogLevel): string {
+function logBlocks(site: string, logLevel: LogLevel): string {
   return `
-errorlog ${vhostLogDir(fqdn)}/error.log {
+errorlog ${vhostLogDir(site)}/error.log {
   useServer               0
   logLevel                ${logLevel}
   rollingSize             0
 }
 
-accesslog ${vhostLogDir(fqdn)}/access.log {
+accesslog ${vhostLogDir(site)}/access.log {
   useServer               0
   logFormat               %h %l %u %t "%r" %>s %b
   rollingSize             0
@@ -268,14 +270,14 @@ accesslog ${vhostLogDir(fqdn)}/access.log {
 }
 
 export function renderVhost(
-  { username, fqdn, docRoot, phpVersion, phpOptions, certZone, originPull, logLevel, suspended, app, hooks }: SiteConfig,
+  { username, site, docRoot, phpVersion, phpOptions, certZone, originPull, logLevel, suspended, app, hooks }: SiteConfig,
   facts: SiteFacts = { immutableAssets: false, staticRoot: null },
 ): string {
   const home = `/home/${username}`;
   const { children, memoryMb, indexFiles, gzip, htaccess, directives, flags } = phpOptions;
   // First what the user chose: the security directives, which come after, always win.
   const userIni = [
-    `  php_value error_log "${phpLogPath(username, fqdn)}"`,
+    `  php_value error_log "${phpLogPath(username, site)}"`,
     ...Object.entries(directives).map(([key, value]) => `  php_value ${key} "${key === "error_reporting" ? ERROR_REPORTING_VALUES[value as ErrorLevel] : value}"`),
     ...Object.entries(flags).map(([key, value]) => `  php_flag ${key} ${value ? "on" : "off"}`),
   ].join("\n");
@@ -305,22 +307,22 @@ ${originPull ? originPullSsl : ""}}
 `
     : "";
 
-  if (suspended) return renderSuspendedVhost({ fqdn, logLevel, ssl });
-  if (app?.kind === "server") return renderAppVhost({ fqdn, logLevel, appId: app.id, redirect: certZone ? rewrite : "", ssl, hooks });
+  if (suspended) return renderSuspendedVhost({ site, logLevel, ssl });
+  if (app?.kind === "server") return renderAppVhost({ site, logLevel, appId: app.id, redirect: certZone ? rewrite : "", ssl, hooks });
   if (app?.kind === "static") {
-    return renderStaticVhost({ fqdn, logLevel, certZone, ssl, hooks, root: facts.staticRoot, spaFallback: app.spaFallback, immutableAssets: facts.immutableAssets });
+    return renderStaticVhost({ site, logLevel, certZone, ssl, hooks, root: facts.staticRoot, spaFallback: app.spaFallback, immutableAssets: facts.immutableAssets });
   }
 
   return `docRoot                   ${home}/${docRoot}
 enableGzip                ${gzip ? 1 : 0}
 
-errorlog ${vhostLogDir(fqdn)}/error.log {
+errorlog ${vhostLogDir(site)}/error.log {
   useServer               0
   logLevel                ${logLevel}
   rollingSize             0
 }
 
-accesslog ${vhostLogDir(fqdn)}/access.log {
+accesslog ${vhostLogDir(site)}/access.log {
   useServer               0
   logFormat               %h %l %u %t "%r" %>s %b
   rollingSize             0
@@ -346,9 +348,9 @@ context exp:(^|/)\\.(?!well-known(/|$)) {
   allowBrowse             0
 }
 
-extprocessor lsphp-${fqdn} {
+extprocessor lsphp-${site} {
   type                    lsapi
-  address                 uds://tmp/lshttpd/${fqdn}.sock
+  address                 uds://tmp/lshttpd/${site}.sock
   maxConns                ${children}
   env                     PHP_LSAPI_CHILDREN=${children}
   env                     LSAPI_AVOID_FORK=200M
@@ -372,7 +374,7 @@ extprocessor lsphp-${fqdn} {
 }
 
 scripthandler  {
-  add                     lsapi:lsphp-${fqdn} php
+  add                     lsapi:lsphp-${site} php
 }
 ${ssl}`;
 }
@@ -451,13 +453,13 @@ export interface HooksSite {
 }
 
 function renderBlock(sites: SyncedSite[], hooks: HooksSite | null): string {
-  const sorted = [...sites].sort((a, b) => a.fqdn.localeCompare(b.fqdn));
+  const sorted = [...sites].sort((a, b) => a.site.localeCompare(b.site));
   const parts: string[] = [];
 
-  for (const { fqdn, username } of sorted) {
-    parts.push(`virtualhost ${fqdn} {
+  for (const { site, username } of sorted) {
+    parts.push(`virtualhost ${site} {
   vhRoot                  /home/${username}
-  configFile              conf/vhosts/${fqdn}/vhost.conf
+  configFile              conf/vhosts/${site}/vhost.conf
   allowSymbolLink         0
   enableScript            1
   restrained              1
@@ -477,7 +479,7 @@ function renderBlock(sites: SyncedSite[], hooks: HooksSite | null): string {
 
   const hooksMap = (secure: boolean) => (hooks && (!secure || hooks.certZone) ? `\n  map                     ${HOOKS_VHOST} ${hooks.fqdn}` : "");
   const map = (list: SyncedSite[], secure: boolean) =>
-    `${list.map(({ fqdn }) => `  map                     ${fqdn} ${fqdn}`).join("\n")}${hooksMap(secure)}`.replace(/^\n/, "");
+    `${list.map(({ site, hostname }) => `  map                     ${site} ${hostname}`).join("\n")}${hooksMap(secure)}`.replace(/^\n/, "");
 
   if (sorted.length > 0 || hooks) {
     parts.push(`listener eaglepanel-http {

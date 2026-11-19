@@ -85,17 +85,17 @@ export function Field({ label, htmlFor, hint, children }: { label: string; htmlF
   );
 }
 
-const memoryFree = (account: AccountDto, fqdn: string) =>
-  account.limits.appMemoryMb - account.vhosts.filter((vhost) => vhost.fqdn !== fqdn && vhost.app).reduce((total, vhost) => total + (vhost.app ? appReservedMemory(vhost.app.config) : 0), 0);
+const memoryFree = (account: AccountDto, vhostId: number) =>
+  account.limits.appMemoryMb - account.vhosts.filter((vhost) => vhost.id !== vhostId && vhost.app).reduce((total, vhost) => total + (vhost.app ? appReservedMemory(vhost.app.config) : 0), 0);
 
 /** Used both to convert a PHP environment and to edit an app's configuration. */
 export function AppConfigForm({ account, vhost }: { account: AccountDto; vhost: VhostDto }) {
   const { t } = useTranslation();
-  const defaultMemory = Math.min(256, Math.max(64, memoryFree(account, vhost.fqdn)));
+  const defaultMemory = Math.min(256, Math.max(64, memoryFree(account, vhost.id)));
   const initial: AppConfig = vhost.app?.config ?? { repoUrl: "", branch: "main", subdir: "", healthPath: "/", spaFallback: true, memoryMb: 0, ...PRESETS.spa!.config };
   const [config, setConfig] = useState<AppConfig>(initial);
-  const save = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.fqdn}/app`, config));
-  const available = memoryFree(account, vhost.fqdn);
+  const save = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.id}/app`, config));
+  const available = memoryFree(account, vhost.id);
   const set = <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => setConfig({ ...config, [key]: value });
   // A static site reserves no memory: switching to server proposes a value that fits in the account.
   const setKind = (kind: AppKind) => setConfig({ ...config, kind, memoryMb: kind === "server" ? config.memoryMb || defaultMemory : 0 });
@@ -243,7 +243,7 @@ function DeployKeyField({ vhost }: { vhost: VhostDto }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const key = useMutation({
-    mutationFn: () => api.post<{ publicKey: string }>(`/vhosts/${vhost.fqdn}/app/deploy-key`),
+    mutationFn: () => api.post<{ publicKey: string }>(`/vhosts/${vhost.id}/app/deploy-key`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["accounts"] }),
   });
   const instructions = t("In GitHub: Settings → Deploy keys → Add deploy key, without write access.");
@@ -270,7 +270,7 @@ function AutoDeployCard({ vhost, app }: { vhost: VhostDto; app: AppDto }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const toggle = useMutation({
-    mutationFn: (enabled: boolean) => api.post<{ ok: true }>(`/vhosts/${vhost.fqdn}/webhook`, { enabled }),
+    mutationFn: (enabled: boolean) => api.post<{ ok: true }>(`/vhosts/${vhost.id}/webhook`, { enabled }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["accounts"] }),
   });
   const { secret, urls } = app.webhook;
@@ -328,10 +328,10 @@ function AutoDeployCard({ vhost, app }: { vhost: VhostDto; app: AppDto }) {
 
 // ---------------------------------------------------------------------------- Summary
 
-function useAppStatus(fqdn: string, enabled: boolean) {
+function useAppStatus(vhostId: number, enabled: boolean) {
   return useQuery({
-    queryKey: ["app-status", fqdn],
-    queryFn: () => api.get<{ state: string; restarts: number; memoryBytes: number | null; sinceMs: number | null }>(`/vhosts/${fqdn}/app/status`),
+    queryKey: ["app-status", vhostId],
+    queryFn: () => api.get<{ state: string; restarts: number; memoryBytes: number | null; sinceMs: number | null }>(`/vhosts/${vhostId}/app/status`),
     refetchInterval: 5000,
     enabled,
   });
@@ -340,13 +340,13 @@ function useAppStatus(fqdn: string, enabled: boolean) {
 function SummaryTab({ account, vhost, app }: { account: AccountDto; vhost: VhostDto; app: AppDto }) {
   const { t } = useTranslation();
   const isServer = app.config.kind === "server";
-  const status = useAppStatus(vhost.fqdn, isServer && app.currentRelease !== null);
-  const deploy = useJobAction(() => api.post<DeployRequestDto>(`/vhosts/${vhost.fqdn}/deploy`));
-  const control = useJobAction((action: "start" | "stop" | "restart") => api.post<JobCreatedDto>(`/vhosts/${vhost.fqdn}/app/${action}`));
+  const status = useAppStatus(vhost.id, isServer && app.currentRelease !== null);
+  const deploy = useJobAction(() => api.post<DeployRequestDto>(`/vhosts/${vhost.id}/deploy`));
+  const control = useJobAction((action: "start" | "stop" | "restart") => api.post<JobCreatedDto>(`/vhosts/${vhost.id}/app/${action}`));
   const queryClient = useQueryClient();
   // Not a job: the agent generates it on demand. The account must be reloaded to show it.
   const key = useMutation({
-    mutationFn: () => api.post<{ publicKey: string }>(`/vhosts/${vhost.fqdn}/app/deploy-key`),
+    mutationFn: () => api.post<{ publicKey: string }>(`/vhosts/${vhost.id}/app/deploy-key`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["accounts"] }),
   });
   const ssh = !app.config.repoUrl.startsWith("https://");
@@ -383,7 +383,7 @@ function SummaryTab({ account, vhost, app }: { account: AccountDto; vhost: Vhost
       )}
       <Card>
         <CardHeader>
-          <CardTitle>{vhost.fqdn}</CardTitle>
+          <CardTitle>{vhost.name}</CardTitle>
           <CardDescription>{isServer ? t("Server") : t("Static site")} · {app.config.runtime === "node" ? "Node" : "Bun"} {app.config.runtimeVersion} · {app.config.repoUrl} · {app.config.branch}</CardDescription>
           <CardAction><Badge variant={STATUS[app.status].variant}>{!isServer && app.status === "online" ? t("Published") : t(STATUS[app.status].label)}</Badge></CardAction>
         </CardHeader>
@@ -432,13 +432,13 @@ function SummaryTab({ account, vhost, app }: { account: AccountDto; vhost: Vhost
 
 function DeploymentsTab({ vhost, app }: { vhost: VhostDto; app: AppDto }) {
   const { t } = useTranslation();
-  const list = useQuery({ queryKey: ["deployments", vhost.fqdn, app.currentRelease, app.status], queryFn: () => api.get<DeploymentDto[]>(`/vhosts/${vhost.fqdn}/deployments`), refetchInterval: app.status === "deploying" ? 3000 : false });
+  const list = useQuery({ queryKey: ["deployments", vhost.id, app.currentRelease, app.status], queryFn: () => api.get<DeploymentDto[]>(`/vhosts/${vhost.id}/deployments`), refetchInterval: app.status === "deploying" ? 3000 : false });
   const [viewing, setViewing] = useState<DeploymentDto | null>(null);
-  const log = useQuery({ queryKey: ["deployment-log", viewing?.id], queryFn: () => api.get<{ log: string }>(`/vhosts/${vhost.fqdn}/deployments/${viewing?.id}/log`), enabled: viewing !== null, refetchInterval: viewing?.status === "running" ? 2000 : false });
-  const rollback = useJobAction((id: number) => api.post<JobCreatedDto>(`/vhosts/${vhost.fqdn}/deployments/${id}/rollback`));
+  const log = useQuery({ queryKey: ["deployment-log", viewing?.id], queryFn: () => api.get<{ log: string }>(`/vhosts/${vhost.id}/deployments/${viewing?.id}/log`), enabled: viewing !== null, refetchInterval: viewing?.status === "running" ? 2000 : false });
+  const rollback = useJobAction((id: number) => api.post<JobCreatedDto>(`/vhosts/${vhost.id}/deployments/${id}/rollback`));
   const queryClient = useQueryClient();
   const cancel = useMutation({
-    mutationFn: (id: number) => api.post<{ ok: true }>(`/vhosts/${vhost.fqdn}/queue/${id}/cancel`),
+    mutationFn: (id: number) => api.post<{ ok: true }>(`/vhosts/${vhost.id}/queue/${id}/cancel`),
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["accounts"] }),
   });
 
@@ -567,7 +567,7 @@ function VariablesTab({ vhost, app }: { vhost: VhostDto; app: AppDto }) {
   const [pasted, setPasted] = useState("");
   const [pasteOpen, setPasteOpen] = useState(false);
   const [notice, setNotice] = useState("");
-  const save = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.fqdn}/env`, { vars }));
+  const save = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.id}/env`, { vars }));
   const dirty = JSON.stringify(vars) !== JSON.stringify(app.env);
 
   function add(event: SyntheticEvent) {
@@ -679,8 +679,8 @@ function AppLogsTab({ vhost }: { vhost: VhostDto }) {
   const { t } = useTranslation();
   const [live, setLive] = useState(true);
   const logs = useQuery({
-    queryKey: ["app-logs", vhost.fqdn],
-    queryFn: () => api.get<{ lines: string[] }>(`/vhosts/${vhost.fqdn}/app/logs?lines=200`),
+    queryKey: ["app-logs", vhost.id],
+    queryFn: () => api.get<{ lines: string[] }>(`/vhosts/${vhost.id}/app/logs?lines=200`),
     refetchInterval: (query) => (live && !query.state.error ? 3000 : false),
   });
   const output = useRef<HTMLPreElement>(null);
@@ -714,7 +714,7 @@ function AppLogsTab({ vhost }: { vhost: VhostDto }) {
 
 function ConfigTab({ account, vhost }: { account: AccountDto; vhost: VhostDto }) {
   const { t } = useTranslation();
-  const toPhp = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.fqdn}/to-php`));
+  const toPhp = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.id}/to-php`));
   return (
     <div className="flex flex-col gap-4">
       <AppConfigForm key={JSON.stringify(vhost.app?.config)} account={account} vhost={vhost} />
@@ -729,7 +729,7 @@ function ConfigTab({ account, vhost }: { account: AccountDto; vhost: VhostDto })
               <AlertDialogTrigger render={<Button variant="outline" />}>{t("Switch to PHP")}</AlertDialogTrigger>
               <AlertDialogContent>
                 <AlertDialogHeader>
-                  <AlertDialogTitle>{t("Switch {{name}} to PHP?", { name: vhost.fqdn })}</AlertDialogTitle>
+                  <AlertDialogTitle>{t("Switch {{name}} to PHP?", { name: vhost.name })}</AlertDialogTitle>
                   <AlertDialogDescription>{t("The app is stopped and its deployments and variables are deleted. This cannot be undone.")}</AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>

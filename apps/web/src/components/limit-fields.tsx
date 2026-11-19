@@ -27,7 +27,7 @@ export const limitsFromForm = (form: LimitsForm): AccountLimits => ({
 const FIELDS: { key: keyof AccountLimits; label: string; min: string; step: string; hint?: string }[] = [
   { key: "quotaMb", label: "Disk (GB)", min: "0.1", step: "0.1" },
   { key: "domains", label: "Domains", min: "1", step: "1" },
-  { key: "vhosts", label: "Additional environments", min: "0", step: "1", hint: "Excluding the primary one." },
+  { key: "vhosts", label: "Environments", min: "0", step: "1" },
   { key: "databases", label: "Databases", min: "0", step: "1" },
   { key: "dbStorageMb", label: "Database storage (GB)", min: "0.1", step: "0.1", hint: "Account total." },
   { key: "appMemoryMb", label: "App memory (MB)", min: "0", step: "64", hint: "Account total." },

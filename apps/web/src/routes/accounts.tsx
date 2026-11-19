@@ -92,7 +92,7 @@ export function AccountsPage() {
                   <TableRow>
                     <TableHead>{t("Username")}</TableHead>
                     <TableHead>{t("Domain")}</TableHead>
-                    <TableHead>{t("Additional environments")}</TableHead>
+                    <TableHead>{t("Environments")}</TableHead>
                     <TableHead>{t("Disk")}</TableHead>
                     <TableHead>HTTPS</TableHead>
                   </TableRow>
@@ -106,8 +106,8 @@ export function AccountsPage() {
                         </Button>
                         {account.suspended && <Badge variant="destructive" className="ml-2">{t("Suspended")}</Badge>}
                       </TableCell>
-                      <TableCell>{account.domains.join(", ")}</TableCell>
-                      <TableCell className="text-muted-foreground">{t("{{used}} of {{limit}}", { used: account.vhosts.filter(({ isMain }) => !isMain).length, limit: account.limits.vhosts })}</TableCell>
+                      <TableCell>{account.domains.map(({ fqdn }) => fqdn).join(", ")}</TableCell>
+                      <TableCell className="text-muted-foreground">{t("{{used}} of {{limit}}", { used: account.vhosts.length, limit: account.limits.vhosts })}</TableCell>
                       <TableCell>{formatBytes(account.limits.quotaMb * 1024 * 1024)}</TableCell>
                       <TableCell>
                         {account.vhosts.every(({ certZone }) => certZone) ? <Badge variant="outline">{t("Active")}</Badge> : <Badge variant="destructive">{t("No certificate")}</Badge>}

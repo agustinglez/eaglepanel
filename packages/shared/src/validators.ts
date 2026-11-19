@@ -19,10 +19,10 @@ export const phpVersionSchema = z.string().regex(/^\d{2}$/, "Invalid PHP version
 
 export const quotaMbSchema = z.number().int().min(50, "The minimum quota is 50 MB").max(1024 * 1024);
 
-/** Account limits. `vhosts` does not count the primary environment of each domain. */
+/** Account limits. `domains` counts root domains (subdomains are free); `vhosts`, every environment. */
 export const accountLimitsSchema = z.object({
   quotaMb: quotaMbSchema,
-  domains: z.number().int().min(1, "Must allow at least one domain").max(1000),
+  domains: z.number().int().min(0).max(1000),
   vhosts: z.number().int().min(0).max(1000),
   databases: z.number().int().min(0).max(1000),
   dbStorageMb: z.number().int().min(1).max(1024 * 1024),
@@ -119,7 +119,43 @@ export const DEFAULT_LOG_DAYS = 30;
 
 /** Home directories that are not published: they hold sessions, app data or sockets. */
 const PRIVATE_FOLDERS = new Set(["tmp", "data", "logs", "run"]);
-export const isPublishableDocRoot = (docRoot: string) => !PRIVATE_FOLDERS.has(docRoot.split("/")[0] ?? "");
+
+/**
+ * Key of an environment, unique on the server: its directory `~/sites/<slug>`, its OLS vhost and logs, its FTP login.
+ * Letters and digits only: it goes in paths, in the OLS configuration and in the FTP login, and needs no escaping.
+ */
+const RESERVED_SLUGS = new Set(["eaglepanel", "eaglepanelhooks", "example"]);
+export const vhostSlugSchema = z
+  .string()
+  .regex(/^[a-z0-9]{1,32}$/, "Must be 1 to 32 lowercase letters or digits")
+  .refine((value) => !RESERVED_SLUGS.has(value), "That name is reserved");
+
+/**
+ * The slug suggested for a name: in lowercase, letters and digits only. NFD splits "á" into "a" and its accent, and
+ * the accent goes with everything else that is not a letter or digit. Empty if nothing is left.
+ */
+export const slugify = (name: string) => name.normalize("NFD").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 32);
+
+/** What the panel shows: "Admin CRM". Up to 64 characters, on a single line. */
+export const vhostNameSchema = z.string().trim().min(1, "The name is required").max(64, "Up to 64 characters").refine((value) => !/[\r\n]/.test(value), "Invalid name");
+
+/** Directory of an environment, relative to the home directory: its FTP access sees only this. */
+export const siteDir = (slug: string) => `sites/${slug}`;
+export const defaultDocRoot = (slug: string) => `${siteDir(slug)}/public_html`;
+
+/**
+ * Inside `sites/`, only what is under an environment directory and outside its `logs/`: publishing `sites` or
+ * `sites/<fqdn>` would expose the PHP logs.
+ */
+export function isPublishableDocRoot(docRoot: string): boolean {
+  const parts = docRoot.split("/");
+  if (PRIVATE_FOLDERS.has(parts[0] ?? "")) return false;
+  if (parts[0] !== "sites") return true;
+  return parts.length >= 3 && parts[2] !== "logs";
+}
+
+/** FTP login of an environment, like cPanel: `<slug>@<account>`. An account login never has `@`. */
+export const siteFtpLogin = (slug: string, username: string) => `${slug}@${username}`;
 
 /** Checks whether a certificate covers a domain. The wildcard covers a single level, as in TLS. */
 export function certCovers(names: string[], fqdn: string): boolean {

@@ -214,7 +214,8 @@ export interface BackupRunDto {
 
 /** What a backup contains, without values or secrets, to choose what to restore. */
 export interface BackupManifestSummaryDto {
-  vhosts: { fqdn: string; type: "php" | "app"; exists: boolean; sameType: boolean; envKeys: string[]; app: boolean }[];
+  /** `id` is the current environment, if it still exists. */
+  vhosts: { id: number | null; name: string; type: "php" | "app"; exists: boolean; sameType: boolean; envKeys: string[]; app: boolean }[];
   databases: { name: string; exists: boolean; hasUser: boolean }[];
 }
 

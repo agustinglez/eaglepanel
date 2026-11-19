@@ -14,6 +14,9 @@ import {
   envScopeSchema,
   envValueSchema,
   fqdnSchema,
+  slugify,
+  vhostNameSchema,
+  vhostSlugSchema,
   ftpHashSchema,
   logDaysSchema,
   logLevelSchema,
@@ -33,7 +36,7 @@ import { z } from "zod";
 import type { AgentClient } from "./agent-client";
 import { audit } from "./audit";
 import type { Db } from "./db";
-import { accounts, appEnv, apps, certificates, databases, domains, vhosts } from "./db/schema";
+import { accounts, appEnv, apps, certificates, databases, domains, hostnames, vhosts } from "./db/schema";
 import type { JobRunner, JobStep } from "./jobs";
 
 /**
@@ -73,16 +76,38 @@ const accountRowSchema = z.object({
   redisMemoryMb: z.number().int().optional(),
   memcachedEnabled: z.boolean().optional(),
   memcachedMemoryMb: z.number().int().optional(),
+  /** Since 0.3.0: the source environment id. Before, its hostname. */
+  hookVhost: z.number().int().nullable().optional(),
   hookDomain: fqdnSchema.nullable().optional(),
 }).loose();
 const domainRowSchema = z.object({ fqdn: fqdnSchema }).loose();
+/**
+ * Since 0.3.0 an environment has an id (of the source server: a new one is assigned here), a slug, a name and one
+ * hostname; before, it was its `fqdn`. Both are accepted, and the other rows point to it with the same key.
+ */
 const vhostRowSchema = z.object({
-  fqdn: fqdnSchema, domain: fqdnSchema, isMain: z.boolean(), type: z.enum(["php", "app"]), docRoot: docRootSchema,
+  id: z.number().int().optional(), slug: vhostSlugSchema.optional(), name: vhostNameSchema.optional(), hostname: fqdnSchema.optional(),
+  fqdn: fqdnSchema.optional(), domain: fqdnSchema.optional(),
+  type: z.enum(["php", "app"]), docRoot: docRootSchema,
   phpVersion: phpVersionSchema, phpOptions: phpOptionsSchema.catch(DEFAULT_PHP_OPTIONS), logLevel: logLevelSchema.catch(DEFAULT_LOG_LEVEL), logDays: logDaysSchema.catch(DEFAULT_LOG_DAYS),
 }).loose();
+const hostnameRowSchema = z.object({ fqdn: fqdnSchema, domain: fqdnSchema }).loose();
 const certRowSchema = z.object({ zone: fqdnSchema, originPull: z.boolean().optional() }).loose();
-const appRowSchema = z.object({ fqdn: fqdnSchema, id: z.number().int(), webhookSecret: z.string().nullable().optional(), deployKey: z.string().nullable().optional() }).loose();
-const envRowSchema = z.object({ fqdn: fqdnSchema, key: envKeySchema, value: envValueSchema, scope: envScopeSchema });
+const appRowSchema = z.object({ vhost: z.number().int().optional(), fqdn: fqdnSchema.optional(), id: z.number().int(), webhookSecret: z.string().nullable().optional(), deployKey: z.string().nullable().optional() }).loose();
+const envRowSchema = z.object({ vhost: z.number().int().optional(), fqdn: fqdnSchema.optional(), key: envKeySchema, value: envValueSchema, scope: envScopeSchema });
+
+/** How the other rows of the manifest name an environment: its id since 0.3.0, its fqdn before. */
+const sourceKey = (row: { id?: number; vhost?: number; fqdn?: string }, isVhost = false) =>
+  isVhost ? (row.id !== undefined ? `id:${row.id}` : `fqdn:${row.fqdn}`) : row.vhost !== undefined ? `id:${row.vhost}` : `fqdn:${row.fqdn}`;
+
+/** For backups before 0.3.0: the same rule as migration 0017 (first label, letters and digits). */
+function legacySlug(fqdn: string, taken: Set<string>): string {
+  const label = slugify(fqdn.split(".")[0] ?? "").slice(0, 28) || "site";
+  let slug = vhostSlugSchema.safeParse(label).success && !taken.has(label) ? label : "";
+  for (let n = 2; !slug; n += 1) if (!taken.has(`${label}${n}`)) slug = `${label}${n}`;
+  taken.add(slug);
+  return slug;
+}
 const CONFIG_KEYS = ["kind", "repoUrl", "branch", "subdir", "runtime", "runtimeVersion", "buildCommand", "startCommand", "outputDir", "spaFallback", "healthPath", "memoryMb"] as const;
 const MAX_APP_ID = 16383;
 
@@ -108,9 +133,9 @@ export interface MigrationDeps {
   agent: AgentClient;
   jobs: JobRunner;
   writeSite: (row: VhostRow) => Promise<void>;
-  syncSites: (options?: { exclude?: string[]; restart?: boolean }) => Promise<void>;
+  syncSites: (options?: { exclude?: number[]; restart?: boolean }) => Promise<void>;
   domainConflict: (fqdn: string) => boolean;
-  requestDeploy: (fqdn: string, trigger: string) => unknown;
+  requestDeploy: (vhostId: number, trigger: string) => unknown;
 }
 
 export function registerMigrationRoutes(routes: Hono, { db, agent, jobs, writeSite, syncSites, domainConflict, requestDeploy }: MigrationDeps) {
@@ -180,11 +205,15 @@ export function registerMigrationRoutes(routes: Hono, { db, agent, jobs, writeSi
     for (const cert of plan.certificates) {
       if (db.select().from(certificates).where(eq(certificates.zone, cert.zone)).get()) return c.json({ error: `A certificate for ${cert.zone} already exists on this server` }, 409);
     }
+    // The slug is unique on each server: with one already in use, the account cannot keep its directories and FTP logins.
+    for (const row of plan.vhosts) {
+      if (db.select().from(vhosts).where(eq(vhosts.slug, row.slug)).get()) return c.json({ error: `The environment slug ${row.slug} is already in use on this server` }, 409);
+    }
     const preflight = await agent.call("system.preflight", {});
     if (!preflight.ok) return c.json({ error: `The server is not ready: ${preflight.checks.filter((check) => !check.ok).map((check) => check.name).join(", ")}` }, 409);
     const available = (await agent.call("php.versions", {})).versions;
     const missingPhp = plan.vhosts.find((row) => row.type === "php" && !available.includes(row.phpVersion));
-    if (missingPhp) return c.json({ error: `${missingPhp.fqdn} uses PHP ${missingPhp.phpVersion}, which is not installed here` }, 409);
+    if (missingPhp) return c.json({ error: `${missingPhp.name} uses PHP ${missingPhp.phpVersion}, which is not installed here` }, 409);
 
     // ---------------------------------------------------------------- Recrear
     // App ids belong to each server: new ones are assigned.
@@ -197,7 +226,10 @@ export function registerMigrationRoutes(routes: Hono, { db, agent, jobs, writeSi
       used.add(id);
       newIds.set(app.row.id, id);
     }
-    const fqdns = plan.vhosts.map(({ fqdn }) => fqdn);
+    const slugs = plan.vhosts.map(({ slug }) => slug);
+    /** The new id of each environment, by its key in the manifest. Filled in when they are registered. */
+    const newVhostIds = new Map<string, number>();
+    const createdIds = () => db.select({ id: vhosts.id }).from(vhosts).where(eq(vhosts.username, username)).all().map(({ id }) => id);
     const databaseParts = parts.filter((item) => item.part === "database");
     const filesPart = parts.find((item) => item.part === "files")!;
     const createdAt = Date.now();
@@ -206,12 +238,9 @@ export function registerMigrationRoutes(routes: Hono, { db, agent, jobs, writeSi
     async function undo() {
       const attempt = async (action: () => Promise<unknown>) => { try { await action(); } catch (error) { console.error("[api] while undoing the migration:", error); } };
       for (const database of plan.databases) await attempt(() => agent.call("db.delete", { username, name: database.slice(username.length + 1) }));
-      for (const [, id] of newIds) {
-        const app = plan.apps.find((item) => newIds.get(item.row.id) === id)!;
-        await attempt(() => agent.call("app.remove", { appId: id, username, fqdn: app.row.fqdn }));
-      }
-      await attempt(() => syncSites({ exclude: fqdns }));
-      for (const fqdn of fqdns) await attempt(() => agent.call("site.remove", { fqdn }));
+      for (const id of newIds.values()) await attempt(() => agent.call("app.remove", { appId: id, username }));
+      await attempt(() => syncSites({ exclude: createdIds() }));
+      for (const slug of slugs) await attempt(() => agent.call("site.remove", { site: slug }));
       for (const cert of plan.certificates) await attempt(() => agent.call("cert.remove", { zone: cert.zone }));
       await attempt(() => agent.call("account.delete", { username }));
       db.delete(certificates).where(eq(certificates.username, username)).run();
@@ -233,19 +262,30 @@ export function registerMigrationRoutes(routes: Hono, { db, agent, jobs, writeSi
               username, quotaMb: a.quotaMb, maxDomains: a.maxDomains, maxVhosts: a.maxVhosts, maxDatabases: a.maxDatabases,
               dbStorageMb: a.dbStorageMb, appMemoryMb: a.appMemoryMb, createdAt,
               redisMemoryMb: a.redisMemoryMb ?? DEFAULT_SERVICE_MEMORY_MB, memcachedMemoryMb: a.memcachedMemoryMb ?? DEFAULT_SERVICE_MEMORY_MB,
-              hookDomain: a.hookDomain && fqdns.includes(a.hookDomain) ? a.hookDomain : null,
             }).run();
             for (const domain of plan.domains) tx.insert(domains).values({ fqdn: domain.fqdn, username, createdAt }).run();
+            for (const row of plan.hostnames) tx.insert(hostnames).values({ fqdn: row.fqdn, username, domain: row.domain, createdAt }).run();
             for (const row of plan.vhosts) {
-              tx.insert(vhosts).values({ fqdn: row.fqdn, username, domain: row.domain, isMain: row.isMain, type: row.type, docRoot: row.docRoot, phpVersion: row.phpVersion, phpOptions: row.phpOptions, logLevel: row.logLevel, logDays: row.logDays, createdAt }).run();
+              const { id } = tx.insert(vhosts).values({
+                username, slug: row.slug, name: row.name, hostname: row.hostname, type: row.type, docRoot: row.docRoot,
+                phpVersion: row.phpVersion, phpOptions: row.phpOptions, logLevel: row.logLevel, logDays: row.logDays, createdAt,
+              }).returning({ id: vhosts.id }).get()!;
+              newVhostIds.set(row.key, id);
             }
+            const hookVhost = plan.hookKey ? newVhostIds.get(plan.hookKey) ?? null : null;
+            if (hookVhost) tx.update(accounts).set({ hookVhost }).where(eq(accounts.username, username)).run();
             for (const app of plan.apps) {
+              const vhost = newVhostIds.get(app.key);
+              if (!vhost) continue;
               tx.insert(apps).values({
-                fqdn: app.row.fqdn, id: newIds.get(app.row.id)!, ...app.config, status: "new", currentRelease: null, commit: null,
-                deployKey: app.key?.publicKey.trim() ?? null, webhookSecret: app.row.webhookSecret ?? null, createdAt,
+                vhost, id: newIds.get(app.row.id)!, ...app.config, status: "new", currentRelease: null, commit: null,
+                deployKey: app.deployKey?.publicKey.trim() ?? null, webhookSecret: app.row.webhookSecret ?? null, createdAt,
               } as typeof apps.$inferInsert).run();
             }
-            for (const env of plan.env) tx.insert(appEnv).values(env).run();
+            for (const env of plan.env) {
+              const vhost = newVhostIds.get(env.key);
+              if (vhost) tx.insert(appEnv).values({ vhost, key: env.row.key, value: env.row.value, scope: env.row.scope }).run();
+            }
           });
         },
       },
@@ -263,9 +303,9 @@ export function registerMigrationRoutes(routes: Hono, { db, agent, jobs, writeSi
         run: async () => {
           for (const app of plan.apps) {
             const id = newIds.get(app.row.id)!;
-            await agent.call("app.prepare", { appId: id, username, fqdn: app.row.fqdn, runtime: app.config.runtime, runtimeVersion: app.config.runtimeVersion });
-            if (app.key) await agent.call("migrate.deployKey", { appId: id, privateKey: app.key.privateKey, publicKey: app.key.publicKey });
-            const envRows = plan.env.filter((env) => env.fqdn === app.row.fqdn);
+            await agent.call("app.prepare", { appId: id, username, runtime: app.config.runtime, runtimeVersion: app.config.runtimeVersion });
+            if (app.deployKey) await agent.call("migrate.deployKey", { appId: id, privateKey: app.deployKey.privateKey, publicKey: app.deployKey.publicKey });
+            const envRows = plan.env.filter((env) => env.key === app.key).map(({ row }) => row);
             const pick = (scope: "runtime" | "build") => Object.fromEntries(envRows.filter((env) => env.scope === scope || env.scope === "both").map(({ key, value }) => [key, value]));
             await agent.call("app.env", { appId: id, runtime: pick("runtime"), build: pick("build") });
           }
@@ -274,8 +314,8 @@ export function registerMigrationRoutes(routes: Hono, { db, agent, jobs, writeSi
       {
         name: "Publish the environments to OpenLiteSpeed",
         run: async () => {
-          for (const fqdn of fqdns) {
-            const row = db.select().from(vhosts).where(eq(vhosts.fqdn, fqdn)).get();
+          for (const id of newVhostIds.values()) {
+            const row = db.select().from(vhosts).where(eq(vhosts.id, id)).get();
             if (row) await writeSite(row);
           }
           await syncSites({ restart: true });
@@ -316,7 +356,10 @@ export function registerMigrationRoutes(routes: Hono, { db, agent, jobs, writeSi
             db.update(accounts).set(service === "redis" ? { redisEnabled: true } : { memcachedEnabled: true }).where(eq(accounts.username, username)).run();
           }
           // The app code comes back from Git, like any deployment.
-          for (const app of plan.apps) requestDeploy(app.row.fqdn, "migration from another server");
+          for (const app of plan.apps) {
+            const vhost = newVhostIds.get(app.key);
+            if (vhost) requestDeploy(vhost, "migration from another server");
+          }
         },
       },
     ];
@@ -332,13 +375,43 @@ function readPlan(manifest: BackupManifest) {
   if (!parsedAccount.success) throw new Error(`The backup has invalid account data: ${parsedAccount.error.issues[0]?.message ?? ""}`);
   const accountRow = parsedAccount.data;
   const vhostRows = rows(manifest, "vhosts", vhostRowSchema);
+  const domainRows = rows(manifest, "domains", domainRowSchema);
+  const owned = new Set(domainRows.map(({ fqdn }) => fqdn));
+  // Before 0.3.0 there were no hostnames: each environment was its own one.
+  const savedHostnames = Array.isArray(manifest.panel.hostnames)
+    ? rows(manifest, "hostnames", hostnameRowSchema).map(({ fqdn, domain }) => ({ fqdn, domain }))
+    : [];
+  const taken = new Set(vhostRows.flatMap((row) => (row.slug ? [row.slug] : [])));
+  const environments = vhostRows.map((row) => {
+    const hostname = row.hostname ?? row.fqdn;
+    if (!hostname) throw new Error("The backup has an environment without a domain");
+    const slug = row.slug ?? legacySlug(hostname, taken);
+    return {
+      key: sourceKey(row, true), slug, name: row.name ?? hostname, hostname,
+      type: row.type, docRoot: row.docRoot, phpVersion: row.phpVersion, phpOptions: row.phpOptions, logLevel: row.logLevel, logDays: row.logDays,
+    };
+  });
+  const domainOf = (fqdn: string) => domainRows.find((domain) => fqdn === domain.fqdn || fqdn.endsWith(`.${domain.fqdn}`))?.fqdn;
+  const hostnameList = new Map(savedHostnames.map((row) => [row.fqdn, row]));
+  for (const env of environments) {
+    if (!hostnameList.has(env.hostname)) {
+      const domain = domainOf(env.hostname);
+      if (!domain) throw new Error(`The backup has ${env.hostname} without its domain`);
+      hostnameList.set(env.hostname, { fqdn: env.hostname, domain });
+    }
+  }
+  if ([...hostnameList.values()].some((row) => !owned.has(row.domain))) throw new Error("The backup has domains that do not match its environments");
+  if (new Set(environments.map(({ hostname }) => hostname)).size !== environments.length) throw new Error("The backup has two environments for the same domain");
+  const hookKey = accountRow.hookVhost ? `id:${accountRow.hookVhost}` : accountRow.hookDomain ? `fqdn:${accountRow.hookDomain}` : null;
   const certRows = rows(manifest, "certificates", certRowSchema);
   const appRows = rows(manifest, "apps", appRowSchema);
   const keys = new Map(manifest.server.deployKeys.map((key) => [key.appId, key]));
   return {
     account: accountRow,
-    domains: rows(manifest, "domains", domainRowSchema),
-    vhosts: vhostRows,
+    domains: domainRows,
+    vhosts: environments,
+    hostnames: [...hostnameList.values()],
+    hookKey,
     certificates: certRows.map((row) => {
       const secret = manifest.server.certificates.find((item) => item.zone === row.zone);
       if (!secret) throw new Error(`The backup does not contain the certificate key for ${row.zone}`);
@@ -346,10 +419,11 @@ function readPlan(manifest: BackupManifest) {
     }),
     apps: appRows.map((row) => ({
       row,
+      key: sourceKey(row),
       config: appConfigSchema.parse(Object.fromEntries(CONFIG_KEYS.map((key) => [key, (row as Record<string, unknown>)[key]]))) as z.infer<typeof appConfigSchema> & Partial<AppRow>,
-      key: keys.get(row.id) ?? null,
+      deployKey: keys.get(row.id) ?? null,
     })),
-    env: rows(manifest, "appEnv", envRowSchema),
+    env: rows(manifest, "appEnv", envRowSchema).map((row) => ({ key: sourceKey(row), row })),
     databases: rows(manifest, "databases", z.object({ name: dbFullNameSchema }).loose()).map(({ name }) => name),
     mysqlHashes: new Map(manifest.server.mysqlUsers.flatMap((user) => {
       const hash = authHashOf(user.createUser);

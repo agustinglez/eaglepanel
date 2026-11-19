@@ -153,7 +153,7 @@ describe("PHP versions", () => {
 });
 
 describe("vhosts", () => {
-  const site = { username: "acme", fqdn: "example.com", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: null, originPull: false, logLevel: "ERROR", logDays: 30, suspended: false, app: null, hooks: false } as const;
+  const site = { username: "acme", site: "web", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: null, originPull: false, logLevel: "ERROR", logDays: 30, suspended: false, app: null, hooks: false } as const;
 
   test("applies the chosen PHP options, and security always wins", () => {
     const conf = renderVhost({
@@ -207,14 +207,14 @@ describe("vhosts", () => {
     expect(conf).not.toContain("vhssl");
   });
 
-  test("a subdomain has its own directory and process", () => {
-    const conf = renderVhost({ ...site, fqdn: "blog.example.com", docRoot: "subdomains/blog.example.com/public_html" });
-    expect(conf).toContain("docRoot                   /home/acme/subdomains/blog.example.com/public_html");
-    expect(conf).toContain("uds://tmp/lshttpd/blog.example.com.sock");
+  test("each environment has its own directory and process, named by its slug", () => {
+    const conf = renderVhost({ ...site, site: "blog", docRoot: "sites/blog/public_html" });
+    expect(conf).toContain("docRoot                   /home/acme/sites/blog/public_html");
+    expect(conf).toContain("uds://tmp/lshttpd/blog.sock");
   });
 
   test("uses the certificate of its zone", () => {
-    const conf = renderVhost({ ...site, fqdn: "blog.example.com", certZone: "example.com" });
+    const conf = renderVhost({ ...site, site: "blog", certZone: "example.com" });
     expect(conf).toContain("keyFile                 /usr/local/lsws/conf/eaglepanel-certs/example.com/origin.key");
   });
 
@@ -250,13 +250,13 @@ describe("vhosts", () => {
 
 describe("OLS configuration", () => {
   const BASE = "serverName glez\n\nlistener Default{\n  address 127.0.0.1:8088\n}\n";
-  const http = { fqdn: "example.com", username: "acme", certZone: null, originPull: false };
-  const https = { fqdn: "secure.test", username: "bravo", certZone: "secure.test", originPull: false };
+  const http = { site: "web", username: "acme", hostname: "example.com", certZone: null, originPull: false };
+  const https = { site: "secure", username: "bravo", hostname: "secure.test", certZone: "secure.test", originPull: false };
 
   test("adds the block without touching the rest", () => {
     const result = applyBlock(BASE, [http]);
     expect(result).toContain("listener Default{\n  address 127.0.0.1:8088");
-    expect(result).toContain("virtualhost example.com {");
+    expect(result).toContain("virtualhost web {");
     expect(result).toContain("allowSymbolLink         0");
     expect(result).toContain("address                 *:80");
   });
@@ -277,9 +277,16 @@ describe("OLS configuration", () => {
   test("a site without a certificate is not published on 443", () => {
     const result = applyBlock(BASE, [http, https]);
     const httpsListener = result.slice(result.indexOf("listener eaglepanel-https"));
-    expect(httpsListener).toContain("map                     secure.test secure.test");
+    expect(httpsListener).toContain("map                     secure secure.test");
     expect(httpsListener).not.toContain("example.com");
     expect(applyBlock(BASE, [http])).not.toContain("*:443");
+  });
+
+  test("the vhost is named by the slug and answers for its hostname", () => {
+    const result = applyBlock(BASE, [{ ...http, site: "admincrm", hostname: "admin.example.com" }]);
+    expect(result).toContain("virtualhost admincrm {");
+    expect(result).toContain("configFile              conf/vhosts/admincrm/vhost.conf");
+    expect(result).toContain("map                     admincrm admin.example.com");
   });
 
   test("warnings do not invalidate the configuration, errors do", () => {

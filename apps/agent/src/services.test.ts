@@ -110,6 +110,55 @@ describe("FTP", () => {
     expect(host.commands.some(({ command, args }) => command === "rm" && args.includes(ftpUserFile("acme")))).toBe(true);
   });
 
+  test("an environment gets its own login, like cPanel, locked inside its directory", async () => {
+    const host = new FakeHost();
+    host.files.set("/etc/eaglepanel/ftp/users.txt", "acme\n$6$acme\n");
+    expect(await call(host, "ftp.setSitePassword", { username: "acme", site: "shop", password: PASSWORD })).toMatchObject({ ok: true });
+    expect(host.files.get(ftpUserFile("shop@acme"))).toBe("guest_username=acme\nlocal_root=/home/acme/sites/shop\n");
+    expect(host.files.get("/etc/eaglepanel/ftp/users.txt")).toBe("acme\n$6$acme\nshop@acme\n$6$salt$hash\n");
+  });
+
+  test("renaming the environment keeps its password, with the new login and directory", async () => {
+    const host = new FakeHost();
+    host.files.set("/etc/eaglepanel/ftp/users.txt", "acme\n$6$a\nshop@acme\n$6$s\n");
+    host.files.set(ftpUserFile("shop@acme"), "guest_username=acme\nlocal_root=/home/acme/sites/shop\n");
+    // What the old slug had exists; nothing with the new one does yet.
+    const run = host.run.bind(host);
+    host.run = async (command, args, options) => {
+      const result = await run(command, args, options);
+      return command === "test" && args.some((arg) => arg.includes("store")) ? { ...result, code: 1 } : result;
+    };
+    expect(await call(host, "site.rename", { username: "acme", from: "shop", to: "store" })).toMatchObject({ ok: true });
+    expect(host.files.get("/etc/eaglepanel/ftp/users.txt")).toBe("acme\n$6$a\nstore@acme\n$6$s\n");
+    expect(host.files.get(ftpUserFile("store@acme"))).toBe("guest_username=acme\nlocal_root=/home/acme/sites/store\n");
+    expect(host.commands.some(({ command, args }) => command === "rm" && args.includes(ftpUserFile("shop@acme")))).toBe(true);
+    const moves = host.commands.filter(({ command }) => command === "mv").map(({ args }) => args.slice(-2));
+    expect(moves).toContainEqual(["/home/acme/sites/shop", "/home/acme/sites/store"]);
+    expect(moves).toContainEqual(["/var/log/eaglepanel/vhosts/shop", "/var/log/eaglepanel/vhosts/store"]);
+  });
+
+  test("suspending leaves out the account and its environments, not the others", async () => {
+    const host = new FakeHost();
+    host.files.set("/etc/eaglepanel/ftp/users.txt", "acme\n$6$a\nshop@acme\n$6$s\notra\n$6$o\nweb@otra\n$6$ot\n");
+    await call(host, "ftp.setSuspended", { username: "acme", suspended: true });
+    expect(host.files.get("/etc/eaglepanel/ftp/users.active.txt")).toBe("otra\n$6$o\nweb@otra\n$6$ot\n");
+  });
+
+  test("deleting the account also removes the logins of its environments", async () => {
+    const host = new FakeHost();
+    host.files.set("/etc/eaglepanel/ftp/users.txt", "acme\n$6$a\nshop@acme\n$6$s\nweb@otra\n$6$ot\n");
+    await call(host, "account.delete", { username: "acme" });
+    expect(host.files.get("/etc/eaglepanel/ftp/users.txt")).toBe("web@otra\n$6$ot\n");
+    expect(host.commands.some(({ command, args }) => command === "rm" && args.includes(ftpUserFile("shop@acme")))).toBe(true);
+  });
+
+  test("removing an environment login keeps the account one", async () => {
+    const host = new FakeHost();
+    host.files.set("/etc/eaglepanel/ftp/users.txt", "acme\n$6$a\nshop@acme\n$6$s\n");
+    expect(await call(host, "ftp.removeSite", { username: "acme", site: "shop" })).toMatchObject({ ok: true });
+    expect(host.files.get("/etc/eaglepanel/ftp/users.txt")).toBe("acme\n$6$a\n");
+  });
+
   test("deleting the last account removes the database instead of leaving an empty one", async () => {
     const host = new FakeHost();
     host.files.set("/etc/eaglepanel/ftp/users.txt", "acme\n$6$acme\n");
@@ -206,9 +255,9 @@ describe("MySQL", () => {
 });
 
 describe("Cloudflare client certificate", () => {
-  const site = { username: "acme", fqdn: "example.com", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: "example.com", originPull: true, logLevel: "ERROR" as const, logDays: 30, suspended: false, app: null, hooks: false };
-  const secure = { fqdn: "example.com", username: "acme", certZone: "example.com", originPull: true };
-  const open = { fqdn: "otra.com", username: "otra", certZone: "otra.com", originPull: false };
+  const site = { username: "acme", site: "web", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: "example.com", originPull: true, logLevel: "ERROR" as const, logDays: 30, suspended: false, app: null, hooks: false };
+  const secure = { site: "web", username: "acme", hostname: "example.com", certZone: "example.com", originPull: true };
+  const open = { site: "otra", username: "otra", hostname: "otra.com", certZone: "otra.com", originPull: false };
 
   test("the date shown by the panel is the one of the CA bundled with the agent", () => {
     const ca = new X509Certificate(CLOUDFLARE_ORIGIN_PULL_CA);
@@ -278,8 +327,8 @@ describe("Cloudflare client certificate", () => {
 });
 
 describe("closing listeners when removing sites", () => {
-  const plain = { fqdn: "example.com", username: "acme", certZone: null, originPull: false };
-  const secure = { fqdn: "secure.test", username: "bravo", certZone: "secure.test", originPull: false };
+  const plain = { site: "web", username: "acme", hostname: "example.com", certZone: null, originPull: false };
+  const secure = { site: "secure", username: "bravo", hostname: "secure.test", certZone: "secure.test", originPull: false };
   const seed = (sites: (typeof plain | typeof secure)[]) => {
     const host = new FakeHost();
     host.files.set(HTTPD_CONFIG, applyBlock("serverName test\n", sites));
@@ -393,7 +442,7 @@ describe("closing listeners when removing sites", () => {
 });
 
 describe(".user.ini per environment", () => {
-  const site = { username: "acme", fqdn: "example.com", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: null, originPull: false, logLevel: "ERROR" as const, logDays: 30, suspended: false, app: null, hooks: false };
+  const site = { username: "acme", site: "web", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: null, originPull: false, logLevel: "ERROR" as const, logDays: 30, suspended: false, app: null, hooks: false };
 
   test("enables .user.ini", () => {
     const conf = renderVhost(site);
@@ -414,7 +463,7 @@ describe(".user.ini per environment", () => {
   });
 
   test("SCAN_DIR points only to the root directory: pointing to the account, a .user.ini enabled exec()", () => {
-    for (const docRoot of ["public_html", "subdomains/test.example.com/public_html"]) {
+    for (const docRoot of ["public_html", "sites/test.example.com/public_html"]) {
       const scan = renderVhost({ ...site, docRoot }).split("\n").filter((line) => line.includes("PHP_INI_SCAN_DIR"));
       expect(scan).toEqual([`  env                     PHP_INI_SCAN_DIR=:${PHP_SYSTEM_INI_DIR}`]);
     }
@@ -433,11 +482,11 @@ describe(".user.ini per environment", () => {
 
   test("each environment has its own, created as the account and without overwriting the content", async () => {
     const host = new FakeHost();
-    await call(host, "site.write", { ...site, fqdn: "test.example.com", docRoot: "subdomains/test.example.com/public_html" });
+    await call(host, "site.write", { ...site, site: "test", docRoot: "sites/test/public_html" });
     expect(host.commands.find(({ command }) => command === "setpriv")?.args).toEqual([
-      "--reuid=acme", "--regid=acme", "--clear-groups", "touch", "-a", "--", "/home/acme/subdomains/test.example.com/public_html/.user.ini",
+      "--reuid=acme", "--regid=acme", "--clear-groups", "touch", "-a", "--", "/home/acme/sites/test/public_html/.user.ini",
     ]);
-    expect(host.files.has("/home/acme/subdomains/test.example.com/public_html/.user.ini")).toBe(false);
+    expect(host.files.has("/home/acme/sites/test/public_html/.user.ini")).toBe(false);
   });
 
   test("restarts only that account PHP", async () => {
@@ -464,7 +513,7 @@ describe(".user.ini per environment", () => {
 });
 
 describe("suspended account", () => {
-  const site = { username: "acme", fqdn: "example.com", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: "example.com", originPull: true, logLevel: "ERROR" as const, logDays: 30, suspended: true, app: null, hooks: false };
+  const site = { username: "acme", site: "web", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: "example.com", originPull: true, logLevel: "ERROR" as const, logDays: 30, suspended: true, app: null, hooks: false };
   const USERS = "/etc/eaglepanel/ftp/users.txt";
   const SUSPENDED = "/etc/eaglepanel/ftp/suspended.txt";
   const ACTIVE = "/etc/eaglepanel/ftp/users.active.txt";
@@ -494,7 +543,7 @@ describe("suspended account", () => {
     const conf = renderVhost(site);
     expect(conf).toContain("vhssl  {");
     expect(conf).toContain("clientVerify            2");
-    expect(conf).toContain("accesslog /var/log/eaglepanel/vhosts/example.com/access.log");
+    expect(conf).toContain("accesslog /var/log/eaglepanel/vhosts/web/access.log");
   });
 
   test("site.write deletes nothing from the account", async () => {
@@ -577,20 +626,20 @@ describe("suspended account", () => {
 });
 
 describe("environment logs", () => {
-  const site = { username: "acme", fqdn: "example.com", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: null, originPull: false, logLevel: "WARN" as const, logDays: 14, suspended: false, app: null, hooks: false };
-  const read = (host: FakeHost, source: string, lines = 50) => call(host, "logs.read", { username: "acme", fqdn: "example.com", source, lines });
+  const site = { username: "acme", site: "web", docRoot: "public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, certZone: null, originPull: false, logLevel: "WARN" as const, logDays: 14, suspended: false, app: null, hooks: false };
+  const read = (host: FakeHost, source: string, lines = 50) => call(host, "logs.read", { username: "acme", site: "web", source, lines });
 
   test("the vhost writes outside the home directory, without OLS rotation", () => {
     const conf = renderVhost(site);
-    expect(conf).toContain("errorlog /var/log/eaglepanel/vhosts/example.com/error.log {");
-    expect(conf).toContain("accesslog /var/log/eaglepanel/vhosts/example.com/access.log {");
+    expect(conf).toContain("errorlog /var/log/eaglepanel/vhosts/web/error.log {");
+    expect(conf).toContain("accesslog /var/log/eaglepanel/vhosts/web/access.log {");
     expect(conf).toContain("logLevel                WARN");
     expect(conf.match(/rollingSize             0/g)).toHaveLength(2);
   });
 
   test("OLS logs rotate daily and keep the chosen number of days", () => {
     const ols = renderLogrotate(site).split("/home/")[0]!;
-    expect(ols).toContain("/var/log/eaglepanel/vhosts/example.com/*.log {");
+    expect(ols).toContain("/var/log/eaglepanel/vhosts/web/*.log {");
     expect(ols).toContain("rotate 14");
     expect(ols).toContain("maxage 14");
     expect(ols).toContain("copytruncate");
@@ -598,7 +647,7 @@ describe("environment logs", () => {
 
   test("the PHP error_log is packed at 20 MB or every month, and nothing deletes it", () => {
     const conf = renderLogrotate(site);
-    const php = conf.slice(conf.indexOf("/home/acme/logs/example.com.php_error.log {"));
+    const php = conf.slice(conf.indexOf("/home/acme/sites/web/logs/php_error.log {"));
     expect(php).toContain("su acme acme");
     expect(php).toContain("monthly");
     expect(php).toContain("maxsize 20M");
@@ -614,13 +663,13 @@ describe("environment logs", () => {
     // What the account plants is not followed, and what is already packed is not packed again.
     expect(script).toContain('[ ! -L "$f" ]');
     expect(script).toContain("*.tar.gz) continue");
-    // Only its own file: it does not reach those of another environment of the same account.
-    expect(script).toContain("for f in example.com.php_error.log-*;");
+    // Inside its own logs/: it does not reach the files of another environment of the same account.
+    expect(script).toContain("for f in php_error.log-*;");
   });
 
   test("the account can change the PHP error_log", () => {
     const conf = renderVhost(site);
-    expect(conf).toContain('php_value error_log "/home/acme/logs/example.com.php_error.log"');
+    expect(conf).toContain('php_value error_log "/home/acme/sites/web/logs/php_error.log"');
     expect(conf).not.toContain("php_admin_value error_log");
     expect(conf).toContain("php_admin_value open_basedir");
   });
@@ -629,16 +678,24 @@ describe("environment logs", () => {
     const host = new FakeHost();
     expect(await call(host, "site.write", site)).toMatchObject({ ok: true });
     const args = host.commands.filter(({ command }) => command === "install").map((entry) => entry.args.join(" "));
-    expect(args).toContain("-d -o acme -g acme -m 750 /home/acme/logs");
-    expect(args).toContain("-d -o root -g nogroup -m 750 /var/log/eaglepanel/vhosts/example.com");
-    expect(host.files.get(logrotatePath("example.com"))).toContain("rotate 14");
+    expect(args).toContain("-d -o acme -g acme -m 750 /home/acme/sites/web/logs");
+    expect(args).toContain("-d -o root -g nogroup -m 750 /var/log/eaglepanel/vhosts/web");
+    expect(host.files.get(logrotatePath("web"))).toContain("rotate 14");
+  });
+
+  test("an app creates nothing in the home directory, and has no PHP log to rotate", async () => {
+    const host = new FakeHost();
+    expect(await call(host, "site.write", { ...site, app: { kind: "server", id: 7 } })).toMatchObject({ ok: true });
+    const touched = host.commands.flatMap(({ args }) => args).filter((arg) => arg.startsWith("/home/"));
+    expect(touched).toEqual([]);
+    expect(host.files.get(logrotatePath("web"))).not.toContain("php_error.log");
   });
 
   test("site.remove removes the rotation and the OLS logs", async () => {
     const host = new FakeHost();
-    await call(host, "site.remove", { fqdn: "example.com" });
+    await call(host, "site.remove", { site: "web" });
     const removed = host.commands.filter(({ command }) => command === "rm").map(({ args }) => args.at(-1));
-    expect(removed).toEqual(expect.arrayContaining([logrotatePath("example.com"), "/var/log/eaglepanel/vhosts/example.com"]));
+    expect(removed).toEqual(expect.arrayContaining([logrotatePath("web"), "/var/log/eaglepanel/vhosts/web"]));
   });
 
   test("OLS logs are read directly, from a fixed path", async () => {
@@ -646,14 +703,14 @@ describe("environment logs", () => {
     const respond = host.respond;
     host.respond = (command, stdin) => (command === "tail" ? { stdout: "one\ntwo\n" } : respond(command, stdin));
     expect(await read(host, "access", 50)).toEqual({ ok: true, result: { lines: ["one", "two"] } });
-    expect(host.commands.find(({ command }) => command === "tail")?.args).toEqual(["-n", "50", "--", "/var/log/eaglepanel/vhosts/example.com/access.log"]);
+    expect(host.commands.find(({ command }) => command === "tail")?.args).toEqual(["-n", "50", "--", "/var/log/eaglepanel/vhosts/web/access.log"]);
   });
 
   test("the PHP log is read with the account permissions and with a time limit", async () => {
     const host = new FakeHost();
     await read(host, "php");
     expect(host.commands.find(({ command }) => command === "timeout")?.args).toEqual([
-      "5", "setpriv", "--reuid=acme", "--regid=acme", "--clear-groups", "tail", "-n", "50", "--", "/home/acme/logs/example.com.php_error.log",
+      "5", "setpriv", "--reuid=acme", "--regid=acme", "--clear-groups", "tail", "-n", "50", "--", "/home/acme/sites/web/logs/php_error.log",
     ]);
     expect(host.commands.some(({ command }) => command === "tail")).toBe(false);
   });
@@ -687,9 +744,9 @@ describe("environment logs", () => {
   });
 
   test.each([
-    ["fuente desconocida", { username: "acme", fqdn: "example.com", source: "../../etc/shadow", lines: 10 }],
+    ["fuente desconocida", { username: "acme", site: "web", source: "../../etc/shadow", lines: 10 }],
     ["fqdn with a path", { username: "acme", fqdn: "../../etc", source: "access", lines: 10 }],
-    ["too many lines", { username: "acme", fqdn: "example.com", source: "access", lines: 100000 }],
+    ["too many lines", { username: "acme", site: "web", source: "access", lines: 100000 }],
     ["usuario con ruta", { username: "../root", fqdn: "example.com", source: "php", lines: 10 }],
   ])("rejects %s without running anything", async (_label, params) => {
     const host = new FakeHost();

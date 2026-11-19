@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
-import type { AccountDto, JobCreatedDto, LogLevel, LogSource, PhpOptions, VhostDto } from "@eaglepanel/shared";
+import { siteDir, type AccountDto, type JobCreatedDto, type LogLevel, type LogSource, type PhpOptions, type VhostDto } from "@eaglepanel/shared";
 import { LockIcon } from "lucide-react";
 import { useEffect, useRef, useState, type SyntheticEvent } from "react";
 import { useTranslation } from "react-i18next";
@@ -17,10 +17,19 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
+import { VhostGeneralCard } from "@/routes/account-domains";
+import { SiteFtpCard } from "@/routes/account-services";
 import { PhpSelect } from "@/routes/accounts";
 import { AppConfigForm, AppPanel } from "@/routes/app-panel";
 
-const route = getRouteApi("/accounts/$username/environments/$fqdn");
+const route = getRouteApi("/accounts/$username/environments/$id");
+
+const VHOST_TABS = ["options", "logs", "ftp", "app"] as const;
+type VhostTab = (typeof VHOST_TABS)[number];
+const isVhostTab = (value: unknown): value is VhostTab => VHOST_TABS.includes(value as VhostTab);
+
+/** `?tab=ftp` opens that tab: the account FTP list links straight to it. */
+export const validateVhostSearch = (search: Record<string, unknown>): { tab?: VhostTab } => (isVhostTab(search.tab) ? { tab: search.tab } : {});
 
 const DIRECTIVES: { key: Exclude<keyof PhpOptions["directives"], "error_reporting">; label: string }[] = [
   { key: "memory_limit", label: "memory_limit" },
@@ -52,13 +61,13 @@ const LOG_SOURCES: { value: LogSource; label: string; empty: string }[] = [
 const LOG_REFRESH_MS = 3000;
 const LOG_LINES = 200;
 
-function LogsPanel({ fqdn }: { fqdn: string }) {
+function LogsPanel({ vhost }: { vhost: VhostDto }) {
   const { t } = useTranslation();
   const [source, setSource] = useState<LogSource>("access");
   const [live, setLive] = useState(true);
   const logs = useQuery({
-    queryKey: ["logs", fqdn, source],
-    queryFn: () => api.get<{ lines: string[] }>(`/vhosts/${fqdn}/logs?source=${source}&lines=${LOG_LINES}`),
+    queryKey: ["logs", vhost.id, source],
+    queryFn: () => api.get<{ lines: string[] }>(`/vhosts/${vhost.id}/logs?source=${source}&lines=${LOG_LINES}`),
     // On failure, stop polling every 3 seconds with the same error.
     refetchInterval: (query) => (live && !query.state.error ? LOG_REFRESH_MS : false),
   });
@@ -77,7 +86,7 @@ function LogsPanel({ fqdn }: { fqdn: string }) {
     <Card>
       <CardHeader>
         <CardTitle>Logs</CardTitle>
-        <CardDescription>{t("Last {{lines}} lines for {{fqdn}}, exactly as logged.", { lines: LOG_LINES, fqdn })}</CardDescription>
+        <CardDescription>{t("Last {{lines}} lines for {{fqdn}}, exactly as logged.", { lines: LOG_LINES, fqdn: vhost.name })}</CardDescription>
         <CardAction className="flex items-center gap-2">
           <Label htmlFor="live" className="font-normal">{t("Live")}</Label>
           <Switch id="live" checked={live} onCheckedChange={setLive} />
@@ -149,7 +158,7 @@ function VhostForm({ username, vhost }: { username: string; vhost: VhostDto }) {
   const [options, setOptions] = useState(vhost.phpOptions);
   const [logLevel, setLogLevel] = useState(vhost.logLevel);
   const [logDays, setLogDays] = useState(vhost.logDays);
-  const save = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.fqdn}/options`, { docRoot, phpVersion, phpOptions: options, logLevel, logDays }));
+  const save = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.id}/options`, { docRoot, phpVersion, phpOptions: options, logLevel, logDays }));
   const restart = useJobAction(() => api.post<JobCreatedDto>(`/accounts/${username}/php/restart`));
   const warnings = warningsFor(options, t);
   const setDirective = (key: keyof PhpOptions["directives"], value: string) =>
@@ -249,7 +258,7 @@ function VhostForm({ username, vhost }: { username: string; vhost: VhostDto }) {
       <Card>
         <CardHeader>
           <CardTitle>Logs</CardTitle>
-          <CardDescription>{t("Access and server error logs rotate daily. The PHP error_log belongs to the account: it is packed into a tar.gz inside logs/ when it reaches 20 MB or every month, counts toward its quota, and the panel does not delete those files.")}</CardDescription>
+          <CardDescription>{t("Access and server error logs rotate daily. The PHP error_log belongs to the account: it is in {{dir}}, it is packed into a tar.gz there when it reaches 20 MB or every month, counts toward its quota, and the panel does not delete those files.", { dir: `${siteDir(vhost.slug)}/logs` })}</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap gap-4">
           <div className="grid gap-2">
@@ -300,41 +309,46 @@ function VhostForm({ username, vhost }: { username: string; vhost: VhostDto }) {
 
 export function VhostDetailPage() {
   const { t } = useTranslation();
-  const { username, fqdn } = route.useParams();
+  const { username, id } = route.useParams();
+  const vhostId = Number(id);
   const account = useQuery({
     queryKey: ["accounts", username],
     queryFn: () => api.get<AccountDto>(`/accounts/${username}`),
     // Queued deployments start on their own: refresh while one is running or waiting.
     refetchInterval: (query) => {
-      const app = query.state.data?.vhosts.find((item) => item.fqdn === fqdn)?.app;
+      const app = query.state.data?.vhosts.find((item) => item.id === vhostId)?.app;
       return app && (app.status === "deploying" || app.queue.length > 0) ? 3000 : false;
     },
   });
-  const vhost = account.data?.vhosts.find((item) => item.fqdn === fqdn);
-  const [tab, setTab] = useState<"options" | "logs" | "app">("options");
+  const vhost = account.data?.vhosts.find((item) => item.id === vhostId);
+  const [tab, setTab] = useState<VhostTab>(route.useSearch().tab ?? "options");
 
   return (
     <Page>
       <div>
         <Button variant="link" className="h-auto p-0" nativeButton={false} render={<Link to="/accounts/$username" params={{ username }} />}>← {username}</Button>
-        <h2 className="mt-1 text-lg font-medium">{fqdn}</h2>
+        <h2 className="mt-1 text-lg font-medium">{vhost?.name ?? ""}</h2>
+        {vhost && <p className="text-sm text-muted-foreground">{vhost.hostname} · <span className="font-mono">{vhost.slug}</span></p>}
       </div>
       {account.isPending && <Skeleton className="h-48 w-full" />}
       {account.isError && <p className="text-sm text-destructive">{account.error.message}</p>}
       {account.data && !vhost && <p className="text-sm text-muted-foreground">{t("The environment does not exist.")}</p>}
+      {account.data && vhost && <VhostGeneralCard key={`${vhost.id}-${vhost.slug}-${vhost.name}-${vhost.hostname}`} account={account.data} vhost={vhost} />}
       {account.data && vhost?.app && <AppPanel account={account.data} vhost={vhost} app={vhost.app} />}
       {account.data && vhost && !vhost.app && (
-        <Tabs value={tab} onValueChange={(next) => setTab(next as "options" | "logs" | "app")} className="gap-4">
+        <Tabs value={tab} onValueChange={(next) => isVhostTab(next) && setTab(next)} className="gap-4">
           <TabsList>
             <TabsTrigger value="options">{t("Options")}</TabsTrigger>
             <TabsTrigger value="logs">Logs</TabsTrigger>
+            <TabsTrigger value="ftp">FTP</TabsTrigger>
             <TabsTrigger value="app">{t("Convert to app")}</TabsTrigger>
           </TabsList>
+          {tab === "ftp" && vhost.ftp && <div role="tabpanel"><SiteFtpCard username={username} vhost={vhost} ftp={vhost.ftp} suspended={account.data.suspended} /></div>}
           {tab === "app" && <div role="tabpanel"><AppConfigForm account={account.data} vhost={vhost} /></div>}
           {/* Stays mounted while hidden: viewing logs must not discard unsaved edits. */}
-          <div role="tabpanel" hidden={tab !== "options"}><VhostForm key={vhost.fqdn} username={username} vhost={vhost} /></div>
+          <div role="tabpanel" hidden={tab !== "options"}><VhostForm key={`${vhost.id}-${vhost.docRoot}`} username={username} vhost={vhost} /></div>
           {/* Mounted only while visible: leaving the tab stops polling the server every 3 seconds. */}
-          {tab === "logs" && <div role="tabpanel"><LogsPanel fqdn={vhost.fqdn} /></div>}
+          {tab === "logs" && <div role="tabpanel"><LogsPanel vhost={vhost} /></div>}
         </Tabs>
       )}
     </Page>

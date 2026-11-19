@@ -89,8 +89,8 @@ beforeEach(async () => {
     body: JSON.stringify({ username: "admin", password: PASSWORD }),
   });
   cookie = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
-  for (const [username, domain] of [["acme", "example.com"], ["other", "other.test"]] as const) {
-    expect((await runJob(await post("/accounts", { username, domain, phpVersion: "85", limits: DEFAULT_LIMITS }))).status).toBe("succeeded");
+  for (const username of ["acme", "other"]) {
+    expect((await runJob(await post("/accounts", { username, limits: DEFAULT_LIMITS }))).status).toBe("succeeded");
   }
   expect((await runJob(await post("/accounts/acme/databases", { name: "shop" }))).status).toBe("succeeded");
   expect((await runJob(await post("/accounts/other/databases", { name: "data" }))).status).toBe("succeeded");

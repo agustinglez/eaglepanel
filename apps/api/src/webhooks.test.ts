@@ -14,6 +14,7 @@ import { openDb, type Db } from "./db";
 import { eq } from "drizzle-orm";
 import { accounts, apps, certificates, deployments, deployQueue } from "./db/schema";
 import { JobRunner } from "./jobs";
+import { addEnvironment, createSiteAccount, testSlug } from "./test-support";
 import { normalizeRepo, validSignature } from "./webhooks";
 
 const PASSWORD = "test-password-value";
@@ -40,6 +41,17 @@ const agent: AgentClient = {
   }) as AgentClient["call"],
 };
 
+
+/** The API names an environment by its id: the one that answers for that hostname. */
+async function vid(hostname: string): Promise<number> {
+  const response = await app.request("/api/accounts", { headers: { cookie } });
+  for (const item of (await response.json()) as AccountDto[]) {
+    const found = item.vhosts.find((vhost) => vhost.hostname === hostname);
+    if (found) return found.id;
+  }
+  throw new Error(`No environment answers for ${hostname}`);
+}
+
 const post = (path: string, body: unknown = {}) => app.request(`/api${path}`, {
   method: "POST", headers: { "content-type": "application/json", "x-eaglepanel": "1", cookie }, body: JSON.stringify(body),
 });
@@ -59,8 +71,9 @@ async function runJob(path: string, body: unknown = {}): Promise<JobDto> {
   return waitFor(((await response.json()) as { jobId: string }).jobId);
 }
 const vhostOf = async (username: string, fqdn: string) =>
-  ((await (await get(`/accounts/${username}`)).json()) as AccountDto).vhosts.find((item) => item.fqdn === fqdn) as VhostDto;
-const conf = (fqdn: string) => readFileSync(host.resolvePath(`/usr/local/lsws/conf/vhosts/${fqdn}/vhost.conf`), "utf8");
+  ((await (await get(`/accounts/${username}`)).json()) as AccountDto).vhosts.find((item) => item.hostname === fqdn) as VhostDto;
+/** By hostname for an environment; the webhook vhost has its own name. */
+const conf = (name: string) => readFileSync(host.resolvePath(`/usr/local/lsws/conf/vhosts/${name.includes(".") ? testSlug(name) : name}/vhost.conf`), "utf8");
 
 const CONFIG = {
   kind: "static", repoUrl: "git@github.com:Acme/Front.git", branch: "main", subdir: "", runtime: "bun", runtimeVersion: "1",
@@ -82,13 +95,13 @@ beforeEach(async () => {
   });
   cookie = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
   for (const [username, domain] of [["acme", "example.com"], ["otra", "otra.com"]] as const) {
-    expect((await runJob("/accounts", { username, domain, phpVersion: "85", limits: DEFAULT_LIMITS })).status).toBe("succeeded");
+    expect((await createSiteAccount(runJob, { username, domain, limits: DEFAULT_LIMITS })).status).toBe("succeeded");
     db.insert(certificates).values({ zone: domain, username, names: [domain, `*.${domain}`], notAfter: Date.now() + 86_400_000 }).run();
   }
-  expect((await runJob("/accounts/acme/vhosts", { fqdn: "web.example.com", domain: "example.com", phpVersion: "85" })).status).toBe("succeeded");
-  expect((await runJob("/vhosts/web.example.com/app", CONFIG)).status).toBe("succeeded");
-  await post("/vhosts/web.example.com/app/deploy-key");
-  expect((await post("/vhosts/web.example.com/webhook", { enabled: true })).status).toBe(200);
+  expect((await addEnvironment(runJob, "acme", "web.example.com")).status).toBe("succeeded");
+  expect((await runJob(`/vhosts/${await vid("web.example.com")}/app`, CONFIG)).status).toBe("succeeded");
+  await post(`/vhosts/${await vid("web.example.com")}/app/deploy-key`);
+  expect((await post(`/vhosts/${await vid("web.example.com")}/webhook`, { enabled: true })).status).toBe(200);
   calls = [];
 });
 
@@ -143,7 +156,7 @@ describe("server-wide domain", () => {
     const body = pushPayload();
     const response = await push("hooks.example.com", "/hooks/github", body, sign(await secretOf(), body));
     expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({ deployed: ["web.example.com"], queued: [], skipped: [] });
+    expect(await response.json()).toEqual({ deployed: [await vid("web.example.com")], queued: [], skipped: [] });
     for (let attempt = 0; attempt < 400 && !calls.some(({ op }) => op === "app.release"); attempt += 1) await Bun.sleep(5);
     expect(calls.some(({ op }) => op === "app.build")).toBe(true);
   });
@@ -152,9 +165,9 @@ describe("server-wide domain", () => {
     const secret = await secretOf();
     const first = pushPayload();
     const second = pushPayload(undefined, undefined, "b".repeat(40));
-    expect(await (await push("hooks.example.com", "/hooks/github", first, sign(secret, first))).json()).toMatchObject({ deployed: ["web.example.com"] });
+    expect(await (await push("hooks.example.com", "/hooks/github", first, sign(secret, first))).json()).toMatchObject({ deployed: [await vid("web.example.com")] });
     expect(await (await push("hooks.example.com", "/hooks/github", second, sign(secret, second))).json())
-      .toEqual({ deployed: [], queued: [{ fqdn: "web.example.com", position: 1 }], skipped: [] });
+      .toEqual({ deployed: [], queued: [{ vhost: await vid("web.example.com"), position: 1 }], skipped: [] });
     expect((await vhostOf("acme", "web.example.com")).app!.queue).toMatchObject([{ commit: "b".repeat(40) }]);
 
     await until(() => fetches().length === 2);
@@ -165,8 +178,8 @@ describe("server-wide domain", () => {
 
   test("when the panel restarts, the interrupted deployment is marked failed and the queue continues", async () => {
     db.update(apps).set({ status: "deploying" }).run();
-    db.insert(deployments).values({ fqdn: "web.example.com", release: 1, kind: "static", status: "running", startedAt: Date.now() }).run();
-    db.insert(deployQueue).values({ fqdn: "web.example.com", trigger: "webhook de GitHub, main ccccccc", commit: "c".repeat(40), requestedAt: Date.now() }).run();
+    db.insert(deployments).values({ vhost: await vid("web.example.com"), release: 1, kind: "static", status: "running", startedAt: Date.now() }).run();
+    db.insert(deployQueue).values({ vhost: await vid("web.example.com"), trigger: "webhook de GitHub, main ccccccc", commit: "c".repeat(40), requestedAt: Date.now() }).run();
     calls = [];
     app = createApp({ db, agent, jobs });
 
@@ -185,13 +198,13 @@ describe("server-wide domain", () => {
     await push("hooks.example.com", "/hooks/github", first, sign(secret, first));
     await push("hooks.example.com", "/hooks/github", second, sign(secret, second));
     expect(await (await push("hooks.example.com", "/hooks/github", second, sign(secret, second))).json())
-      .toEqual({ deployed: [], queued: [], skipped: [{ fqdn: "web.example.com", reason: "That commit is already queued" }] });
+      .toEqual({ deployed: [], queued: [], skipped: [{ vhost: await vid("web.example.com"), reason: "That commit is already queued" }] });
   });
 
   test("also accepts the GitHub form format", async () => {
     const body = `payload=${encodeURIComponent(pushPayload())}`;
     const response = await push("hooks.example.com", "/hooks/github", body, sign(await secretOf(), body), "push", "application/x-www-form-urlencoded");
-    expect(await response.json()).toMatchObject({ deployed: ["web.example.com"] });
+    expect(await response.json()).toMatchObject({ deployed: [await vid("web.example.com")] });
   });
 
   test("another branch, a ping or a deleted branch do not deploy", async () => {
@@ -201,7 +214,7 @@ describe("server-wide domain", () => {
     const ping = JSON.stringify({ zen: "x", repository: { html_url: "https://github.com/acme/front" } });
     const pong = await push("hooks.example.com", "/hooks/github", ping, sign(secret, ping), "ping");
     expect(pong.status).toBe(200);
-    expect(await pong.json()).toEqual({ ok: true, apps: ["web.example.com"] });
+    expect(await pong.json()).toEqual({ ok: true, apps: [await vid("web.example.com")] });
     const deleted = JSON.stringify({ ref: "refs/heads/main", deleted: true, repository: { html_url: "https://github.com/acme/front" } });
     expect((await push("hooks.example.com", "/hooks/github", deleted, sign(secret, deleted))).status).toBe(202);
     expect(calls.some(({ op }) => op === "app.build")).toBe(false);
@@ -219,7 +232,7 @@ describe("server-wide domain", () => {
 
   test("with the webhook disabled, the previous secret no longer works", async () => {
     const secret = await secretOf();
-    await post("/vhosts/web.example.com/webhook", { enabled: false });
+    await post(`/vhosts/${await vid("web.example.com")}/webhook`, { enabled: false });
     expect((await vhostOf("acme", "web.example.com")).app!.webhook).toEqual({ secret: null, urls: ["https://hooks.example.com/hooks/github"] });
     const body = pushPayload();
     expect((await push("hooks.example.com", "/hooks/github", body, sign(secret, body))).status).toBe(401);
@@ -245,18 +258,18 @@ describe("server-wide domain", () => {
 
 describe("account domain", () => {
   test("the account chooses one of its environments with a certificate, and its URL shows up in the app", async () => {
-    expect((await post("/accounts/acme/hook-domain", { fqdn: "example.com" })).status).toBe(202);
-    for (let attempt = 0; attempt < 400 && db.select().from(accounts).all().find((row) => row.username === "acme")?.hookDomain !== "example.com"; attempt += 1) await Bun.sleep(5);
+    expect((await post("/accounts/acme/hook-vhost", { vhost: await vid("example.com") })).status).toBe(202);
+    for (let attempt = 0; attempt < 400 && db.select().from(accounts).all().find((row) => row.username === "acme")?.hookVhost !== await vid("example.com"); attempt += 1) await Bun.sleep(5);
     await Bun.sleep(20);
     expect(conf("example.com")).toContain("context /_eaglepanel/github {");
     expect(conf("web.example.com")).not.toContain("eaglepanel-api");
     expect((await vhostOf("acme", "web.example.com")).app!.webhook.urls).toEqual(["https://example.com/_eaglepanel/github"]);
-    expect((await post("/accounts/acme/hook-domain", { fqdn: "otra.com" })).status).toBe(400);
+    expect((await post("/accounts/acme/hook-vhost", { vhost: await vid("otra.com") })).status).toBe(400);
   });
 
   test("an environment without a certificate works: with Flexible SSL, Cloudflare connects over HTTP", async () => {
     db.delete(certificates).where(eq(certificates.zone, "example.com")).run();
-    expect((await runJob("/accounts/acme/hook-domain", { fqdn: "example.com" })).status).toBe("succeeded");
+    expect((await runJob("/accounts/acme/hook-vhost", { vhost: await vid("example.com") })).status).toBe("succeeded");
     expect(conf("example.com")).toContain("context /_eaglepanel/github {");
     // Without a certificate, there is neither an HTTPS redirect nor an SSL block: Cloudflare calls over HTTP and must get through.
     expect(conf("example.com")).not.toContain("vhssl");
@@ -264,23 +277,23 @@ describe("account domain", () => {
   });
 
   test("deploys only apps of that account", async () => {
-    db.update(accounts).set({ hookDomain: "example.com" }).where(eq(accounts.username, "acme")).run();
-    db.update(accounts).set({ hookDomain: "otra.com" }).where(eq(accounts.username, "otra")).run();
+    db.update(accounts).set({ hookVhost: await vid("example.com") }).where(eq(accounts.username, "acme")).run();
+    db.update(accounts).set({ hookVhost: await vid("otra.com") }).where(eq(accounts.username, "otra")).run();
     const body = pushPayload();
     const signature = sign(await secretOf(), body);
-    expect(await (await push("example.com", "/_eaglepanel/github", body, signature)).json()).toMatchObject({ deployed: ["web.example.com"] });
+    expect(await (await push("example.com", "/_eaglepanel/github", body, signature)).json()).toMatchObject({ deployed: [await vid("web.example.com")] });
     expect((await push("otra.com", "/_eaglepanel/github", body, signature)).status).toBe(401);
   });
 
   test("a suspended account receives no webhooks", async () => {
-    db.update(accounts).set({ hookDomain: "example.com", suspended: true }).run();
+    db.update(accounts).set({ hookVhost: await vid("example.com"), suspended: true }).where(eq(accounts.username, "acme")).run();
     const body = pushPayload();
     expect((await push("example.com", "/_eaglepanel/github", body, sign(await secretOf(), body))).status).toBe(404);
   });
 
   test("deleting the chosen environment clears the webhook domain", async () => {
-    db.update(accounts).set({ hookDomain: "web.example.com" }).run();
-    expect((await runJob("/vhosts/web.example.com/delete")).status).toBe("succeeded");
-    expect(db.select().from(accounts).all().find((row) => row.username === "acme")?.hookDomain).toBeNull();
+    db.update(accounts).set({ hookVhost: await vid("web.example.com") }).where(eq(accounts.username, "acme")).run();
+    expect((await runJob(`/vhosts/${await vid("web.example.com")}/delete`)).status).toBe("succeeded");
+    expect(db.select().from(accounts).all().find((row) => row.username === "acme")?.hookVhost).toBeNull();
   });
 });

@@ -57,7 +57,7 @@ beforeEach(async () => {
   await host.writeFileAtomic(HTTPD_CONFIG, "serverName test\n");
   const login = await app.request("/api/auth/login", { method: "POST", headers: { "content-type": "application/json", "x-eaglepanel": "1" }, body: JSON.stringify({ username: "admin", password: PASSWORD }) });
   cookie = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
-  const created = (await (await post("/accounts", { username: "acme", domain: "example.com", phpVersion: "85", limits: DEFAULT_LIMITS })).json()) as { jobId: string };
+  const created = (await (await post("/accounts", { username: "acme", limits: DEFAULT_LIMITS })).json()) as { jobId: string };
   for (let attempt = 0; attempt < 400; attempt += 1) {
     const job = jobs.get(created.jobId) as JobDto;
     if (job.status !== "pending" && job.status !== "running") break;

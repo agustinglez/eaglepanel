@@ -279,12 +279,12 @@ function EnvironmentsTable({ accounts, health }: { accounts: ReturnType<typeof u
   const { t } = useTranslation();
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
-  const byFqdn = new Map<string, EnvironmentHealthDto>((health.data ?? []).map((h) => [h.fqdn, h]));
+  const byId = new Map<number, EnvironmentHealthDto>((health.data ?? []).map((h) => [h.id, h]));
   const now = Date.now();
   const rows = (accounts.data ?? [])
     .flatMap((account) => account.vhosts.map((vhost) => ({ account, vhost })))
-    .filter(({ account, vhost }) => !q || vhost.fqdn.toLowerCase().includes(q) || account.username.toLowerCase().includes(q))
-    .sort((a, b) => a.vhost.fqdn.localeCompare(b.vhost.fqdn));
+    .filter(({ account, vhost }) => !q || [vhost.name, vhost.hostname, vhost.slug, account.username].some((text) => text.toLowerCase().includes(q)))
+    .sort((a, b) => a.vhost.name.localeCompare(b.vhost.name));
   const total = accounts.data?.reduce((n, a) => n + a.vhosts.length, 0) ?? 0;
 
   return (
@@ -323,21 +323,21 @@ function EnvironmentsTable({ accounts, health }: { accounts: ReturnType<typeof u
             </thead>
             <tbody className="divide-y divide-white/5">
               {rows.map(({ account, vhost }) => {
-                const h = byFqdn.get(vhost.fqdn);
+                const h = byId.get(vhost.id);
                 const state = HEALTH[h?.health ?? "unknown"];
-                const cert = vhost.certZone ? account.certificates.find((c) => c.zone === vhost.certZone) : undefined;
+                const cert = vhost.certZone ? account.domains.find((d) => d.fqdn === vhost.certZone)?.certificate ?? undefined : undefined;
                 const daysLeft = cert ? Math.floor((cert.notAfter - now) / DAY_MS) : null;
                 const isApp = vhost.type === "app";
                 return (
-                  <tr key={vhost.fqdn} className="transition hover:bg-white/[0.025]">
+                  <tr key={vhost.id} className="transition hover:bg-white/[0.025]">
                     <td className="px-5 py-3.5">
-                      <Link to="/accounts/$username/environments/$fqdn" params={{ username: account.username, fqdn: vhost.fqdn }} className="flex items-center gap-3">
+                      <Link to="/accounts/$username/environments/$id" params={{ username: account.username, id: String(vhost.id) }} className="flex items-center gap-3">
                         <span className="flex size-8 shrink-0 items-center justify-center rounded-ep-chip border border-white/10 bg-white/[0.02] text-foreground/45">
                           {isApp ? <BoxIcon className="size-4" aria-hidden="true" /> : <GlobeIcon className="size-4" aria-hidden="true" />}
                         </span>
                         <span className="min-w-0">
-                          <span className="block truncate text-sm text-foreground/85">{vhost.fqdn}</span>
-                          <span className="mt-1 block truncate font-mono text-xs text-foreground/35">{vhost.isMain ? t("Main domain") : vhost.domain}</span>
+                          <span className="block truncate text-sm text-foreground/85">{vhost.name}</span>
+                          <span className="mt-1 block truncate font-mono text-xs text-foreground/35">{vhost.hostname}</span>
                         </span>
                       </Link>
                     </td>
@@ -389,7 +389,7 @@ function AccountsTable({ accounts }: { accounts: ReturnType<typeof useAccounts> 
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
   const rows = (accounts.data ?? []).filter(
-    (a) => !q || a.username.toLowerCase().includes(q) || a.domains.some((d) => d.toLowerCase().includes(q)),
+    (a) => !q || a.username.toLowerCase().includes(q) || a.domains.some((d) => d.hostnames.some((h) => h.fqdn.includes(q))),
   );
 
   return (
@@ -435,7 +435,7 @@ function AccountsTable({ accounts }: { accounts: ReturnType<typeof useAccounts> 
                       </span>
                       <span className="min-w-0">
                         <span className="block truncate text-sm text-foreground/85">{account.username}</span>
-                        <span className="mt-1 block truncate font-mono text-xs text-foreground/35">{account.domains[0] ?? "—"}</span>
+                        <span className="mt-1 block truncate font-mono text-xs text-foreground/35">{account.domains.map(({ fqdn }) => fqdn).join(", ") || "—"}</span>
                       </span>
                     </Link>
                   </td>

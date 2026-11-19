@@ -1,0 +1,1 @@
+ALTER TABLE `vhosts` ADD `ftp_password_changed_at` integer;

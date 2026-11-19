@@ -19,6 +19,7 @@ import {
   dbNameSchema,
   docRootSchema,
   fqdnSchema,
+  vhostSlugSchema,
   generatedSecretSchema,
   logDaysSchema,
   logLevelSchema,
@@ -93,7 +94,7 @@ export const agentOps = {
   "site.write": {
     params: z.object({
       username: usernameSchema,
-      fqdn: fqdnSchema,
+      site: vhostSlugSchema,
       docRoot: docRootSchema,
       phpVersion: phpVersionSchema,
       phpOptions: phpOptionsSchema,
@@ -116,7 +117,7 @@ export const agentOps = {
     result: ok,
   },
   "app.prepare": {
-    params: z.object({ appId: appIdSchema, username: usernameSchema, fqdn: fqdnSchema, runtime: appRuntimeSchema, runtimeVersion: runtimeVersionSchema }).strict(),
+    params: z.object({ appId: appIdSchema, username: usernameSchema, runtime: appRuntimeSchema, runtimeVersion: runtimeVersionSchema }).strict(),
     result: ok,
   },
   "app.deployKey": {
@@ -130,7 +131,7 @@ export const agentOps = {
   },
   /** Puts the commit code in the build directory, emptied first: every deployment builds from scratch. */
   "app.unpack": {
-    params: z.object({ appId: appIdSchema, username: usernameSchema, fqdn: fqdnSchema, commit: commitSchema, subdir: repoSubdirSchema }).strict(),
+    params: z.object({ appId: appIdSchema, username: usernameSchema, commit: commitSchema, subdir: repoSubdirSchema }).strict(),
     result: ok,
   },
   /** Runs the account's build command in a container, on this release's code. */
@@ -138,7 +139,6 @@ export const agentOps = {
     params: z.object({
       appId: appIdSchema,
       username: usernameSchema,
-      fqdn: fqdnSchema,
       command: appCommandSchema,
       runtime: appRuntimeSchema,
       runtimeVersion: runtimeVersionSchema,
@@ -151,7 +151,6 @@ export const agentOps = {
     params: z.object({
       appId: appIdSchema,
       username: usernameSchema,
-      fqdn: fqdnSchema,
       release: z.number().int().min(1),
       kind: appKindSchema,
       outputDir: outputDirSchema,
@@ -165,7 +164,6 @@ export const agentOps = {
     params: z.object({
       appId: appIdSchema,
       username: usernameSchema,
-      fqdn: fqdnSchema,
       release: z.number().int().min(1),
       startCommand: appCommandSchema,
       memoryMb: appMemorySchema,
@@ -192,11 +190,11 @@ export const agentOps = {
     result: z.object({ lines: z.array(z.string()) }),
   },
   "app.prune": {
-    params: z.object({ appId: appIdSchema, username: usernameSchema, fqdn: fqdnSchema, keep: z.array(z.number().int().min(1)) }).strict(),
+    params: z.object({ appId: appIdSchema, username: usernameSchema, keep: z.array(z.number().int().min(1)) }).strict(),
     result: ok,
   },
   "app.remove": {
-    params: z.object({ appId: appIdSchema, username: usernameSchema, fqdn: fqdnSchema }).strict(),
+    params: z.object({ appId: appIdSchema, username: usernameSchema }).strict(),
     result: ok,
   },
   "ftp.setSuspended": {
@@ -219,7 +217,7 @@ export const agentOps = {
     result: z.unknown(),
   },
   "logs.read": {
-    params: z.object({ username: usernameSchema, fqdn: fqdnSchema, source: logSourceSchema, lines: logLinesSchema }).strict(),
+    params: z.object({ username: usernameSchema, site: vhostSlugSchema, source: logSourceSchema, lines: logLinesSchema }).strict(),
     result: z.object({ lines: z.array(z.string()) }),
   },
   "system.publicIp": {
@@ -228,6 +226,15 @@ export const agentOps = {
   },
   "ftp.setPassword": {
     params: z.object({ username: usernameSchema, password: generatedSecretSchema }).strict(),
+    result: ok,
+  },
+  /** FTP access of a single environment: it only sees `sites/<slug>`. */
+  "ftp.setSitePassword": {
+    params: z.object({ username: usernameSchema, site: vhostSlugSchema, password: generatedSecretSchema }).strict(),
+    result: ok,
+  },
+  "ftp.removeSite": {
+    params: z.object({ username: usernameSchema, site: vhostSlugSchema }).strict(),
     result: ok,
   },
   "db.create": {
@@ -268,14 +275,24 @@ export const agentOps = {
     result: ok,
   },
   "site.remove": {
-    params: z.object({ fqdn: fqdnSchema }).strict(),
+    params: z.object({ site: vhostSlugSchema }).strict(),
+    result: ok,
+  },
+  /**
+   * A new slug: moves `~/sites/<from>`, its OLS logs and its FTP login (with the same password). The configuration is
+   * written again afterwards with `site.write` and `ols.sync`.
+   */
+  "site.rename": {
+    params: z.object({ username: usernameSchema, from: vhostSlugSchema, to: vhostSlugSchema }).strict(),
     result: ok,
   },
   "ols.sync": {
     params: z.object({
       sites: z.array(z.object({
-        fqdn: fqdnSchema,
+        site: vhostSlugSchema,
         username: usernameSchema,
+        /** What the listeners map to this vhost. */
+        hostname: fqdnSchema,
         certZone: fqdnSchema.nullable(),
         originPull: z.boolean(),
       }).strict()),
@@ -341,9 +358,15 @@ export interface MeDto {
 }
 
 export interface VhostDto {
-  fqdn: string;
+  /** Never changes: the API and the panel URLs use it. */
+  id: number;
+  /** Unique on the server and editable: names its directory, its OLS vhost and its FTP login. */
+  slug: string;
+  name: string;
+  /** The domain or subdomain it answers for (OLS also maps www. in front of it). */
+  hostname: string;
+  /** Root domain of its hostname, whose certificate it uses. */
   domain: string;
-  isMain: boolean;
   type: VhostType;
   docRoot: string;
   phpVersion: string;
@@ -353,6 +376,8 @@ export interface VhostDto {
   /** Zone whose certificate covers this environment. Without it, Cloudflare in Full (strict) answers 526. */
   certZone: string | null;
   app: AppDto | null;
+  /** FTP access of this environment only. Without a password, it does not exist. Null for apps: they have no files to upload. */
+  ftp: { login: string; root: string; passwordChangedAt: number | null } | null;
 }
 
 export type AppStatus = "new" | "deploying" | "online" | "stopped" | "failed";
@@ -428,22 +453,34 @@ export interface CertificateDto {
 /** Expiry of the global Authenticated Origin Pulls CA bundled with the agent. */
 export const ORIGIN_PULL_CA_EXPIRES_AT = Date.UTC(2029, 10, 1, 17);
 
+export interface HostnameDto {
+  fqdn: string;
+  /** Environment that answers for it. */
+  vhost: { id: number; name: string } | null;
+}
+
+/** A root domain of the account, with its subdomains (the apex is the first hostname) and its certificate. */
+export interface DomainDto {
+  fqdn: string;
+  hostnames: HostnameDto[];
+  certificate: CertificateDto | null;
+}
+
 export interface AccountDto {
   username: string;
   limits: AccountLimits;
   /** Its sites answer 503, its services are stopped, and FTP and MySQL are blocked. Nothing is deleted. */
   suspended: boolean;
   createdAt: number;
-  domains: string[];
+  domains: DomainDto[];
   vhosts: VhostDto[];
-  certificates: CertificateDto[];
   databases: DatabaseDto[];
   /** When the size limit is exceeded, or the server is low on disk, databases lose write privileges. */
   dbBlocked: boolean;
   ftpPasswordChangedAt: number | null;
   services: Record<AccountService, AccountServiceDto>;
   /** Account environment where its webhook URL is published. */
-  hookDomain: string | null;
+  hookVhost: number | null;
 }
 
 /** Server settings. */
@@ -496,7 +533,8 @@ export interface SystemMetricsDto {
 export type EnvironmentHealth = "online" | "down" | "inactive" | "suspended" | "deploying" | "unknown";
 
 export interface EnvironmentHealthDto {
-  fqdn: string;
+  id: number;
+  name: string;
   health: EnvironmentHealth;
   /** HTTP status of the check, null if it did not answer or was not checked. */
   httpStatus: number | null;

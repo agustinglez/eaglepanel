@@ -1,12 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import type { AccountDto, AccountService, JobCreatedDto } from "@eaglepanel/shared";
+import type { AccountDto, AccountService, JobCreatedDto, VhostDto } from "@eaglepanel/shared";
 import { CirclePlusIcon, EllipsisVerticalIcon } from "lucide-react";
 import { useState, type SyntheticEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { ActionFeedback, CopyField, SecretDialog, useJobAction } from "@/components/job-action";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -213,6 +213,15 @@ function ConnectionDialog({ credentials, onClose }: { credentials: { database: s
 }
 
 export function FtpTab({ account }: { account: AccountDto }) {
+  return (
+    <div className="flex flex-col gap-4">
+      <AccountFtpCard account={account} />
+      <SiteFtpList account={account} />
+    </div>
+  );
+}
+
+function AccountFtpCard({ account }: { account: AccountDto }) {
   const { t } = useTranslation();
   const [secret, setSecret] = useState<string | null>(null);
   const server = useQuery({ queryKey: ["server-ip"], queryFn: () => api.get<{ ip: string | null }>("/server-ip") });
@@ -221,8 +230,8 @@ export function FtpTab({ account }: { account: AccountDto }) {
   return (
     <Card className="max-w-2xl">
       <CardHeader>
-        <CardTitle>{t("FTP account")}</CardTitle>
-        <CardDescription>{t("One per account, restricted to its home directory. Requires an encrypted connection (FTPS).")}</CardDescription>
+        <CardTitle>{t("General FTP account")}</CardTitle>
+        <CardDescription>{t("Sees the whole home directory, with every environment. Requires an encrypted connection (FTPS).")}</CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <div className="grid gap-4 sm:grid-cols-2">
@@ -240,6 +249,99 @@ export function FtpTab({ account }: { account: AccountDto }) {
         <ActionFeedback action={regenerate} onFinished={(ok) => { if (ok) setSecret(regenerate.data?.secret ?? null); }} />
       </CardContent>
       <SecretDialog title={t("FTP password")} secret={secret} onClose={() => setSecret(null)} />
+    </Card>
+  );
+}
+
+function SiteFtpList({ account }: { account: AccountDto }) {
+  const { t } = useTranslation();
+  // Apps have no files to upload: they have no FTP access of their own.
+  const sites = account.vhosts.flatMap((vhost) => (vhost.ftp ? [{ id: vhost.id, name: vhost.name, ftp: vhost.ftp }] : []));
+  if (sites.length === 0) return null;
+  return (
+    <Card className="max-w-2xl">
+      <CardHeader>
+        <CardTitle>{t("Environment FTP accounts")}</CardTitle>
+        <CardDescription>{t("Each environment can have its own access, which only sees its directory. It is created from the environment page.")}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="overflow-x-auto rounded-lg border">
+          <Table>
+            <TableHeader className="bg-muted">
+              <TableRow>
+                <TableHead>{t("User")}</TableHead>
+                <TableHead>{t("Root directory")}</TableHead>
+                <TableHead className="text-right">{t("Status")}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {sites.map((vhost) => (
+                <TableRow key={vhost.id}>
+                  <TableCell className="font-medium">
+                    <Link to="/accounts/$username/environments/$id" params={{ username: account.username, id: String(vhost.id) }} search={{ tab: "ftp" }} className="hover:underline">{vhost.ftp.login}</Link>
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">{vhost.ftp.root}</TableCell>
+                  <TableCell className="text-right">
+                    {vhost.ftp.passwordChangedAt ? <Badge variant="outline">{t("Active")}</Badge> : <Badge variant="secondary">{t("No access")}</Badge>}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** FTP access of a single environment: vsftpd locks it inside `sites/<slug>`. */
+export function SiteFtpCard({ username, vhost, ftp, suspended }: { username: string; vhost: VhostDto; ftp: NonNullable<VhostDto["ftp"]>; suspended: boolean }) {
+  const { t } = useTranslation();
+  const [secret, setSecret] = useState<string | null>(null);
+  const server = useQuery({ queryKey: ["server-ip"], queryFn: () => api.get<{ ip: string | null }>("/server-ip") });
+  const regenerate = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.id}/ftp/password`));
+  const remove = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.id}/ftp/delete`));
+  const active = ftp.passwordChangedAt !== null;
+
+  return (
+    <Card className="max-w-2xl">
+      <CardHeader>
+        <CardTitle>{t("Environment FTP account")}</CardTitle>
+        <CardDescription>{t("Only sees the directory of this environment. The general FTP account of {{username}} keeps seeing everything. Requires an encrypted connection (FTPS).", { username })}</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-2"><Label>{t("Server")}</Label><CopyField value={server.data?.ip ?? t("Server IP")} /></div>
+          <div className="grid gap-2"><Label>{t("Port")}</Label><CopyField value="21" /></div>
+          <div className="grid gap-2"><Label>{t("User")}</Label><CopyField value={ftp.login} /></div>
+          <div className="grid gap-2"><Label>{t("Root directory")}</Label><Input readOnly value={`/home/${username}/${ftp.root}`} /></div>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          {active ? t("Password changed on {{date}}.", { date: formatDateTime(ftp.passwordChangedAt ?? 0) }) : t("This environment has no FTP access of its own yet.")}
+          {suspended && ` ${t("The account is suspended: FTP is blocked.")}`}
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" disabled={regenerate.isPending} onClick={() => regenerate.mutate()}>{active ? t("Regenerate password") : t("Create access")}</Button>
+          {active && (
+            <AlertDialog>
+              <AlertDialogTrigger render={<Button variant="ghost" disabled={remove.isPending} />}>{t("Remove access")}</AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>{t("Remove the FTP access of {{name}}?", { name: vhost.name })}</AlertDialogTitle>
+                  <AlertDialogDescription>{t("New logins are rejected. The files stay where they are.")}</AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>{t("Cancel")}</AlertDialogCancel>
+                  <AlertDialogAction variant="destructive" onClick={() => remove.mutate()}>{t("Remove access")}</AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          )}
+        </div>
+        <ActionFeedback action={regenerate} onFinished={(ok) => { if (ok) setSecret(regenerate.data?.secret ?? null); }} />
+        <ActionFeedback action={remove} />
+      </CardContent>
+      <SecretDialog title={t("FTP password of {{name}}", { name: vhost.name })} secret={secret} onClose={() => setSecret(null)} />
     </Card>
   );
 }
