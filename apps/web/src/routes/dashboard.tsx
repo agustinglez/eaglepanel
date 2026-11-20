@@ -331,7 +331,7 @@ function EnvironmentsTable({ accounts, health }: { accounts: ReturnType<typeof u
                 return (
                   <tr key={vhost.id} className="transition hover:bg-white/[0.025]">
                     <td className="px-5 py-3.5">
-                      <Link to="/accounts/$username/environments/$id" params={{ username: account.username, id: String(vhost.id) }} className="flex items-center gap-3">
+                      <Link to="/accounts/$username/environments/$slug" params={{ username: account.username, slug: vhost.slug }} className="flex items-center gap-3">
                         <span className="flex size-8 shrink-0 items-center justify-center rounded-ep-chip border border-white/10 bg-white/[0.02] text-foreground/45">
                           {isApp ? <BoxIcon className="size-4" aria-hidden="true" /> : <GlobeIcon className="size-4" aria-hidden="true" />}
                         </span>

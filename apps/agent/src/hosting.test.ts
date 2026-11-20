@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { dispatch } from "./dispatch";
 import type { CommandResult, Host, RunOptions } from "./host";
-import { applyBlock, firstConfigError, HTTPD_CONFIG, renderVhost } from "./ols";
+import { applyBlock, CERTS_DIR, firstConfigError, HTTPD_CONFIG, includedPanelFiles, PANEL_CONF_DIR, redirectVhostPath, renderPanelConf, renderRedirectVhost, renderVhost, type HooksSite, type RedirectSite, type SyncedSite } from "./ols";
 
 const fixture = (name: string) => readFileSync(join(import.meta.dir, "testdata", name), "utf8");
 
@@ -86,6 +86,8 @@ describe("accounts", () => {
     expect(await call(host, "account.delete", { username: "acme" })).toMatchObject({ ok: true });
     expect(host.ran("userdel")).toBe(true);
     expect(host.commands.find((entry) => entry.command === "systemctl")?.args).toContain("eaglepanel-redis@acme");
+    // Its PHP .ini goes with it.
+    expect(host.commands.some(({ command, args }) => command === "rm" && args.includes("/etc/eaglepanel/php-accounts/acme"))).toBe(true);
   });
 
   test("deleting a missing account does not fail: rollback must be idempotent", async () => {
@@ -180,7 +182,8 @@ describe("vhosts", () => {
     // PHP does not evaluate constants in php_value.
     expect(conf).toContain('php_value error_reporting "1"');
     expect(conf).toContain("php_flag display_errors on");
-    expect(conf.indexOf("php_value memory_limit")).toBeLessThan(conf.indexOf("php_admin_value open_basedir"));
+    // What the account must not change is not here: OLS ignores php_admin_value. It goes in the .ini files read at startup.
+    expect(conf).not.toContain("php_admin");
   });
 
   test("rejects options that could open another directive in vhost.conf", async () => {
@@ -200,7 +203,7 @@ describe("vhosts", () => {
   test("isolates PHP in the account home directory", () => {
     const conf = renderVhost(site);
     expect(conf).toContain("docRoot                   /home/acme/public_html");
-    expect(conf).toContain('php_admin_value open_basedir "/home/acme"');
+    expect(conf).toContain("PHP_INI_SCAN_DIR=:/etc/eaglepanel/php:/etc/eaglepanel/php-accounts/acme");
     expect(conf).toContain("extUser                 acme");
     expect(conf).toContain("extGroup                acme");
     expect(conf).toContain("/usr/local/lsws/lsphp85/bin/lsphp");
@@ -252,41 +255,121 @@ describe("OLS configuration", () => {
   const BASE = "serverName glez\n\nlistener Default{\n  address 127.0.0.1:8088\n}\n";
   const http = { site: "web", username: "acme", hostname: "example.com", certZone: null, originPull: false };
   const https = { site: "secure", username: "bravo", hostname: "secure.test", certZone: "secure.test", originPull: false };
+  type Site = typeof http | typeof https | SyncedSite;
+  /** The block and every file, as one text. */
+  const all = (sites: Site[], hooks: HooksSite | null = null, redirects: RedirectSite[] = []) => {
+    const { block, files } = renderPanelConf(sites, hooks, redirects);
+    return [block, ...files.values()].join("\n");
+  };
+  const listener = (text: string, name: string) => {
+    const start = text.indexOf(`listener ${name}`);
+    return start === -1 ? "" : text.slice(start, text.indexOf("\n}", start) + 2);
+  };
+  /** A server already configured with these sites. */
+  async function seeded(sites: Site[]) {
+    const host = new FakeHost();
+    const { block, files } = renderPanelConf(sites, null);
+    await host.writeFileAtomic(HTTPD_CONFIG, applyBlock(BASE, block));
+    for (const [path, content] of files) await host.writeFileAtomic(path, content);
+    return host;
+  }
 
-  test("adds the block without touching the rest", () => {
-    const result = applyBlock(BASE, [http]);
+  test("httpd_config.conf only gets the include lines, without touching the rest", () => {
+    const { block, files } = renderPanelConf([http], null);
+    const result = applyBlock(BASE, block);
     expect(result).toContain("listener Default{\n  address 127.0.0.1:8088");
-    expect(result).toContain("virtualhost web {");
-    expect(result).toContain("allowSymbolLink         0");
-    expect(result).toContain("address                 *:80");
+    expect(result).toContain(`include ${PANEL_CONF_DIR}/sites/web.conf`);
+    expect(result).toContain(`include ${PANEL_CONF_DIR}/listeners.conf`);
+    expect(result).not.toContain("virtualhost");
+    expect(files.get(`${PANEL_CONF_DIR}/sites/web.conf`)).toContain("allowSymbolLink         0");
+    expect(files.get(`${PANEL_CONF_DIR}/listeners.conf`)).toContain("address                 *:80");
+  });
+
+  test("the vhosts are included before the listeners that map to them", () => {
+    const { block } = renderPanelConf([http, https], null);
+    expect(block.indexOf("listeners.conf")).toBeGreaterThan(block.indexOf("sites/web.conf"));
+    expect(block.indexOf("listeners.conf")).toBeGreaterThan(block.indexOf("sites/secure.conf"));
   });
 
   test("replacing the block is idempotent", () => {
-    const once = applyBlock(BASE, [http]);
-    expect(applyBlock(once, [http])).toBe(once);
+    const { block } = renderPanelConf([http], null);
+    const once = applyBlock(BASE, block);
+    expect(applyBlock(once, block)).toBe(once);
     expect(once.match(/BEGIN EAGLEPANEL/g)).toHaveLength(1);
   });
 
   test("without sites it does not open public ports", () => {
-    const result = applyBlock(applyBlock(BASE, [http]), []);
-    expect(result).not.toContain("*:80");
-    expect(result).not.toContain("virtualhost");
+    const { block, files } = renderPanelConf([], null);
+    expect(files.size).toBe(0);
+    expect(block).not.toContain("include");
+    const result = applyBlock(applyBlock(BASE, renderPanelConf([http], null).block), block);
+    expect(result).not.toContain("include");
     expect(result).toContain("listener Default{");
   });
 
   test("a site without a certificate is not published on 443", () => {
-    const result = applyBlock(BASE, [http, https]);
-    const httpsListener = result.slice(result.indexOf("listener eaglepanel-https"));
+    const httpsListener = listener(all([http, https]), "eaglepanel-https");
     expect(httpsListener).toContain("map                     secure secure.test");
     expect(httpsListener).not.toContain("example.com");
-    expect(applyBlock(BASE, [http])).not.toContain("*:443");
+    expect(all([http])).not.toContain("*:443");
   });
 
   test("the vhost is named by the slug and answers for its hostname", () => {
-    const result = applyBlock(BASE, [{ ...http, site: "admincrm", hostname: "admin.example.com" }]);
+    const result = all([{ ...http, site: "admincrm", hostname: "admin.example.com" }]);
     expect(result).toContain("virtualhost admincrm {");
     expect(result).toContain("configFile              conf/vhosts/admincrm/vhost.conf");
     expect(result).toContain("map                     admincrm admin.example.com");
+  });
+
+  test("aliases go on the same vhost; on 443 only the ones its certificate covers", () => {
+    const site = { ...https, aliases: [{ fqdn: "shop.secure.test", secure: true }, { fqdn: "a.b.secure.test", secure: false }] };
+    const text = all([site]);
+    expect(listener(text, "eaglepanel-http")).toContain("map                     secure secure.test, shop.secure.test, a.b.secure.test");
+    expect(listener(text, "eaglepanel-https")).toContain("map                     secure secure.test, shop.secure.test\n");
+    expect(text.match(/virtualhost /g)).toHaveLength(1);
+  });
+
+  test("redirects: one vhost per domain, without PHP or logs, a 301 to the target keeping the path", () => {
+    const redirect = {
+      domain: "other.test", certZone: "other.test", originPull: false, suspended: false,
+      hosts: [{ fqdn: "other.test", secure: true, target: "https://secure.test" }, { fqdn: "deep.x.other.test", secure: false, target: "https://secure.test" }],
+    };
+    const { block, files } = renderPanelConf([https], null, [redirect]);
+    expect(block).toContain(`include ${PANEL_CONF_DIR}/redirects/other.test.conf`);
+    expect(block).not.toContain("vhost.conf");
+    const registration = files.get(`${PANEL_CONF_DIR}/redirects/other.test.conf`)!;
+    expect(registration).toContain("virtualhost redirect_other.test {");
+    expect(registration).toContain("configFile              conf/eaglepanel/redirects/other.test/vhost.conf");
+    expect(registration).toContain("enableScript            0");
+    const vhost = files.get(redirectVhostPath("other.test"))!;
+    expect(vhost).toContain("RewriteCond %{HTTP_HOST} ^other\\.test(:\\d+)?$ [NC]\nRewriteRule ^ https://secure.test%{REQUEST_URI} [R=301,L]");
+    expect(vhost).toContain("RewriteCond %{HTTP_HOST} ^deep\\.x\\.other\\.test(:\\d+)?$ [NC]");
+    expect(vhost).not.toContain("log");
+    expect(vhost).not.toContain("extprocessor");
+    expect(vhost).toContain(`keyFile                 ${CERTS_DIR}/other.test/origin.key`);
+    const text = [block, ...files.values()].join("\n");
+    expect(listener(text, "eaglepanel-http")).toContain("map                     redirect_other.test other.test, deep.x.other.test");
+    expect(listener(text, "eaglepanel-https")).toContain("map                     redirect_other.test other.test\n");
+  });
+
+  test("a suspended account's redirects answer 503", () => {
+    const conf = renderRedirectVhost({ domain: "other.test", certZone: null, originPull: false, suspended: true, hosts: [{ fqdn: "other.test", secure: false, target: "http://example.com" }] });
+    expect(conf).toContain("RewriteRule ^ - [R=503,L]");
+    expect(conf).not.toContain("R=301");
+    expect(conf).not.toContain("vhssl");
+  });
+
+  test("redirects alone also open 443 with their certificate", () => {
+    const redirect = { domain: "other.test", certZone: "other.test", originPull: true, suspended: false, hosts: [{ fqdn: "other.test", secure: true, target: "http://example.com" }] };
+    const https443 = listener(all([http], null, [redirect]), "eaglepanel-https");
+    expect(https443).toContain(`keyFile                 ${CERTS_DIR}/other.test/origin.key`);
+    expect(https443).toContain("clientVerify            2");
+  });
+
+  test("only files of the panel directory are taken as its own", () => {
+    const { block, files } = renderPanelConf([https], null, [{ domain: "other.test", certZone: null, originPull: false, suspended: false, hosts: [{ fqdn: "other.test", secure: false, target: "http://secure.test" }] }]);
+    const own = includedPanelFiles(`${block}\ninclude /etc/passwd\ninclude ${PANEL_CONF_DIR}/../httpd_config.conf`, (path) => files.get(path));
+    expect(own.sort()).toEqual([...files.keys()].sort());
   });
 
   test("warnings do not invalidate the configuration, errors do", () => {
@@ -299,31 +382,63 @@ describe("OLS configuration", () => {
     await host.writeFileAtomic(HTTPD_CONFIG, BASE);
     expect(await call(host, "ols.sync", { sites: [http] })).toEqual({ ok: true, result: { changed: true } });
     expect(host.ran("lswsctrl")).toBe(true);
+    expect(await host.readFile(`${PANEL_CONF_DIR}/sites/web.conf`)).toContain("virtualhost web {");
+    expect(await host.readFile(HTTPD_CONFIG)).toContain(`include ${PANEL_CONF_DIR}/sites/web.conf`);
+  });
+
+  test("moves a block written before the included files into them", async () => {
+    const host = new FakeHost();
+    const legacy = `${BASE}\n# BEGIN EAGLEPANEL: generated by the panel, do not edit by hand\n\nvirtualhost web {\n  vhRoot /home/acme\n}\n\nlistener eaglepanel-http {\n  address                 *:80\n  map web example.com\n}\n\n# END EAGLEPANEL\n`;
+    await host.writeFileAtomic(HTTPD_CONFIG, legacy);
+    expect(await call(host, "ols.sync", { sites: [http] })).toMatchObject({ ok: true });
+    const config = (await host.readFile(HTTPD_CONFIG))!;
+    expect(config).not.toContain("virtualhost web {");
+    expect(config).toContain(`include ${PANEL_CONF_DIR}/listeners.conf`);
+    // Port 80 stays: it is only moved, so the usual restart is enough.
+    expect(host.ran("lswsctrl")).toBe(true);
   });
 
   test("does not restart when nothing changed", async () => {
-    const host = new FakeHost();
-    await host.writeFileAtomic(HTTPD_CONFIG, applyBlock(BASE, [http]));
+    const host = await seeded([http]);
     expect(await call(host, "ols.sync", { sites: [http] })).toEqual({ ok: true, result: { changed: false } });
     expect(host.ran("lswsctrl")).toBe(false);
   });
 
-  test("restarts when asked, even if the block did not change", async () => {
-    const host = new FakeHost();
-    await host.writeFileAtomic(HTTPD_CONFIG, applyBlock(BASE, [http]));
+  test("a change only inside an included file is applied", async () => {
+    const host = await seeded([http]);
+    expect(await call(host, "ols.sync", { sites: [{ ...http, aliases: [{ fqdn: "shop.example.com", secure: false }] }] })).toEqual({ ok: true, result: { changed: true } });
+    expect(await host.readFile(`${PANEL_CONF_DIR}/listeners.conf`)).toContain("example.com, shop.example.com");
+  });
+
+  test("deletes the files of what is no longer there", async () => {
+    const host = await seeded([http, https]);
+    expect(await call(host, "ols.sync", { sites: [https] })).toMatchObject({ ok: true });
+    const removed = host.commands.find(({ command, args }) => command === "rm" && args[0] === "-f");
+    expect(removed?.args).toContain(`${PANEL_CONF_DIR}/sites/web.conf`);
+    // With the copies OLS keeps next to it.
+    expect(removed?.args).toContain(`${PANEL_CONF_DIR}/sites/web.conf0,v`);
+    expect(removed?.args).not.toContain(`${PANEL_CONF_DIR}/sites/secure.conf`);
+  });
+
+  test("restarts when asked, even if nothing changed", async () => {
+    const host = await seeded([http]);
     expect(await call(host, "ols.sync", { sites: [http], restart: true })).toMatchObject({ ok: true });
     expect(host.ran("lswsctrl")).toBe(true);
   });
 
   test("if OLS rejects the configuration, it restores the previous one and does not restart", async () => {
-    const host = new FakeHost();
-    await host.writeFileAtomic(HTTPD_CONFIG, BASE);
+    const host = await seeded([http]);
+    const before = await host.readFile(HTTPD_CONFIG);
+    const listeners = await host.readFile(`${PANEL_CONF_DIR}/listeners.conf`);
     // Returns 2 just like on the VPS: what decides is the [ERROR] line.
     host.responses.set("openlitespeed", { code: 2, stdout: "[ERROR] missing <vhRoot>\n" });
 
-    const response = await call(host, "ols.sync", { sites: [http] });
+    const response = await call(host, "ols.sync", { sites: [http, https] });
     expect(response).toMatchObject({ ok: false, error: { message: expect.stringContaining("missing <vhRoot>") } });
-    expect(await host.readFile(HTTPD_CONFIG)).toBe(BASE);
+    expect(await host.readFile(HTTPD_CONFIG)).toBe(before);
+    expect(await host.readFile(`${PANEL_CONF_DIR}/listeners.conf`)).toBe(listeners);
+    // The file of the new site is deleted again.
+    expect(host.commands.some(({ command, args }) => command === "rm" && args.includes(`${PANEL_CONF_DIR}/sites/secure.conf`))).toBe(true);
     expect(host.ran("lswsctrl")).toBe(false);
   });
 

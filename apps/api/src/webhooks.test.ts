@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dispatch } from "../../agent/src/dispatch";
 import { SandboxHost } from "../../agent/src/host";
-import { HTTPD_CONFIG } from "../../agent/src/ols";
+import { HTTPD_CONFIG, PANEL_CONF_DIR } from "../../agent/src/ols";
 import type { AgentClient } from "./agent-client";
 import { createApp } from "./app";
 import { hashPassword, setAdminCredentials } from "./auth";
@@ -146,7 +146,8 @@ describe("server-wide domain", () => {
   });
 
   test("OLS publishes only the webhook path on that domain, with the certificate that covers it", () => {
-    const config = readFileSync(host.resolvePath(HTTPD_CONFIG), "utf8");
+    const config = readFileSync(host.resolvePath(`${PANEL_CONF_DIR}/listeners.conf`), "utf8");
+    expect(readFileSync(host.resolvePath(HTTPD_CONFIG), "utf8")).toContain(`include ${PANEL_CONF_DIR}/hooks.conf`);
     expect(config).toContain("map                     eaglepanel-hooks hooks.example.com");
     expect(conf("eaglepanel-hooks")).toContain("context /hooks/github {");
     expect(conf("eaglepanel-hooks")).toContain("/eaglepanel-certs/example.com/origin.crt");

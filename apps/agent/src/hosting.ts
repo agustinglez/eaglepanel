@@ -19,6 +19,10 @@ import {
   HOOKS_LOG_DIR,
   hooksVhostDir,
   HTTPD_CONFIG,
+  includedPanelFiles,
+  PANEL_CONF_DIR,
+  panelBlock,
+  renderPanelConf,
   keyPath,
   listenerPort,
   logrotatePath,
@@ -27,6 +31,10 @@ import {
   PHP_SYSTEM_INI,
   PHP_SYSTEM_INI_CONTENT,
   PHP_SYSTEM_INI_DIR,
+  PHP_ACCOUNTS_INI_DIR,
+  accountIniDir,
+  accountIniPath,
+  renderAccountIni,
   phpLogPath,
   removedListeners,
   renderHooksVhost,
@@ -166,43 +174,77 @@ async function withSql<T>(host: Host, work: (sql: SqlClient) => Promise<T>): Pro
   }
 }
 
-async function syncOls({ sites, restart, hooks = null }: AgentOpParams<"ols.sync">, host: Host): Promise<AgentOpResult<"ols.sync">> {
+/** Contents of the given files; a missing file is left out. */
+async function readFiles(host: Host, paths: string[]): Promise<Map<string, string>> {
+  const files = new Map<string, string>();
+  for (const path of paths) {
+    const content = await host.readFile(path);
+    if (content !== null) files.set(path, content);
+  }
+  return files;
+}
+
+/** Leaves the panel files and `httpd_config.conf` exactly as `files` and `config`, deleting what is not in `files`. */
+async function writePanelConf(host: Host, config: string, files: Map<string, string>, others: Iterable<string>) {
+  for (const [path, content] of files) await host.writeFileAtomic(path, content, 0o640);
+  const stale = [...others].filter((path) => !files.has(path));
+  // OLS keeps a copy and an RCS history next to every configuration file it loads (measured in WSL, OLS 1.9.4).
+  if (stale.length > 0) await must(host, "rm", ["-f", "--", ...stale.flatMap((path) => [path, `${path}0`, `${path}0,v`, `${path}.txt`])]);
+  // Only what the panel writes there: the redirect directory of a domain that no longer has one goes too.
+  const staleDirs = [...new Set(stale.filter((path) => path.endsWith("/vhost.conf")).map((path) => path.slice(0, path.lastIndexOf("/"))))];
+  if (staleDirs.length > 0) await must(host, "rm", ["-rf", "--", ...staleDirs]);
+  if (files.size > 0) {
+    await must(host, "chown", ["-R", `--reference=${LSWS}/conf/vhosts`, PANEL_CONF_DIR]);
+    await must(host, "chmod", ["-R", "u=rwX,g=rX,o=", PANEL_CONF_DIR]);
+  }
+  await host.writeFileAtomic(HTTPD_CONFIG, config, 0o640);
+  await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
+}
+
+async function syncOls({ sites, restart, hooks = null, redirects = [] }: AgentOpParams<"ols.sync">, host: Host): Promise<AgentOpResult<"ols.sync">> {
   const current = (await host.readFile(HTTPD_CONFIG)) ?? "";
-  const next = applyBlock(current, sites, hooks);
+  const { block, files } = renderPanelConf(sites, hooks, redirects);
+  const next = applyBlock(current, block);
+  // What the current block uses, to compare, to undo, and to delete what stops being used.
+  const firstLevel = await readFiles(host, includedPanelFiles(panelBlock(current), () => null));
+  const previous = await readFiles(host, includedPanelFiles(panelBlock(current), (path) => firstLevel.get(path)));
+  const filesChanged = previous.size !== files.size || [...files].some(([path, content]) => previous.get(path) !== content);
   // Its vhost.conf can change without the block changing: the certificate, for example.
   const hooksConf = hooks ? renderHooksVhost(hooks) : null;
   const hooksChanged = hooksConf !== null && (await host.readFile(`${hooksVhostDir()}/vhost.conf`)) !== hooksConf;
-  if (next === current && !restart && !hooksChanged) return { changed: false };
+  if (next === current && !filesChanged && !restart && !hooksChanged) return { changed: false };
 
   // Also before validating. Without a hooks domain the directory is deleted at the end, once OLS no longer uses it.
+  if (hooksConf || redirects.length > 0) {
+    await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "711", "/srv/eaglepanel"]);
+    await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", SUSPENDED_DOC_ROOT]);
+  }
   if (hooksConf) {
     await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", "/var/log/eaglepanel"]);
     await makeDir(host, HOOKS_LOG_DIR, "root", "nogroup", "750");
-    await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "711", "/srv/eaglepanel"]);
-    await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", SUSPENDED_DOC_ROOT]);
     await host.writeFileAtomic(`${hooksVhostDir()}/vhost.conf`, hooksConf, 0o640);
     await must(host, "chown", ["-R", `--reference=${LSWS}/conf/vhosts`, hooksVhostDir()]);
     await must(host, "chmod", ["750", hooksVhostDir()]);
   }
 
   // Before validating: `openlitespeed -t` would reject a configuration pointing to a missing file.
-  if (sites.some((site) => site.originPull)) {
+  if (sites.some((site) => site.originPull) || redirects.some((redirect) => redirect.originPull)) {
     await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "700", CERTS_DIR]);
     await host.writeFileAtomic(ORIGIN_PULL_CA_PATH, CLOUDFLARE_ORIGIN_PULL_CA, 0o600);
   }
 
-  await host.writeFileAtomic(HTTPD_CONFIG, next, 0o640);
-  await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
+  const restore = () => writePanelConf(host, current, previous, files.keys());
+  await writePanelConf(host, next, files, previous.keys());
 
   const test = await host.run(`${LSWS}/bin/openlitespeed`, ["-t"]);
   const error = firstConfigError(`${test.stdout}\n${test.stderr}`);
   if (error) {
-    await host.writeFileAtomic(HTTPD_CONFIG, current, 0o640);
-    await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
+    await restore();
     throw new Error(`OLS rejected the configuration and the previous one was restored: ${error}`);
   }
 
-  const removed = removedListeners(current, next);
+  // Before this version the listeners were inside the block itself.
+  const removed = removedListeners(`${panelBlock(current)}\n${[...previous.values()].join("\n")}`, [...files.values()].join("\n"));
   if (removed.length === 0) {
     await must(host, `${LSWS}/bin/lswsctrl`, ["restart"]);
     if (!hooks) await must(host, "rm", ["-rf", "--", hooksVhostDir()]);
@@ -214,8 +256,7 @@ async function syncOls({ sites, restart, hooks = null }: AgentOpParams<"ols.sync
     await must(host, "systemctl", ["start", OLS_UNIT]);
     await assertNotListening(host, removed);
   } catch (error) {
-    await host.writeFileAtomic(HTTPD_CONFIG, current, 0o640);
-    await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
+    await restore();
     // If it did get stopped, the sites cannot stay down. If it is still running, this does nothing.
     await host.run("systemctl", ["start", OLS_UNIT]);
     throw error;
@@ -273,6 +314,7 @@ export const hostingHandlers: HostingHandlers = {
 
     await host.run("pkill", ["-KILL", "-u", username]);
     await must(host, "userdel", ["--remove", username]);
+    await must(host, "rm", ["-rf", "--", accountIniDir(username)]);
     return { ok: true };
   },
 
@@ -387,6 +429,9 @@ export const hostingHandlers: HostingHandlers = {
     await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "711", "/srv/eaglepanel"]);
     await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", SUSPENDED_DOC_ROOT]);
     await host.writeFileAtomic(PHP_SYSTEM_INI, PHP_SYSTEM_INI_CONTENT, 0o644);
+    // Readable by the account (its PHP runs as it), writable only by root.
+    await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", PHP_ACCOUNTS_INI_DIR, accountIniDir(site.username)]);
+    await host.writeFileAtomic(accountIniPath(site.username), renderAccountIni(site.username), 0o644);
     // It belongs to the account: created empty with its permissions and, if it already exists, its content is left alone.
     if (!site.app) await must(host, "setpriv", [`--reuid=${site.username}`, `--regid=${site.username}`, "--clear-groups", "touch", "-a", "--", userIniPath(site.username, site.docRoot)]);
 

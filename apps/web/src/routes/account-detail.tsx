@@ -87,11 +87,11 @@ function NewVhostForm({ account }: { account: AccountDto }) {
       <form onSubmit={submit} className="flex flex-wrap items-start gap-4">
         <div className="grid gap-2">
           <Label htmlFor="vhost-name">{t("Name")}</Label>
-          <Input id="vhost-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="Admin CRM" autoComplete="off" required maxLength={64} className="w-56" />
+          <Input id="vhost-name" value={name} onChange={(event) => setName(event.target.value)} placeholder={t("My site")} autoComplete="off" required maxLength={64} className="w-56" />
         </div>
         <div className="grid gap-2">
           <Label htmlFor="vhost-slug">{t("Slug")}</Label>
-          <Input id="vhost-slug" value={slug} onChange={(event) => setCustomSlug(event.target.value.toLowerCase().replace(/[^a-z0-9]/g, ""))} placeholder="admincrm" autoComplete="off" spellCheck={false} required maxLength={32} className="w-40 font-mono" />
+          <Input id="vhost-slug" value={slug} onChange={(event) => setCustomSlug(event.target.value.toLowerCase().replace(/[^a-z0-9]/g, ""))} placeholder="mysite" autoComplete="off" spellCheck={false} required maxLength={32} className="w-40 font-mono" />
           <p className="max-w-56 text-xs text-muted-foreground">{t("Letters and digits, unique on the server: sites/{{slug}}", { slug: slug || "…" })}</p>
         </div>
         <div className="grid gap-2">
@@ -152,7 +152,7 @@ function VhostsTab({ account }: { account: AccountDto }) {
               {account.vhosts.map((vhost) => (
                 <TableRow key={vhost.id}>
                   <TableCell>
-                    <Link to="/accounts/$username/environments/$id" params={{ username: account.username, id: String(vhost.id) }} className="font-medium hover:underline">{vhost.name}</Link>
+                    <Link to="/accounts/$username/environments/$slug" params={{ username: account.username, slug: vhost.slug }} className="font-medium hover:underline">{vhost.name}</Link>
                     <span className="ml-2 text-muted-foreground">({vhost.hostname})</span>
                   </TableCell>
                   <TableCell className="hidden font-mono text-muted-foreground @3xl/main:table-cell">{vhost.slug}</TableCell>

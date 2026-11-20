@@ -8,7 +8,7 @@ import { migrate as drizzleMigrate } from "drizzle-orm/bun-sqlite/migrator";
 import { openDb } from "./index";
 
 const DIR = join(import.meta.dir, "..", "..", "drizzle");
-const FILES = ["0000_easy_hawkeye", "0001_tan_madripoor", "0002_cloudy_blade", "0003_mysterious_apocalypse", "0004_shallow_gamma_corps", "0005_lucky_black_bolt", "0006_boring_scrambler", "0007_cultured_forgotten_one", "0008_numerous_lockheed", "0009_app_kinds", "0010_merge_install", "0011_deployment_kind", "0012_webhooks", "0013_deploy_queue", "0014_account_exports", "0015_site_ftp", "0016_hostnames", "0017_environment_slugs"];
+const FILES = ["0000_easy_hawkeye", "0001_tan_madripoor", "0002_cloudy_blade", "0003_mysterious_apocalypse", "0004_shallow_gamma_corps", "0005_lucky_black_bolt", "0006_boring_scrambler", "0007_cultured_forgotten_one", "0008_numerous_lockheed", "0009_app_kinds", "0010_merge_install", "0011_deployment_kind", "0012_webhooks", "0013_deploy_queue", "0014_account_exports", "0015_site_ftp", "0016_hostnames", "0017_environment_slugs", "0018_environment_extras"];
 
 function apply(sqlite: Database, name: string) {
   for (const statement of readFileSync(join(DIR, `${name}.sql`), "utf8").split("--> statement-breakpoint")) {

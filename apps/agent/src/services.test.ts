@@ -5,7 +5,7 @@ import { CLOUDFLARE_ORIGIN_PULL_CA } from "./cloudflare-ca";
 import { dispatch } from "./dispatch";
 import type { CommandResult, Host, RunOptions } from "./host";
 import { stopOlsFully } from "./hosting";
-import { applyBlock, CERTS_DIR, HTTPD_CONFIG, logrotatePath, ORIGIN_PULL_CA_PATH, PHP_SYSTEM_INI, PHP_SYSTEM_INI_DIR, removedListeners, renderLogrotate, renderVhost, SUSPENDED_DOC_ROOT } from "./ols";
+import { accountIniDir, accountIniPath, applyBlock, CERTS_DIR, PANEL_CONF_DIR, PHP_ACCOUNTS_INI_DIR, PHP_SYSTEM_INI_CONTENT, renderPanelConf, HTTPD_CONFIG, logrotatePath, ORIGIN_PULL_CA_PATH, PHP_SYSTEM_INI, PHP_SYSTEM_INI_DIR, removedListeners, renderLogrotate, renderVhost, SUSPENDED_DOC_ROOT } from "./ols";
 import { ftpUserFile } from "./services";
 
 const PASSWORD = "AbCdEfGh_ijklmnop-1234";
@@ -294,9 +294,9 @@ describe("Cloudflare client certificate", () => {
   });
 
   test("the listener requires it if any domain requires it", () => {
-    const listener = (block: string) => block.slice(block.indexOf("listener eaglepanel-https"));
-    expect(listener(applyBlock("", [secure, open]))).toContain("clientVerify            2");
-    expect(listener(applyBlock("", [open]))).not.toContain("clientVerify");
+    const listener = (sites: (typeof secure)[]) => renderPanelConf(sites, null).files.get(`${PANEL_CONF_DIR}/listeners.conf`) ?? "";
+    expect(listener([secure, open])).toContain("clientVerify            2");
+    expect(listener([open])).not.toContain("clientVerify");
   });
 
   test("writes the CA before validating, readable by root only", async () => {
@@ -331,9 +331,12 @@ describe("closing listeners when removing sites", () => {
   const secure = { site: "secure", username: "bravo", hostname: "secure.test", certZone: "secure.test", originPull: false };
   const seed = (sites: (typeof plain | typeof secure)[]) => {
     const host = new FakeHost();
-    host.files.set(HTTPD_CONFIG, applyBlock("serverName test\n", sites));
+    const { block, files } = renderPanelConf(sites, null);
+    host.files.set(HTTPD_CONFIG, applyBlock("serverName test\n", block));
+    for (const [path, content] of files) host.files.set(path, content);
     return host;
   };
+  const listeners = `${PANEL_CONF_DIR}/listeners.conf`;
   const ran = (host: FakeHost) => host.commands.map(({ command, args }) => [command.split("/").at(-1), ...args].join(" "));
 
   test("with no listeners removed, it uses the usual restart", async () => {
@@ -368,7 +371,7 @@ describe("closing listeners when removing sites", () => {
     const host = seed([plain]);
     expect(await call(host, "ols.sync", { sites: [] })).toMatchObject({ ok: true });
     expect(ran(host)).toContain("systemctl stop lshttpd");
-    expect(host.files.get(HTTPD_CONFIG)).not.toContain("*:80");
+    expect(host.files.get(HTTPD_CONFIG)).not.toContain("listeners.conf");
   });
 
   test("does not start until the old process has exited", async () => {
@@ -435,9 +438,12 @@ describe("closing listeners when removing sites", () => {
   });
 
   test("looks only at the panel block, not at other listeners in the file", () => {
-    const outside = "listener other {\n  address                 *:443\n}\n";
-    expect(removedListeners(applyBlock(outside, [plain]), applyBlock(outside, [plain]))).toEqual([]);
-    expect(removedListeners(applyBlock(outside, [secure]), applyBlock(outside, [plain]))).toEqual(["*:443"]);
+    const text = (sites: (typeof plain | typeof secure)[]) => [...renderPanelConf(sites, null).files.values()].join("\n");
+    expect(removedListeners(text([plain]), text([plain]))).toEqual([]);
+    expect(removedListeners(text([secure]), text([plain]))).toEqual(["*:443"]);
+    // Before the included files, the listeners were in the block itself.
+    const legacy = "# BEGIN EAGLEPANEL\nlistener eaglepanel-https {\n  address                 *:443\n}\n# END EAGLEPANEL";
+    expect(removedListeners(legacy, text([plain]))).toEqual(["*:443"]);
   });
 });
 
@@ -447,7 +453,7 @@ describe(".user.ini per environment", () => {
   test("enables .user.ini", () => {
     const conf = renderVhost(site);
     expect(conf).toContain("env                     LSPHP_ENABLE_USER_INI=on");
-    expect(conf).toContain('php_admin_value user_ini.cache_ttl "5"');
+    expect(PHP_SYSTEM_INI_CONTENT).toContain("user_ini.cache_ttl=5");
   });
 
   test("blocks every dot file or directory, except .well-known", () => {
@@ -462,12 +468,23 @@ describe(".user.ini per environment", () => {
     }
   });
 
-  test("SCAN_DIR points only to the root directory: pointing to the account, a .user.ini enabled exec()", () => {
+  test("SCAN_DIR points only to root directories: pointing to the account, a .user.ini enabled exec()", () => {
     for (const docRoot of ["public_html", "sites/test.example.com/public_html"]) {
       const scan = renderVhost({ ...site, docRoot }).split("\n").filter((line) => line.includes("PHP_INI_SCAN_DIR"));
-      expect(scan).toEqual([`  env                     PHP_INI_SCAN_DIR=:${PHP_SYSTEM_INI_DIR}`]);
+      expect(scan).toEqual([`  env                     PHP_INI_SCAN_DIR=:${PHP_SYSTEM_INI_DIR}:${accountIniDir("acme")}`]);
     }
     expect(PHP_SYSTEM_INI_DIR.startsWith("/home")).toBe(false);
+    expect(accountIniDir("acme").startsWith("/home")).toBe(false);
+  });
+
+  test("open_basedir and the account directories go in a root .ini read at startup: OLS ignores php_admin_value", async () => {
+    expect(renderVhost(site)).not.toContain("php_admin");
+    const host = new FakeHost();
+    await call(host, "site.write", site);
+    expect(host.files.get(accountIniPath("acme"))).toBe("; Generated by EaglePanel. Do not edit by hand.\nopen_basedir=/home/acme\nupload_tmp_dir=/home/acme/tmp\nsession.save_path=/home/acme/tmp\n");
+    expect(host.files.get(PHP_SYSTEM_INI)).toContain("allow_url_include=Off");
+    const dir = host.commands.find(({ args }) => args.includes(accountIniDir("acme")));
+    expect(dir?.args).toEqual(["-d", "-o", "root", "-g", "root", "-m", "755", PHP_ACCOUNTS_INI_DIR, accountIniDir("acme")]);
   });
 
   test("disable_functions goes in the root .ini: in phpIniOverride it has no effect", async () => {
@@ -671,7 +688,6 @@ describe("environment logs", () => {
     const conf = renderVhost(site);
     expect(conf).toContain('php_value error_log "/home/acme/sites/web/logs/php_error.log"');
     expect(conf).not.toContain("php_admin_value error_log");
-    expect(conf).toContain("php_admin_value open_basedir");
   });
 
   test("site.write prepares the directories with their owners and the rotation configuration", async () => {

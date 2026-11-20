@@ -22,7 +22,7 @@ const routeTree = rootRoute.addChildren([
   // Each account tab has its own URL: reloading or following a link returns to the same tab.
   createRoute({ getParentRoute: () => rootRoute, path: "/accounts/$username/$tab", component: AccountDetailPage }),
   createRoute({ getParentRoute: () => rootRoute, path: "/accounts/$username/domains/$zone", component: DomainDetailPage }),
-  createRoute({ getParentRoute: () => rootRoute, path: "/accounts/$username/environments/$id", component: VhostDetailPage, validateSearch: validateVhostSearch }),
+  createRoute({ getParentRoute: () => rootRoute, path: "/accounts/$username/environments/$slug", component: VhostDetailPage, validateSearch: validateVhostSearch }),
   createRoute({ getParentRoute: () => rootRoute, path: "/accounts/$username/databases/$database", component: DatabaseExplorerPage, validateSearch: validateExplorerSearch }),
   createRoute({ getParentRoute: () => rootRoute, path: "/jobs", component: JobsPage }),
   createRoute({ getParentRoute: () => rootRoute, path: "/activity", component: ActivityPage }),

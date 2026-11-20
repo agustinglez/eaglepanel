@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { getRouteApi, Link } from "@tanstack/react-router";
+import { getRouteApi, Link, useNavigate } from "@tanstack/react-router";
 import { siteDir, type AccountDto, type JobCreatedDto, type LogLevel, type LogSource, type PhpOptions, type VhostDto } from "@eaglepanel/shared";
 import { LockIcon } from "lucide-react";
 import { useEffect, useRef, useState, type SyntheticEvent } from "react";
@@ -17,12 +17,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import { VhostGeneralCard } from "@/routes/account-domains";
+import { VhostExtrasCard, VhostGeneralCard } from "@/routes/account-domains";
 import { SiteFtpCard } from "@/routes/account-services";
 import { PhpSelect } from "@/routes/accounts";
 import { AppConfigForm, AppPanel } from "@/routes/app-panel";
 
-const route = getRouteApi("/accounts/$username/environments/$id");
+const route = getRouteApi("/accounts/$username/environments/$slug");
 
 const VHOST_TABS = ["options", "logs", "ftp", "app"] as const;
 type VhostTab = (typeof VHOST_TABS)[number];
@@ -309,18 +309,28 @@ function VhostForm({ username, vhost }: { username: string; vhost: VhostDto }) {
 
 export function VhostDetailPage() {
   const { t } = useTranslation();
-  const { username, id } = route.useParams();
-  const vhostId = Number(id);
+  const { username, slug } = route.useParams();
+  const navigate = useNavigate();
+  // The slug can be renamed from this page: remember which environment it was, to follow it to its new URL.
+  const seen = useRef<{ slug: string; id: number } | null>(null);
   const account = useQuery({
     queryKey: ["accounts", username],
     queryFn: () => api.get<AccountDto>(`/accounts/${username}`),
     // Queued deployments start on their own: refresh while one is running or waiting.
     refetchInterval: (query) => {
-      const app = query.state.data?.vhosts.find((item) => item.id === vhostId)?.app;
+      const app = query.state.data?.vhosts.find((item) => item.slug === slug)?.app;
       return app && (app.status === "deploying" || app.queue.length > 0) ? 3000 : false;
     },
   });
-  const vhost = account.data?.vhosts.find((item) => item.id === vhostId);
+  const vhost = account.data?.vhosts.find((item) => item.slug === slug);
+  if (vhost) seen.current = { slug, id: vhost.id };
+  // Renamed slug, or an old link with the numeric id: redirect to the current slug.
+  const previous = seen.current;
+  const movedId = previous && previous.slug === slug ? previous.id : /^\d+$/.test(slug) ? Number(slug) : null;
+  const moved = account.data && !vhost ? account.data.vhosts.find((item) => item.id === movedId) : undefined;
+  useEffect(() => {
+    if (moved) void navigate({ to: "/accounts/$username/environments/$slug", params: { username, slug: moved.slug }, search: (prev: { tab?: VhostTab }) => prev, replace: true });
+  }, [moved, navigate, username]);
   const [tab, setTab] = useState<VhostTab>(route.useSearch().tab ?? "options");
 
   return (
@@ -332,8 +342,9 @@ export function VhostDetailPage() {
       </div>
       {account.isPending && <Skeleton className="h-48 w-full" />}
       {account.isError && <p className="text-sm text-destructive">{account.error.message}</p>}
-      {account.data && !vhost && <p className="text-sm text-muted-foreground">{t("The environment does not exist.")}</p>}
+      {account.data && !vhost && !moved && <p className="text-sm text-muted-foreground">{t("The environment does not exist.")}</p>}
       {account.data && vhost && <VhostGeneralCard key={`${vhost.id}-${vhost.slug}-${vhost.name}-${vhost.hostname}`} account={account.data} vhost={vhost} />}
+      {account.data && vhost && <VhostExtrasCard account={account.data} vhost={vhost} />}
       {account.data && vhost?.app && <AppPanel account={account.data} vhost={vhost} app={vhost.app} />}
       {account.data && vhost && !vhost.app && (
         <Tabs value={tab} onValueChange={(next) => isVhostTab(next) && setTab(next)} className="gap-4">

@@ -9,8 +9,9 @@ import { HTTPD_CONFIG } from "../../agent/src/ols";
 import type { AgentClient } from "./agent-client";
 import { createApp } from "./app";
 import { hashPassword, setAdminCredentials } from "./auth";
-import { openDb } from "./db";
+import { openDb, type Db } from "./db";
 import { JobRunner } from "./jobs";
+import { createHostingRoutes } from "./hosting";
 import { addEnvironment as addSiteEnvironment, createSiteAccount } from "./test-support";
 
 const PASSWORD = "test-password-value";
@@ -30,6 +31,7 @@ let calls: AgentOpName[];
 let app: ReturnType<typeof createApp>;
 let jobs: JobRunner;
 let cookie: string;
+let db: Db;
 
 // Real integration: the API talks to the agent handlers in sandbox mode, without going through the network.
 const agent: AgentClient = {
@@ -55,7 +57,7 @@ beforeEach(async () => {
   host = new SandboxHost(root);
   failOn = null;
   calls = [];
-  const db = openDb(":memory:");
+  db = openDb(":memory:");
   setAdminCredentials(db, "admin", passwordHash);
   jobs = new JobRunner(db);
   app = createApp({ db, agent, jobs });
@@ -85,7 +87,16 @@ function post(path: string, body: unknown, withCookie = cookie) {
 }
 
 const get = (path: string) => app.request(`/api${path}`, { headers: { cookie } });
-const httpd = () => host.readFile(HTTPD_CONFIG);
+/** httpd_config.conf with the panel files it includes, as OLS reads it. In sandbox mode `rm` does nothing: only what is included counts. */
+async function httpd(): Promise<string> {
+  const config = (await host.readFile(HTTPD_CONFIG)) ?? "";
+  const included = await Promise.all([...config.matchAll(/^include\s+(\S+)\s*$/gm)].map(async (match) => {
+    const file = (await host.readFile(match[1]!)) ?? "";
+    const configFile = /^\s*configFile\s+(conf\/eaglepanel\/\S+)\s*$/m.exec(file)?.[1];
+    return configFile ? `${file}\n${(await host.readFile(`/usr/local/lsws/${configFile}`)) ?? ""}` : file;
+  }));
+  return [config, ...included].join("\n");
+}
 const vhostFile = (fqdn: string) => host.resolvePath(`/usr/local/lsws/conf/vhosts/${fqdn}/vhost.conf`);
 /** The sandbox records `rm` without running it: the command is checked, not the file. */
 const removedVhost = (fqdn: string) =>
@@ -113,6 +124,30 @@ async function addEnvironment(fqdn = "blog.example.com", username = "acme") {
   return addSiteEnvironment(runJob, username, fqdn);
 }
 const vhostOf = async (hostname: string) => (await account("acme")).vhosts.find((vhost) => vhost.hostname === hostname);
+
+describe("panel configuration after an upgrade", () => {
+  test("rewrites every environment once, restarts PHP, and does not repeat it", async () => {
+    await createAccount();
+    await addEnvironment();
+    calls = [];
+    const hosting = createHostingRoutes({ db, agent, jobs });
+    const id = hosting.applyServerConfig();
+    expect(id).not.toBeNull();
+    for (let attempt = 0; attempt < 400 && jobs.get(id!)?.status !== "succeeded"; attempt += 1) await Bun.sleep(5);
+    expect(jobs.get(id!)?.status).toBe("succeeded");
+    expect(calls.filter((op) => op === "site.write")).toHaveLength(2);
+    expect(calls).toContain("ols.sync");
+    expect(calls).toContain("php.restart");
+    expect(readFileSync(host.resolvePath("/etc/eaglepanel/php-accounts/acme/90-account.ini"), "utf8")).toContain("open_basedir=/home/acme");
+    expect(hosting.applyServerConfig()).toBeNull();
+  });
+
+  test("with no environments there is nothing to rewrite", () => {
+    const hosting = createHostingRoutes({ db, agent, jobs });
+    expect(hosting.applyServerConfig()).toBeNull();
+    expect(calls).toEqual([]);
+  });
+});
 
 describe("create account", () => {
   test("creates the user and the general FTP, without domains or environments", async () => {
@@ -143,9 +178,9 @@ describe("create account", () => {
     expect(created.vhosts).toEqual([{
       id: created.vhosts[0]!.id, slug: "admincrmnandu", name: "Admin CRM Ñandú", hostname: "example.com", domain: "example.com",
       type: "php", docRoot: "sites/admincrmnandu/public_html", phpVersion: "85", phpOptions: DEFAULT_PHP_OPTIONS, logLevel: "ERROR", logDays: 30,
-      certZone: null, app: null, ftp: { login: "admincrmnandu@acme", root: "sites/admincrmnandu", passwordChangedAt: null },
+      certZone: null, extras: [], app: null, ftp: { login: "admincrmnandu@acme", root: "sites/admincrmnandu", passwordChangedAt: null },
     }]);
-    expect(created.domains[0]?.hostnames).toEqual([{ fqdn: "example.com", vhost: { id: created.vhosts[0]!.id, name: "Admin CRM Ñandú" } }]);
+    expect(created.domains[0]?.hostnames).toEqual([{ fqdn: "example.com", vhost: { id: created.vhosts[0]!.id, name: "Admin CRM Ñandú", slug: created.vhosts[0]!.slug, mode: "main" } }]);
 
     const vhostConf = readFileSync(vhostFile("admincrmnandu"), "utf8");
     expect(vhostConf).toContain("/home/acme/sites/admincrmnandu/public_html");
@@ -423,6 +458,90 @@ describe("domains and environment limits", () => {
     expect((await vhostOf("example.com"))?.certZone).toBe("example.com");
     expect((await vhostOf("other.test"))?.certZone).toBeNull();
     expect((await post("/accounts/acme/domains/ajeno.test/certificate", cert)).status).toBe(404);
+  });
+});
+
+describe("aliases and redirects", () => {
+  const cert = { certPem: fixture("origin.crt"), keyPem: fixture("origin.key") };
+  beforeEach(async () => {
+    await createAccount();
+  });
+  const main = async () => (await vhostOf("example.com"))!;
+  const addExtra = async (fqdn: string, mode: "alias" | "redirect") => runJob(`/vhosts/${(await main()).id}/extras`, { fqdn, mode });
+
+  test("an alias of its domain is mapped to the same vhost and shown on the domain", async () => {
+    await runJob("/accounts/acme/hostnames", { fqdn: "shop.example.com" });
+    expect((await addExtra("shop.example.com", "alias")).status).toBe("succeeded");
+    expect((await main()).extras).toEqual([{ fqdn: "shop.example.com", mode: "alias", secure: false }]);
+    expect(await httpd()).toContain("map                     examplecom example.com, shop.example.com");
+    const { hostnames } = (await account("acme")).domains[0]!;
+    expect(hostnames.find(({ fqdn }) => fqdn === "shop.example.com")?.vhost).toMatchObject({ slug: "examplecom", mode: "alias" });
+  });
+
+  test("an alias has to be of its domain and covered by its certificate; a redirect can be from anywhere in the account", async () => {
+    await withLimits({ domains: 2 });
+    await runJob("/accounts/acme/domains", { domain: "other.test" });
+    const vhost = await main();
+    expect((await post(`/vhosts/${vhost.id}/extras`, { fqdn: "other.test", mode: "alias" })).status).toBe(400);
+
+    await runJob("/accounts/acme/domains/example.com/certificate", cert);
+    await runJob("/accounts/acme/hostnames", { fqdn: "a.b.example.com" });
+    const deep = await post(`/vhosts/${vhost.id}/extras`, { fqdn: "a.b.example.com", mode: "alias" });
+    expect(deep.status).toBe(400);
+    expect(await deep.text()).toContain("does not cover");
+
+    expect((await addExtra("other.test", "redirect")).status).toBe("succeeded");
+    expect((await addExtra("a.b.example.com", "redirect")).status).toBe("succeeded");
+    const config = await httpd();
+    // One vhost per domain, to the environment over HTTPS because it has a certificate.
+    expect(config).toContain("virtualhost redirect_other.test {");
+    expect(config).toContain("virtualhost redirect_example.com {");
+    expect(config).toContain("RewriteCond %{HTTP_HOST} ^other\\.test(:\\d+)?$ [NC]\nRewriteRule ^ https://example.com%{REQUEST_URI} [R=301,L]");
+    expect(config).toContain("map                     redirect_other.test other.test");
+    expect((await main()).extras).toEqual([
+      { fqdn: "a.b.example.com", mode: "redirect", secure: false },
+      { fqdn: "other.test", mode: "redirect", secure: false },
+    ]);
+  });
+
+  test("a name in use cannot be taken by another environment nor deleted until it is removed", async () => {
+    await runJob("/accounts/acme/hostnames", { fqdn: "shop.example.com" });
+    await addExtra("shop.example.com", "redirect");
+    expect((await post("/accounts/acme/vhosts", { name: "Shop", hostname: "shop.example.com", phpVersion: "85" })).status).toBe(409);
+    expect((await post(`/vhosts/${(await main()).id}/extras`, { fqdn: "shop.example.com", mode: "alias" })).status).toBe(409);
+    expect((await post("/hostnames/shop.example.com/delete", {})).status).toBe(409);
+
+    expect((await runJob(`/vhosts/${(await main()).id}/extras/shop.example.com/delete`, {})).status).toBe("succeeded");
+    expect((await main()).extras).toEqual([]);
+    expect(await httpd()).not.toContain("shop.example.com");
+    expect((await runJob("/hostnames/shop.example.com/delete", {})).status).toBe("succeeded");
+  });
+
+  test("a domain with names in use cannot be deleted", async () => {
+    await withLimits({ domains: 2 });
+    await runJob("/accounts/acme/domains", { domain: "other.test" });
+    await addExtra("other.test", "redirect");
+    const response = await post("/accounts/acme/domains/other.test/delete", {});
+    expect(response.status).toBe(409);
+    expect(await response.text()).toContain("other.test");
+  });
+
+  test("deleting the environment frees its names", async () => {
+    await runJob("/accounts/acme/hostnames", { fqdn: "shop.example.com" });
+    await addExtra("shop.example.com", "redirect");
+    expect((await runJob(`/vhosts/${(await main()).id}/delete`, {})).status).toBe("succeeded");
+    const { hostnames } = (await account("acme")).domains[0]!;
+    expect(hostnames.find(({ fqdn }) => fqdn === "shop.example.com")?.vhost).toBeNull();
+    expect(await httpd()).not.toContain("redirect_");
+  });
+
+  test("the redirects of a suspended account answer 503", async () => {
+    await runJob("/accounts/acme/hostnames", { fqdn: "shop.example.com" });
+    await addExtra("shop.example.com", "redirect");
+    expect((await runJob("/accounts/acme/suspend", { suspended: true })).status).toBe("succeeded");
+    const config = await httpd();
+    expect(config).toContain("RewriteRule ^ - [R=503,L]");
+    expect(config).not.toContain("R=301");
   });
 });
 

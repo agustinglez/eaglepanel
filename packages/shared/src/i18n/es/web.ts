@@ -698,4 +698,11 @@ export const web: Record<string, string> = {
   "Later": "Más tarde",
   "Not yet in this server's repositories": "Todavía no está en los repositorios de este servidor",
   "The distribution already published it, but this server's apt mirror does not have it yet. It usually arrives within hours.": "La distribución ya la publicó, pero el mirror de apt de este servidor todavía no la tiene. Suele llegar en unas horas.",
+  "My site": "Mi sitio",
+  "Aliases and redirects": "Alias y redirecciones",
+  "An alias shows this same site: it has to be of {{domain}} and covered by its certificate. A redirect sends visitors to {{hostname}}, keeping the path, from any domain of the account.": "Un alias muestra este mismo sitio: tiene que ser de {{domain}} y estar cubierto por su certificado. Una redirección lleva a los visitantes a {{hostname}}, con la misma ruta, desde cualquier dominio de la cuenta.",
+  "Alias": "Alias",
+  "Redirect": "Redirección",
+  "Choose a domain": "Elige un dominio",
+  "Adding or removing one restarts OpenLiteSpeed: sites are briefly interrupted.": "Agregar o quitar uno reinicia OpenLiteSpeed: los sitios se interrumpen un momento.",
 };

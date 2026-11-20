@@ -10,7 +10,7 @@ import type { AgentClient } from "./agent-client";
 import { createApp } from "./app";
 import { hashPassword, setAdminCredentials } from "./auth";
 import { openDb, type Db } from "./db";
-import { accounts, appEnv, apps, databases, domains, vhosts } from "./db/schema";
+import { accounts, appEnv, apps, databases, domains, hostnames, vhosts } from "./db/schema";
 import { JobRunner } from "./jobs";
 import { createSiteAccount, addEnvironment } from "./test-support";
 
@@ -82,6 +82,8 @@ beforeEach(async () => {
   expect((await addEnvironment((path, body) => runJob(origin, path, body), "acme", "web.example.com")).status).toBe("succeeded");
   expect((await runJob(origin, `/vhosts/${await vidIn(origin, "web.example.com")}/app`, APP)).status).toBe("succeeded");
   expect((await runJob(origin, `/vhosts/${await vidIn(origin, "web.example.com")}/env`, { vars: [{ key: "API_URL", value: "https://api.example.com", scope: "build" }] })).status).toBe("succeeded");
+  expect((await runJob(origin, "/accounts/acme/hostnames", { fqdn: "shop.example.com" })).status).toBe("succeeded");
+  expect((await runJob(origin, `/vhosts/${await vidIn(origin, "web.example.com")}/extras`, { fqdn: "shop.example.com", mode: "redirect" })).status).toBe("succeeded");
   const settings = { ...STORAGE, enabled: true, prefix: "origen", secretAccessKey: "secreto-origen", hour: 3 };
   const configured = (await (await post(origin, "/settings/backups", settings)).json()) as { jobId: string; secret: string };
   for (let attempt = 0; attempt < 400 && origin.jobs.get(configured.jobId)?.status !== "succeeded"; attempt += 1) await Bun.sleep(5);
@@ -107,6 +109,8 @@ describe("mudanza", () => {
     ]);
     const web = await vidIn(destination, "web.example.com");
     expect(db.select().from(apps).get()).toMatchObject({ vhost: web, repoUrl: APP.repoUrl, buildCommand: APP.buildCommand });
+    // Its redirect points to the environment by its new id.
+    expect(db.select().from(hostnames).all().find(({ fqdn }) => fqdn === "shop.example.com")).toMatchObject({ vhost: web, mode: "redirect" });
     expect(db.select().from(appEnv).all()).toEqual([{ vhost: web, key: "API_URL", value: "https://api.example.com", scope: "build" }]);
     expect(db.select().from(databases).all().map(({ name }) => name)).toEqual(["acme_tienda"]);
 

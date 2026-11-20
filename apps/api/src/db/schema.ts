@@ -1,4 +1,4 @@
-import { DEFAULT_LOG_DAYS, DEFAULT_LOG_LEVEL, DEFAULT_PHP_OPTIONS, DEFAULT_SERVICE_MEMORY_MB, type AppKind, type AppRuntime, type AppStatus, type DeploymentStatus, type EnvScope, type JobStatus, type JobStepStatus, type LogLevel, type PhpOptions, type VhostType } from "@eaglepanel/shared";
+import { DEFAULT_LOG_DAYS, DEFAULT_LOG_LEVEL, DEFAULT_PHP_OPTIONS, DEFAULT_SERVICE_MEMORY_MB, type AppKind, type AppRuntime, type AppStatus, type DeploymentStatus, type EnvScope, type HostnameMode, type JobStatus, type JobStepStatus, type LogLevel, type PhpOptions, type VhostType } from "@eaglepanel/shared";
 import { index, integer, primaryKey, sqliteTable, text, unique, type AnySQLiteColumn } from "drizzle-orm/sqlite-core";
 
 export const admin = sqliteTable("admin", {
@@ -66,8 +66,14 @@ export const hostnames = sqliteTable("hostnames", {
   fqdn: text("fqdn").primaryKey(),
   username: text("username").notNull().references(() => accounts.username, { onDelete: "cascade" }),
   domain: text("domain").notNull().references(() => domains.fqdn, { onDelete: "cascade" }),
+  /**
+   * Environment it serves as an alias or redirects to (`mode`). Null while it is free or it is the hostname of an
+   * environment (`vhosts.hostname`).
+   */
+  vhost: integer("vhost").references((): AnySQLiteColumn => vhosts.id, { onDelete: "set null" }),
+  mode: text("mode").$type<HostnameMode>(),
   createdAt: integer("created_at").notNull(),
-}, (table) => [index("hostnames_username").on(table.username), index("hostnames_domain").on(table.domain)]);
+}, (table) => [index("hostnames_username").on(table.username), index("hostnames_domain").on(table.domain), index("hostnames_vhost").on(table.vhost)]);
 
 /**
  * Called "environments" in the interface. `id` never changes: the other tables, the API and the panel URLs use it.

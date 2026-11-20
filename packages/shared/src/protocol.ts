@@ -19,6 +19,7 @@ import {
   dbNameSchema,
   docRootSchema,
   fqdnSchema,
+  redirectTargetSchema,
   vhostSlugSchema,
   generatedSecretSchema,
   logDaysSchema,
@@ -33,6 +34,7 @@ import {
   usernameSchema,
   type AccountLimits,
   type AccountService,
+  type HostnameMode,
   type LogLevel,
   type PhpOptions,
 } from "./validators";
@@ -297,8 +299,21 @@ export const agentOps = {
         hostname: fqdnSchema,
         certZone: fqdnSchema.nullable(),
         originPull: z.boolean(),
+        /** Other names it serves as is. `secure`: its certificate covers it, so it is also mapped on 443. */
+        aliases: z.array(z.object({ fqdn: fqdnSchema, secure: z.boolean() }).strict()).default([]),
       }).strict()),
-      /** Restarts even if the block did not change: OLS does not reread a vhost.conf modified on its own. */
+      /**
+       * One vhost per domain with names that redirect, without PHP or logs: each name answers a 301 to `target`.
+       * Its certificate is the one of that domain, if it covers the name; a suspended account answers 503.
+       */
+      redirects: z.array(z.object({
+        domain: fqdnSchema,
+        certZone: fqdnSchema.nullable(),
+        originPull: z.boolean(),
+        suspended: z.boolean(),
+        hosts: z.array(z.object({ fqdn: fqdnSchema, secure: z.boolean(), target: redirectTargetSchema }).strict()).min(1),
+      }).strict()).default([]),
+      /** Restarts even if nothing changed: OLS does not reread a vhost.conf modified on its own. */
       restart: z.boolean().optional(),
       /** Server-wide webhook domain: publishes only GLOBAL_HOOK_PATH to the panel. */
       hooks: z.object({ fqdn: fqdnSchema, certZone: fqdnSchema.nullable() }).strict().nullable().optional(),
@@ -377,6 +392,8 @@ export interface VhostDto {
   logDays: number;
   /** Zone whose certificate covers this environment. Without it, Cloudflare in Full (strict) answers 526. */
   certZone: string | null;
+  /** Other names of the account: an alias serves this environment, a redirect sends a 301 to its hostname. `secure`: covered by a certificate, also on 443. */
+  extras: { fqdn: string; mode: HostnameMode; secure: boolean }[];
   app: AppDto | null;
   /** FTP access of this environment only. Without a password, it does not exist. Null for apps: they have no files to upload. */
   ftp: { login: string; root: string; passwordChangedAt: number | null } | null;
@@ -457,8 +474,8 @@ export const ORIGIN_PULL_CA_EXPIRES_AT = Date.UTC(2029, 10, 1, 17);
 
 export interface HostnameDto {
   fqdn: string;
-  /** Environment that answers for it. */
-  vhost: { id: number; name: string } | null;
+  /** Environment that answers for it: as its hostname (`main`), as an alias or with a redirect to it. */
+  vhost: { id: number; name: string; slug: string; mode: HostnameMode | "main" } | null;
 }
 
 /** A root domain of the account, with its subdomains (the apex is the first hostname) and its certificate. */

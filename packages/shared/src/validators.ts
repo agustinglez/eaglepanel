@@ -178,6 +178,19 @@ export const fqdnSchema = z
     return labels.length >= 2 && labels.every((label) => FQDN_LABEL.test(label)) && !/^\d+$/.test(labels.at(-1) ?? "");
   }, "Invalid domain");
 
+/**
+ * What an extra name of an environment does: `alias` serves the environment as is (only names its certificate
+ * covers, so no second PHP engine is needed); `redirect` answers a 301 to its hostname, from any domain of the account.
+ */
+export const hostnameModeSchema = z.enum(["alias", "redirect"]);
+export type HostnameMode = z.infer<typeof hostnameModeSchema>;
+
+/** Where a redirect goes: scheme and host only. The path of the request is appended by OLS. */
+export const redirectTargetSchema = z.string().refine((value) => {
+  const match = /^https?:\/\/(.+)$/.exec(value);
+  return match !== null && fqdnSchema.safeParse(match[1]).success;
+}, "Invalid redirect target");
+
 // ---------------------------------------------------------------------------- Apps
 
 /** App number: defines its namespace and its private address, 10.88.0.0/16 split into /30 blocks. */

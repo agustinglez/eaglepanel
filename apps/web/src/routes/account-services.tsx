@@ -256,7 +256,7 @@ function AccountFtpCard({ account }: { account: AccountDto }) {
 function SiteFtpList({ account }: { account: AccountDto }) {
   const { t } = useTranslation();
   // Apps have no files to upload: they have no FTP access of their own.
-  const sites = account.vhosts.flatMap((vhost) => (vhost.ftp ? [{ id: vhost.id, name: vhost.name, ftp: vhost.ftp }] : []));
+  const sites = account.vhosts.flatMap((vhost) => (vhost.ftp ? [{ id: vhost.id, name: vhost.name, slug: vhost.slug, ftp: vhost.ftp }] : []));
   if (sites.length === 0) return null;
   return (
     <Card className="max-w-2xl">
@@ -278,7 +278,7 @@ function SiteFtpList({ account }: { account: AccountDto }) {
               {sites.map((vhost) => (
                 <TableRow key={vhost.id}>
                   <TableCell className="font-medium">
-                    <Link to="/accounts/$username/environments/$id" params={{ username: account.username, id: String(vhost.id) }} search={{ tab: "ftp" }} className="hover:underline">{vhost.ftp.login}</Link>
+                    <Link to="/accounts/$username/environments/$slug" params={{ username: account.username, slug: vhost.slug }} search={{ tab: "ftp" }} className="hover:underline">{vhost.ftp.login}</Link>
                   </TableCell>
                   <TableCell className="text-muted-foreground">{vhost.ftp.root}</TableCell>
                   <TableCell className="text-right">

@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { getRouteApi, Link, useNavigate } from "@tanstack/react-router";
-import { ORIGIN_PULL_CA_EXPIRES_AT, vhostSlugSchema, type AccountDto, type DomainDto, type JobCreatedDto, type VhostDto } from "@eaglepanel/shared";
+import { ORIGIN_PULL_CA_EXPIRES_AT, vhostSlugSchema, type AccountDto, type DomainDto, type HostnameMode, type JobCreatedDto, type VhostDto } from "@eaglepanel/shared";
 import { useState, type SyntheticEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { Page } from "@/components/app-shell";
@@ -109,7 +109,7 @@ export function DomainsTab({ account }: { account: AccountDto }) {
                 </TableRow>
               )}
               {account.domains.map((domain) => {
-                const environments = new Set(domain.hostnames.map(({ vhost }) => vhost).filter(Boolean));
+                const environments = new Set(domain.hostnames.flatMap(({ vhost }) => (vhost ? [vhost.id] : [])));
                 return (
                   <TableRow key={domain.fqdn}>
                     <TableCell className="font-medium">
@@ -202,6 +202,95 @@ export function VhostGeneralCard({ account, vhost }: { account: AccountDto; vhos
   );
 }
 
+const MODES: { value: HostnameMode; label: string }[] = [
+  { value: "alias", label: "Alias" },
+  { value: "redirect", label: "Redirect" },
+];
+
+/**
+ * Other names of the account for an environment. An alias shows the same site: only of its own domain and covered by
+ * its certificate, because the vhost has a single one. A redirect sends a 301 to its domain, from any domain of the account.
+ */
+export function VhostExtrasCard({ account, vhost }: { account: AccountDto; vhost: VhostDto }) {
+  const { t } = useTranslation();
+  const [mode, setMode] = useState<HostnameMode>("redirect");
+  const [chosen, setChosen] = useState("");
+  const free = freeHostnames(account);
+  const choices = mode === "alias" ? free.filter((fqdn) => fqdn === vhost.domain || fqdn.endsWith(`.${vhost.domain}`)) : free;
+  const fqdn = chosen === ADD_NEW || choices.includes(chosen) ? chosen : "";
+  const options = [...choices.map((name) => ({ value: name, label: name })), { value: ADD_NEW, label: t("Add a domain or subdomain…") }];
+  const add = useJobAction(() => api.post<JobCreatedDto>(`/vhosts/${vhost.id}/extras`, { fqdn, mode }));
+  const remove = useJobAction((name: string) => api.post<JobCreatedDto>(`/vhosts/${vhost.id}/extras/${name}/delete`));
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t("Aliases and redirects")}</CardTitle>
+        <CardDescription>
+          {t("An alias shows this same site: it has to be of {{domain}} and covered by its certificate. A redirect sends visitors to {{hostname}}, keeping the path, from any domain of the account.", { domain: vhost.domain, hostname: vhost.hostname })}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        {vhost.extras.length > 0 && (
+          <div className="overflow-x-auto rounded-lg border">
+            <Table>
+              <TableHeader className="bg-muted">
+                <TableRow>
+                  <TableHead>{t("Name")}</TableHead>
+                  <TableHead>{t("Type")}</TableHead>
+                  <TableHead>HTTPS</TableHead>
+                  <TableHead className="text-right" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {vhost.extras.map((extra) => (
+                  <TableRow key={extra.fqdn}>
+                    <TableCell className="font-medium">{extra.fqdn}</TableCell>
+                    <TableCell><Badge variant="outline">{t(extra.mode === "alias" ? "Alias" : "Redirect")}</Badge></TableCell>
+                    <TableCell className="text-muted-foreground">{extra.secure ? t("Yes") : t("No certificate")}</TableCell>
+                    <TableCell className="text-right">
+                      <Button variant="ghost" size="sm" disabled={remove.isPending} onClick={() => remove.mutate(extra.fqdn)}>{t("Remove")}</Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+        <ActionFeedback action={remove} />
+        <div className="flex flex-wrap items-end gap-2">
+          <div className="grid gap-2">
+            <Label htmlFor="extra-mode">{t("Type")}</Label>
+            <Select items={MODES.map(({ value, label }) => ({ value, label: t(label) }))} value={mode} onValueChange={(next) => next && setMode(next as HostnameMode)}>
+              <SelectTrigger id="extra-mode" className="w-36"><SelectValue /></SelectTrigger>
+              <SelectContent alignItemWithTrigger={false}>
+                <SelectGroup>
+                  {MODES.map(({ value, label }) => <SelectItem key={value} value={value}>{t(label)}</SelectItem>)}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="extra-fqdn">{t("Domain")}</Label>
+            <Select items={options} value={fqdn || null} onValueChange={(next) => next && setChosen(next)}>
+              <SelectTrigger id="extra-fqdn" className="w-72"><SelectValue placeholder={t("Choose a domain")} /></SelectTrigger>
+              <SelectContent alignItemWithTrigger={false}>
+                <SelectGroup>
+                  {options.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
+          {fqdn !== ADD_NEW && <Button variant="outline" disabled={add.isPending || !fqdn} onClick={() => add.mutate()}>{t("Add")}</Button>}
+        </div>
+        {fqdn === ADD_NEW && <AddHostnameForm account={account} onAdded={setChosen} />}
+        <p className="text-sm text-muted-foreground">{t("Adding or removing one restarts OpenLiteSpeed: sites are briefly interrupted.")}</p>
+        <ActionFeedback action={add} onFinished={(ok) => { if (ok) setChosen(""); }} />
+      </CardContent>
+    </Card>
+  );
+}
+
 function HostnamesCard({ account, domain }: { account: AccountDto; domain: DomainDto }) {
   const { t } = useTranslation();
   const remove = useJobAction((fqdn: string) => api.post<JobCreatedDto>(`/hostnames/${fqdn}/delete`));
@@ -227,7 +316,12 @@ function HostnamesCard({ account, domain }: { account: AccountDto; domain: Domai
                   <TableCell className="font-medium">{fqdn}</TableCell>
                   <TableCell>
                     {vhost
-                      ? <Link to="/accounts/$username/environments/$id" params={{ username: account.username, id: String(vhost.id) }} className="hover:underline">{vhost.name}</Link>
+                      ? (
+                        <span className="flex items-center gap-2">
+                          <Link to="/accounts/$username/environments/$slug" params={{ username: account.username, slug: vhost.slug }} className="hover:underline">{vhost.name}</Link>
+                          {vhost.mode !== "main" && <Badge variant="outline">{t(vhost.mode === "alias" ? "Alias" : "Redirect")}</Badge>}
+                        </span>
+                      )
                       : <span className="text-muted-foreground">{t("Unassigned")}</span>}
                   </TableCell>
                   <TableCell className="text-right">

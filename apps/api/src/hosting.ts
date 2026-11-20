@@ -12,6 +12,7 @@ import {
   defaultDocRoot,
   docRootSchema,
   fqdnSchema,
+  hostnameModeSchema,
   isPublishableDocRoot,
   logDaysSchema,
   logLevelSchema,
@@ -33,6 +34,7 @@ import {
   type AccountService,
   type AppDto,
   type DomainDto,
+  type HostnameMode,
   type JobCreatedDto,
   type ServerSettingsDto,
   type VhostDto,
@@ -65,6 +67,7 @@ const addHostnameSchema = z.object({ fqdn: fqdnSchema }).strict();
 /** Without `slug`, it comes from the name. */
 const createVhostSchema = z.object({ name: vhostNameSchema, slug: vhostSlugSchema.optional(), hostname: fqdnSchema, phpVersion: phpVersionSchema }).strict();
 const setHostnameSchema = z.object({ hostname: fqdnSchema }).strict();
+const addExtraSchema = z.object({ fqdn: fqdnSchema, mode: hostnameModeSchema }).strict();
 const renameVhostSchema = z.object({ name: vhostNameSchema, slug: vhostSlugSchema }).strict();
 const setPhpSchema = z.object({ phpVersion: phpVersionSchema }).strict();
 const deleteAccountSchema = z.object({ confirm: z.string() }).strict();
@@ -82,6 +85,13 @@ const logQuerySchema = z.object({ source: logSourceSchema, lines: z.coerce.numbe
  * something OLS does not do.
  */
 const wwwAlias = (fqdn: string) => (fqdn.startsWith("www.") ? `OpenLiteSpeed already answers for ${fqdn} together with ${fqdn.slice(4)}: add ${fqdn.slice(4)} instead` : null);
+
+/**
+ * Changes when what the agent writes for every environment changes, and not for each version. 2026-11-20: the
+ * account .ini with open_basedir (OLS ignored php_admin_value) and the OLS configuration in included files.
+ */
+const SERVER_CONFIG_REVISION = "2026-11-20";
+const SERVER_CONFIG_KEY = "server_config_revision";
 
 /** Letters, digits, `-` and `_` only: it can be pasted into any client and needs no escaping. */
 const generateSecret = () => randomBytes(24).toString("base64url");
@@ -192,14 +202,45 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
     return certZoneFor(row) !== null && (certificateRow(domainOf(row))?.originPull ?? false);
   }
 
+  /** Extra names of an environment: aliases and redirects, in alphabetical order. */
+  const extrasOf = (vhostId: number) => db.select().from(hostnames).where(eq(hostnames.vhost, vhostId)).all()
+    .filter((row): row is typeof row & { mode: HostnameMode } => row.mode !== null)
+    .sort((a, b) => a.fqdn.localeCompare(b.fqdn));
+  /** The certificate of its own domain covers it: it can also be served on 443. */
+  const coveredByItsDomain = (row: { fqdn: string; domain: string }) => {
+    const certificate = certificateRow(row.domain);
+    return certificate !== undefined && certCovers(certificate.names, row.fqdn);
+  };
+  /** Where a redirect to this environment goes: over HTTPS if it has a certificate. */
+  const redirectTarget = (row: VhostRow) => `${certZoneFor(row) ? "https" : "http"}://${row.hostname}`;
+
   /** Always reads the database: `ols.sync` receives the full list, so undoing means syncing again. */
   async function syncSites(options: { exclude?: number[]; restart?: boolean } = {}) {
     const excluded = new Set(options.exclude ?? []);
-    const sites = db.select().from(vhosts).all()
-      .filter(({ id }) => !excluded.has(id))
-      .map((row) => ({ site: row.slug, username: row.username, hostname: row.hostname, certZone: certZoneFor(row), originPull: originPullFor(row) }));
+    const rows = db.select().from(vhosts).all().filter(({ id }) => !excluded.has(id));
+    const sites = rows.map((row) => {
+      const certZone = certZoneFor(row);
+      // Only names of its own domain: the vhost has a single certificate.
+      const aliases = extrasOf(row.id).filter(({ mode, domain }) => mode === "alias" && domain === domainOf(row))
+        .map((extra) => ({ fqdn: extra.fqdn, secure: certZone !== null && coveredByItsDomain(extra) }));
+      return { site: row.slug, username: row.username, hostname: row.hostname, certZone, originPull: originPullFor(row), aliases };
+    });
+    // One redirect vhost per domain, with the certificate of that domain.
+    const byDomain = new Map<string, { username: string; hosts: { fqdn: string; secure: boolean; target: string }[] }>();
+    for (const row of rows) {
+      for (const extra of extrasOf(row.id).filter(({ mode }) => mode === "redirect")) {
+        const entry = byDomain.get(extra.domain) ?? { username: row.username, hosts: [] };
+        entry.hosts.push({ fqdn: extra.fqdn, secure: coveredByItsDomain(extra), target: redirectTarget(row) });
+        byDomain.set(extra.domain, entry);
+      }
+    }
+    const redirects = [...byDomain].map(([domain, { username, hosts }]) => {
+      const certificate = certificateRow(domain);
+      const certZone = certificate && hosts.some(({ secure }) => secure) ? certificate.zone : null;
+      return { domain, certZone, originPull: certZone !== null && certificate!.originPull, suspended: accountRow(username)?.suspended ?? false, hosts };
+    });
     const domain = hooksDomain();
-    await agent.call("ols.sync", { sites, restart: options.restart, hooks: domain ? { fqdn: domain, certZone: zoneCovering(domain) } : null });
+    await agent.call("ols.sync", { sites, redirects, restart: options.restart, hooks: domain ? { fqdn: domain, certZone: zoneCovering(domain) } : null });
   }
 
   async function writeSite(row: VhostRow) {
@@ -220,6 +261,11 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
     return {
       id, slug, name, hostname, domain: domainOf(row), type, docRoot, phpVersion, phpOptions, logLevel, logDays,
       certZone: certZoneFor(row),
+      extras: extrasOf(id).map((extra) => ({
+        fqdn: extra.fqdn,
+        mode: extra.mode,
+        secure: extra.mode === "alias" ? certZoneFor(row) !== null && coveredByItsDomain(extra) : coveredByItsDomain(extra),
+      })),
       app: type === "app" ? toAppDto(id) : null,
       ftp: type === "app" ? null : { login: siteFtpLogin(slug, username), root: siteDir(slug), passwordChangedAt: row.ftpPasswordChangedAt },
     };
@@ -239,8 +285,10 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
       hostnames: db.select().from(hostnames).where(eq(hostnames.domain, fqdn)).all()
         .sort((a, b) => Number(b.fqdn === fqdn) - Number(a.fqdn === fqdn) || a.fqdn.localeCompare(b.fqdn))
         .map((row) => {
-          const vhost = vhostByHostname(row.fqdn);
-          return { fqdn: row.fqdn, vhost: vhost ? { id: vhost.id, name: vhost.name } : null };
+          const main = vhostByHostname(row.fqdn);
+          const extra = !main && row.vhost !== null && row.mode !== null ? vhostRow(row.vhost) : undefined;
+          const vhost = main ?? extra;
+          return { fqdn: row.fqdn, vhost: vhost ? { id: vhost.id, name: vhost.name, slug: vhost.slug, mode: main ? "main" as const : row.mode! } : null };
         }),
       certificate: certificate ? { zone: certificate.zone, names: certificate.names, notAfter: certificate.notAfter, originPull: certificate.originPull } : null,
     };
@@ -483,6 +531,9 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
     // The environments are not deleted along with it: they hold the account files.
     const used = accountVhosts(username).filter((row) => domainOf(row) === zone).map(({ name }) => name);
     if (used.length > 0) return c.json({ error: `First delete or move its environments: ${used.join(", ")}` }, 409);
+    // Its names would keep being mapped in OLS until the next change.
+    const extras = db.select().from(hostnames).where(eq(hostnames.domain, zone)).all().filter((row) => row.vhost !== null).map(({ fqdn }) => fqdn);
+    if (extras.length > 0) return c.json({ error: `First remove from their environments: ${extras.join(", ")}` }, 409);
 
     const certificate = certificateRow(zone);
     return startJob(c, "domain.delete", `Delete domain ${zone}`, [{
@@ -518,7 +569,7 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
     const row = hostnameRow(c.req.param("fqdn"));
     if (!row) return c.json({ error: "Not found" }, 404);
     if (row.fqdn === row.domain) return c.json({ error: "It is the domain itself: delete the domain instead" }, 400);
-    const user = vhostByHostname(row.fqdn);
+    const user = vhostByHostname(row.fqdn) ?? (row.vhost !== null ? vhostRow(row.vhost) : undefined);
     if (user) return c.json({ error: `It is assigned to ${user.name}: unassign it first` }, 409);
     return startJob(c, "hostname.delete", `Delete subdomain ${row.fqdn}`, [dbStep("Delete from the panel", () => {
       db.delete(hostnames).where(eq(hostnames.fqdn, row.fqdn)).run();
@@ -529,7 +580,7 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
   function freeHostname(username: string, fqdn: string): { domain: string } | { error: string; status: 400 | 409 } {
     const host = hostnameRow(fqdn);
     if (!host || host.username !== username) return { error: "That domain does not belong to the account", status: 400 };
-    const user = vhostByHostname(fqdn);
+    const user = vhostByHostname(fqdn) ?? (host.vhost !== null ? vhostRow(host.vhost) : undefined);
     if (user) return { error: `It is already assigned to ${user.name}`, status: 409 };
     return { domain: host.domain };
   }
@@ -570,6 +621,9 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
     if (hostname === row.hostname) return c.json({ error: "No changes" }, 409);
     const free = freeHostname(row.username, hostname);
     if ("error" in free) return c.json({ error: free.error }, free.status);
+    // An alias has to be of the domain of its environment: its certificate is the only one the vhost has.
+    const strayAliases = extrasOf(row.id).filter(({ mode, domain }) => mode === "alias" && domain !== free.domain).map(({ fqdn }) => fqdn);
+    if (strayAliases.length > 0) return c.json({ error: `These aliases are not of ${free.domain}: remove them first: ${strayAliases.join(", ")}` }, 409);
 
     const apply = async (value: string) => {
       db.update(vhosts).set({ hostname: value }).where(eq(vhosts.id, row.id)).run();
@@ -581,6 +635,55 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
       run: () => apply(hostname),
       compensate: () => apply(row.hostname),
     }], `${row.slug}: ${row.hostname} a ${hostname}`);
+  });
+
+  /**
+   * Another name of the account for this environment. An alias serves it as is: only of its own domain and, if it has
+   * a certificate, one it covers, because the vhost has a single certificate. A redirect sends a 301 to its hostname
+   * from any domain of the account, through a vhost of that domain without PHP.
+   */
+  routes.post("/vhosts/:vhost/extras", async (c) => {
+    const row = vhostOf(c);
+    if (!row) return c.json({ error: "Not found" }, 404);
+    const body = await readBody(c, addExtraSchema);
+    if ("error" in body) return c.json({ error: body.error }, 400);
+    const { fqdn, mode } = body.data;
+    const free = freeHostname(row.username, fqdn);
+    if ("error" in free) return c.json({ error: free.error }, free.status);
+    if (mode === "alias") {
+      if (free.domain !== domainOf(row)) return c.json({ error: `An alias has to be of ${domainOf(row)}, like the environment. From another domain, use a redirect` }, 400);
+      const certificate = certificateRow(free.domain);
+      if (certificate && !certCovers(certificate.names, fqdn)) {
+        return c.json({ error: `The certificate of ${free.domain} does not cover ${fqdn}: use a redirect, or a certificate that covers it` }, 400);
+      }
+    }
+
+    const assign = async (vhost: number | null) => {
+      db.update(hostnames).set({ vhost, mode: vhost === null ? null : mode }).where(eq(hostnames.fqdn, fqdn)).run();
+      await syncSites({ restart: true });
+    };
+    return startJob(c, "vhost.extra", mode === "alias" ? `Add alias ${fqdn} to ${row.name}` : `Redirect ${fqdn} to ${row.name}`, [{
+      name: "Apply to OpenLiteSpeed",
+      run: () => assign(row.id),
+      compensate: () => assign(null),
+    }], `${row.slug}: ${mode} ${fqdn}`);
+  });
+
+  routes.post("/vhosts/:vhost/extras/:fqdn/delete", (c) => {
+    const row = vhostOf(c);
+    if (!row) return c.json({ error: "Not found" }, 404);
+    const extra = extrasOf(row.id).find(({ fqdn }) => fqdn === c.req.param("fqdn"));
+    if (!extra) return c.json({ error: "Not found" }, 404);
+
+    const assign = async (vhost: number | null) => {
+      db.update(hostnames).set({ vhost, mode: vhost === null ? null : extra.mode }).where(eq(hostnames.fqdn, extra.fqdn)).run();
+      await syncSites({ restart: true });
+    };
+    return startJob(c, "vhost.extra.delete", `Remove ${extra.fqdn} from ${row.name}`, [{
+      name: "Apply to OpenLiteSpeed",
+      run: () => assign(null),
+      compensate: () => assign(row.id),
+    }], `${row.slug}: ${extra.fqdn}`);
   });
 
   /**
@@ -1084,6 +1187,37 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
   registerMigrationRoutes(routes, { db, agent, jobs, writeSite, syncSites, domainConflict, requestDeploy });
   backups.register(routes, startJob);
 
-  return { routes, webhookDeps, resumeDeploys, backups, accountExists: (username: string) => accountRow(username) !== undefined };
+  /**
+   * Once per start: if what the agent writes for every environment changed since the last time, it rewrites them all,
+   * applies them to OLS and restarts PHP, so an upgraded server does not keep the old configuration until each one
+   * is touched. Saved only when it finished: an interrupted run is repeated on the next start.
+   */
+  function applyServerConfig(): string | null {
+    if (settingValue(SERVER_CONFIG_KEY) === SERVER_CONFIG_REVISION) return null;
+    const save = () => {
+      db.insert(settings).values({ key: SERVER_CONFIG_KEY, value: SERVER_CONFIG_REVISION }).onConflictDoUpdate({ target: settings.key, set: { value: SERVER_CONFIG_REVISION } }).run();
+    };
+    const rows = db.select().from(vhosts).all();
+    if (rows.length === 0) {
+      save();
+      return null;
+    }
+    return jobs.enqueue({
+      type: "server.config",
+      title: "Apply the panel configuration to every environment",
+      steps: [
+        { name: "Rewrite the environments", run: async () => { for (const row of db.select().from(vhosts).all()) await writeSite(row); } },
+        { name: "Apply to OpenLiteSpeed", run: () => syncSites({ restart: true }) },
+        {
+          name: "Restart PHP",
+          // Its processes outlive the OLS restart: they would keep the previous .ini files.
+          run: async () => { for (const username of new Set(db.select().from(vhosts).all().map((row) => row.username))) await agent.call("php.restart", { username }); },
+        },
+        { name: "Save", run: async () => save() },
+      ],
+    }).id;
+  }
+
+  return { routes, webhookDeps, resumeDeploys, applyServerConfig, backups, accountExists: (username: string) => accountRow(username) !== undefined };
 
 }

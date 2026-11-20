@@ -322,6 +322,7 @@ export function createApp({ db, agent, jobs, webDist, secureCookie = false, loca
   // Once per process, at startup: resumes the stored deployment queue.
   hosting.resumeDeploys();
   if (schedule) hosting.backups.startScheduler();
+  if (schedule) hosting.applyServerConfig();
 
   api.get("/audit", (c) => {
     const rows = db.select().from(auditLog).orderBy(desc(auditLog.id)).limit(100).all();

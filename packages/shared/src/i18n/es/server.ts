@@ -475,4 +475,11 @@ export const server: Record<string, string> = {
   "It is updated with eagle upgrade": "Se actualiza con eagle upgrade",
   "{{id}} is not updated with apt": "{{id}} no se actualiza con apt",
   "{{def_name}} is not installed": "{{def_name}} no está instalado",
+  "Add alias {{fqdn}} to {{name}}": "Agregar el alias {{fqdn}} a {{name}}",
+  "Redirect {{fqdn}} to {{name}}": "Redirigir {{fqdn}} a {{name}}",
+  "Remove {{fqdn}} from {{name}}": "Quitar {{fqdn}} de {{name}}",
+  "An alias has to be of {{domain}}, like the environment. From another domain, use a redirect": "Un alias tiene que ser de {{domain}}, como el entorno. Desde otro dominio, usa una redirección",
+  "The certificate of {{domain}} does not cover {{fqdn}}: use a redirect, or a certificate that covers it": "El certificado de {{domain}} no cubre {{fqdn}}: usa una redirección, o un certificado que lo cubra",
+  "These aliases are not of {{domain}}: remove them first: {{names}}": "Estos alias no son de {{domain}}: primero quítalos: {{names}}",
+  "First remove from their environments: {{names}}": "Primero quítalos de sus entornos: {{names}}",
 };

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { containerArgs, containersConf, renderAppUnit, renderEnvFile, renderFirewall, renderNetnsUnit, renderSlotNft, timing } from "./apps";
 import { dispatch } from "./dispatch";
 import type { CommandResult, Host, RunOptions } from "./host";
-import { applyBlock, renderHooksVhost, renderVhost } from "./ols";
+import { renderHooksVhost, renderPanelConf, renderVhost } from "./ols";
 import { DEFAULT_PHP_OPTIONS } from "@eaglepanel/shared";
 
 // The real wait for in-flight requests is 5 s: tests do not need it.
@@ -487,11 +487,12 @@ describe("OLS and cleanup", () => {
     expect(conf).toContain("context /hooks/github {");
     expect(conf).toContain("docRoot                   /srv/eaglepanel/empty");
     expect(conf).toContain("RewriteRule ^ https://");
-    const block = applyBlock("serverName x\n", [], { fqdn: "hooks.example.com", certZone: "example.com" });
+    const panel = renderPanelConf([], { fqdn: "hooks.example.com", certZone: "example.com" });
+    const block = [panel.block, ...panel.files.values()].join("\n");
     expect(block).toContain("virtualhost eaglepanel-hooks {");
     expect(block.match(/map {21}eaglepanel-hooks hooks.example.com/g)).toHaveLength(2);
     expect(block).toContain("address                 *:443");
-    expect(applyBlock("serverName x\n", [], null)).not.toContain("eaglepanel-hooks");
+    expect(renderPanelConf([], null).files.size).toBe(0);
   });
 
   test("when suspended, an app also shows the 503", () => {

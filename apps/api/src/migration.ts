@@ -14,6 +14,7 @@ import {
   envScopeSchema,
   envValueSchema,
   fqdnSchema,
+  hostnameModeSchema,
   slugify,
   vhostNameSchema,
   vhostSlugSchema,
@@ -91,7 +92,8 @@ const vhostRowSchema = z.object({
   type: z.enum(["php", "app"]), docRoot: docRootSchema,
   phpVersion: phpVersionSchema, phpOptions: phpOptionsSchema.catch(DEFAULT_PHP_OPTIONS), logLevel: logLevelSchema.catch(DEFAULT_LOG_LEVEL), logDays: logDaysSchema.catch(DEFAULT_LOG_DAYS),
 }).loose();
-const hostnameRowSchema = z.object({ fqdn: fqdnSchema, domain: fqdnSchema }).loose();
+/** `vhost` and `mode` since aliases and redirects: an extra name of that environment. */
+const hostnameRowSchema = z.object({ fqdn: fqdnSchema, domain: fqdnSchema, vhost: z.number().int().nullable().optional(), mode: hostnameModeSchema.nullable().optional() }).loose();
 const certRowSchema = z.object({ zone: fqdnSchema, originPull: z.boolean().optional() }).loose();
 const appRowSchema = z.object({ vhost: z.number().int().optional(), fqdn: fqdnSchema.optional(), id: z.number().int(), webhookSecret: z.string().nullable().optional(), deployKey: z.string().nullable().optional() }).loose();
 const envRowSchema = z.object({ vhost: z.number().int().optional(), fqdn: fqdnSchema.optional(), key: envKeySchema, value: envValueSchema, scope: envScopeSchema });
@@ -272,6 +274,11 @@ export function registerMigrationRoutes(routes: Hono, { db, agent, jobs, writeSi
               }).returning({ id: vhosts.id }).get()!;
               newVhostIds.set(row.key, id);
             }
+            // Aliases and redirects, now that their environments have their new ids.
+            for (const row of plan.hostnames) {
+              const vhost = row.extra ? newVhostIds.get(row.extra.key) : undefined;
+              if (row.extra && vhost) tx.update(hostnames).set({ vhost, mode: row.extra.mode }).where(eq(hostnames.fqdn, row.fqdn)).run();
+            }
             const hookVhost = plan.hookKey ? newVhostIds.get(plan.hookKey) ?? null : null;
             if (hookVhost) tx.update(accounts).set({ hookVhost }).where(eq(accounts.username, username)).run();
             for (const app of plan.apps) {
@@ -379,7 +386,9 @@ function readPlan(manifest: BackupManifest) {
   const owned = new Set(domainRows.map(({ fqdn }) => fqdn));
   // Before 0.3.0 there were no hostnames: each environment was its own one.
   const savedHostnames = Array.isArray(manifest.panel.hostnames)
-    ? rows(manifest, "hostnames", hostnameRowSchema).map(({ fqdn, domain }) => ({ fqdn, domain }))
+    ? rows(manifest, "hostnames", hostnameRowSchema).map(({ fqdn, domain, vhost, mode }) => ({
+      fqdn, domain, extra: vhost !== null && vhost !== undefined && mode ? { key: `id:${vhost}`, mode } : null,
+    }))
     : [];
   const taken = new Set(vhostRows.flatMap((row) => (row.slug ? [row.slug] : [])));
   const environments = vhostRows.map((row) => {
@@ -397,7 +406,7 @@ function readPlan(manifest: BackupManifest) {
     if (!hostnameList.has(env.hostname)) {
       const domain = domainOf(env.hostname);
       if (!domain) throw new Error(`The backup has ${env.hostname} without its domain`);
-      hostnameList.set(env.hostname, { fqdn: env.hostname, domain });
+      hostnameList.set(env.hostname, { fqdn: env.hostname, domain, extra: null });
     }
   }
   if ([...hostnameList.values()].some((row) => !owned.has(row.domain))) throw new Error("The backup has domains that do not match its environments");
