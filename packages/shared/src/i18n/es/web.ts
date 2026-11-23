@@ -705,4 +705,5 @@ export const web: Record<string, string> = {
   "Redirect": "Redirección",
   "Choose a domain": "Elige un dominio",
   "Adding or removing one restarts OpenLiteSpeed: sites are briefly interrupted.": "Agregar o quitar uno reinicia OpenLiteSpeed: los sitios se interrumpen un momento.",
+  "Subdomain": "Subdominio",
 };

@@ -17,8 +17,9 @@ function titleFor(pathname: string): string {
   if (pathname === "/accounts/new") return "New account";
   if (pathname.startsWith("/accounts/")) {
     const parts = pathname.slice("/accounts/".length).split("/");
-    // /accounts/<user>/<tab> is the account page (title: the username); /accounts/<user>/environments/<slug>, the environment.
-    return decodeURIComponent(parts.length === 3 && parts[1] === "environments" ? parts[2]! : parts.length === 2 ? parts[0]! : parts.join("/"));
+    // /accounts/<user>/<tab> is the account page (title: the username); /accounts/<user>/environments/<slug> and
+    // /accounts/<user>/domains/<domain>, an environment or a domain (title: its slug or its name).
+    return decodeURIComponent(parts.length === 3 && (parts[1] === "environments" || parts[1] === "domains") ? parts[2]! : parts.length === 2 ? parts[0]! : parts.join("/"));
   }
   if (pathname.startsWith("/accounts")) return "Accounts";
   if (pathname.startsWith("/jobs")) return "Jobs";

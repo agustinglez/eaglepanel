@@ -83,6 +83,36 @@ export function AddHostnameForm({ account, onAdded, autoFocus }: { account: Acco
   );
 }
 
+/** On the page of a domain: only subdomains of it, typed without the domain. */
+function AddSubdomainForm({ account, domain }: { account: AccountDto; domain: string }) {
+  const { t } = useTranslation();
+  const [label, setLabel] = useState("");
+  const fqdn = `${label}.${domain}`;
+  const add = useJobAction(() => api.post<JobCreatedDto>(`/accounts/${account.username}/hostnames`, { fqdn }));
+
+  function submit(event: SyntheticEvent) {
+    event.preventDefault();
+    add.mutate();
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <form onSubmit={submit} className="flex flex-wrap items-end gap-2">
+        <div className="grid gap-2">
+          <Label htmlFor="new-subdomain">{t("Subdomain")}</Label>
+          <div className="flex items-center gap-2">
+            <Input id="new-subdomain" value={label} onChange={(event) => setLabel(event.target.value.toLowerCase().replace(/[^a-z0-9.-]/g, ""))} placeholder="shop" autoComplete="off" spellCheck={false} required className="w-40" />
+            <span className="text-sm text-muted-foreground">.{domain}</span>
+          </div>
+        </div>
+        <Button type="submit" variant="outline" disabled={add.isPending || !label || label === "www"}>{t("Add subdomain")}</Button>
+      </form>
+      {label === "www" && <p className="text-sm text-muted-foreground">{t("Not needed: {{name}} also answers for www.{{name}}.", { name: domain })}</p>}
+      <ActionFeedback action={add} onFinished={(ok) => { if (ok) setLabel(""); }} />
+    </div>
+  );
+}
+
 export function DomainsTab({ account }: { account: AccountDto }) {
   const { t } = useTranslation();
   return (
@@ -333,7 +363,7 @@ function HostnamesCard({ account, domain }: { account: AccountDto; domain: Domai
           </Table>
         </div>
         <ActionFeedback action={remove} />
-        <AddHostnameForm account={account} />
+        <AddSubdomainForm account={account} domain={domain.fqdn} />
       </CardContent>
     </Card>
   );
