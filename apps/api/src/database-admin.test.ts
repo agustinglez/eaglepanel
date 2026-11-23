@@ -158,6 +158,12 @@ describe("import", () => {
     expect(readdirSync(host.resolvePath(IMPORT_DIR))).toEqual([]);
   });
 
+  test("accepts files over the JSON body limit", async () => {
+    const big = `INSERT INTO t VALUES ('${"x".repeat(10 * 1024 * 1024)}');\n`;
+    const job = await runJob(await upload(`${BASE}/import`, big));
+    expect(job.status).toBe("succeeded");
+  });
+
   test("rejects files that are not SQL", async () => {
     const response = await upload(`${BASE}/import`, new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0, 0, 0]));
     expect(response.status).toBe(400);

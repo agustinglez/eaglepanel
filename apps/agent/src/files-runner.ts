@@ -15,10 +15,10 @@ export const homeOf = (username: string) => `/home/${username}`;
  * How the account process is launched: its user and group, without extra groups or a way to gain privileges, and
  * with a minimal environment. No transpiler cache: it would write into the home directory.
  */
-export function workerCommand(username: string, args: string[] = []): { cmd: string[]; env: Record<string, string>; cwd: string } {
+export function workerCommand(username: string, args: string[] = [], script = WORKER): { cmd: string[]; env: Record<string, string>; cwd: string } {
   const home = homeOf(username);
   return {
-    cmd: ["setpriv", `--reuid=${username}`, `--regid=${username}`, "--clear-groups", "--no-new-privs", "--", process.execPath, WORKER, ...args],
+    cmd: ["setpriv", `--reuid=${username}`, `--regid=${username}`, "--clear-groups", "--no-new-privs", "--", process.execPath, script, ...args],
     env: { PATH: "/usr/bin:/bin", HOME: home, LC_ALL: "C.UTF-8", TMPDIR: `${home}/tmp`, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" },
     cwd: home,
   };

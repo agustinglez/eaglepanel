@@ -24,6 +24,8 @@ const ACTION_LABELS: Record<string, string> = {
   "domain.php": "Change PHP version",
   "certificate.set": "Install certificate",
   "package.upgrade": "Update package",
+  "wordfence.key_set": "Save the Wordfence API key",
+  "wordfence.key_removed": "Remove the Wordfence API key",
 };
 
 export function ActivityPage() {

@@ -1,11 +1,11 @@
 import { useQueryClient } from "@tanstack/react-query";
-import type { JobCreatedDto, SystemPackageDto, VulnerabilitySeverity } from "@eaglepanel/shared";
-import { ArrowUpRightIcon, RefreshCwIcon } from "lucide-react";
-import { useState } from "react";
+import type { JobCreatedDto, SystemPackageDto, UpdateStatusDto, VulnerabilitySeverity } from "@eaglepanel/shared";
+import { ArrowUpRightIcon, CheckCircle2Icon, Loader2Icon, RefreshCwIcon } from "lucide-react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Page } from "@/components/app-shell";
 import { ActionFeedback, useJobAction } from "@/components/job-action";
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -16,7 +16,7 @@ import { api } from "@/lib/api";
 import { formatDateTime } from "@/lib/format";
 import { serverText } from "@/lib/i18n";
 import { useCheckPackages, usePackagesStatus } from "@/lib/system-packages";
-import { useCheckForUpdates, useUpdateStatus } from "@/lib/update-status";
+import { useCheckForUpdates, usePanelUpgrade, useStartPanelUpgrade, useUpdateStatus } from "@/lib/update-status";
 
 const SEVERITY_LABELS: Record<VulnerabilitySeverity, string> = {
   critical: "Critical",
@@ -27,13 +27,124 @@ const SEVERITY_LABELS: Record<VulnerabilitySeverity, string> = {
   unknown: "Unrated",
 };
 
-function SeverityBadge({ severity }: { severity: VulnerabilitySeverity }) {
+export function SeverityBadge({ severity }: { severity: VulnerabilitySeverity }) {
   const { t } = useTranslation();
   const variant = severity === "critical" || severity === "high" ? "destructive" : severity === "medium" ? "warning" : "outline";
   return <Badge variant={variant}>{t(SEVERITY_LABELS[severity])}</Badge>;
 }
 
-/** The panel itself: updated on the server with `eagle upgrade`, never from the panel. */
+function UpgradeLog({ lines }: { lines: string[] }) {
+  if (!lines.length) return null;
+  return <pre className="max-h-64 overflow-auto rounded-ep border bg-muted p-3 font-mono text-xs whitespace-pre-wrap">{lines.join("\n")}</pre>;
+}
+
+/** Runs `eagle upgrade` on the server through the agent, then follows it while the panel restarts. */
+function PanelUpgrade({ data }: { data: UpdateStatusDto }) {
+  const { t } = useTranslation();
+  const [confirming, setConfirming] = useState(false);
+  const { progress, following } = usePanelUpgrade();
+  const start = useStartPanelUpgrade();
+  const run = progress.data;
+  const finished = following && run && !run.running && run.startedAt !== null;
+
+  // Done: the new version is a new web bundle too, so the page is loaded again.
+  useEffect(() => {
+    if (finished && run.exitCode === 0) window.location.reload();
+  }, [finished, run?.exitCode]);
+
+  const recent = run?.startedAt && Date.now() - run.startedAt < 24 * 60 * 60 * 1000;
+  const failed = run && !run.running && recent && run.exitCode !== 0 && run.version !== data.current;
+  const succeeded = run && !run.running && recent && run.exitCode === 0 && run.version === data.current;
+
+  if (run?.running || (following && !finished)) {
+    return (
+      <Alert>
+        <Loader2Icon className="animate-spin" />
+        <AlertTitle>{t("Updating EaglePanel to v{{version}}", { version: run?.version ?? data.latest })}</AlertTitle>
+        <AlertDescription className="flex flex-col gap-2">
+          <span>
+            {progress.isError
+              ? t("The panel is restarting. This page reconnects by itself.")
+              : t("It downloads the release, verifies it and runs the installer. The panel restarts at the end.")}
+          </span>
+          <UpgradeLog lines={run?.log ?? []} />
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
+  return (
+    <>
+      {succeeded && (
+        <Alert>
+          <CheckCircle2Icon />
+          <AlertDescription>{t("Updated to v{{version}}.", { version: run.version })}</AlertDescription>
+        </Alert>
+      )}
+      {failed && (
+        <Alert variant="destructive">
+          <AlertTitle>
+            {run.exitCode === null
+              ? t("The update to v{{version}} stopped without finishing", { version: run.version })
+              : t("The update to v{{version}} failed", { version: run.version })}
+          </AlertTitle>
+          <AlertDescription className="flex flex-col gap-2">
+            <span>{t("The installed panel keeps working. The full output is on the server: journalctl -u eaglepanel-upgrade")}</span>
+            <UpgradeLog lines={run.log} />
+          </AlertDescription>
+        </Alert>
+      )}
+      {data.updateAvailable && (
+        <Alert>
+          <AlertDescription className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <span>{t("EaglePanel {{version}} is available", { version: `v${data.latest}` })}</span>
+            {data.releaseUrl && (
+              <a href={data.releaseUrl} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 text-primary hover:underline">
+                {t("View release")}
+                <ArrowUpRightIcon className="size-3.5" aria-hidden="true" />
+              </a>
+            )}
+          </AlertDescription>
+          {data.source === "github" && (
+            <AlertAction>
+              <Button size="sm" onClick={() => setConfirming(true)}>
+                {t("Update now")}
+              </Button>
+            </AlertAction>
+          )}
+        </Alert>
+      )}
+      <Dialog
+        open={confirming}
+        onOpenChange={(next) => {
+          setConfirming(next);
+          if (!next) start.reset();
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("Update EaglePanel to v{{version}}", { version: data.latest })}</DialogTitle>
+            <DialogDescription>
+              {t("The release is downloaded from GitHub, checked against its SHA256 and installed with the saved choices. The panel restarts for a few seconds; the sites keep working.")}
+            </DialogDescription>
+          </DialogHeader>
+          {data.notes && <pre className="max-h-64 overflow-auto rounded-ep border p-3 text-xs whitespace-pre-wrap">{data.notes}</pre>}
+          {start.isError && <p className="text-sm text-destructive">{start.error.message}</p>}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirming(false)}>
+              {t("Cancel")}
+            </Button>
+            <Button disabled={start.isPending} onClick={() => start.mutate(undefined, { onSuccess: () => setConfirming(false) })}>
+              {t("Update now")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+/** The panel itself: updated with `eagle upgrade`, from here or on the server. */
 function PanelCard() {
   const { t } = useTranslation();
   const status = useUpdateStatus();
@@ -68,21 +179,7 @@ function PanelCard() {
             )}
           </p>
         )}
-        {data?.updateAvailable && (
-          <Alert>
-            <AlertDescription className="flex flex-wrap items-center gap-x-3 gap-y-1">
-              <span>
-                {t("Update it on the server with")} <code className="font-mono">sudo eagle upgrade</code>
-              </span>
-              {data.releaseUrl && (
-                <a href={data.releaseUrl} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 text-primary hover:underline">
-                  {t("View release")}
-                  <ArrowUpRightIcon className="size-3.5" aria-hidden="true" />
-                </a>
-              )}
-            </AlertDescription>
-          </Alert>
-        )}
+        {data && <PanelUpgrade data={data} />}
         {data?.error && <p className="text-xs text-destructive">{t("Last check failed: {{error}}", { error: data.error })}</p>}
       </CardContent>
     </Card>

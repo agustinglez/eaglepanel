@@ -3,6 +3,7 @@ import { Link, useRouterState } from "@tanstack/react-router";
 import type { AccountDto, JobDto, MeDto } from "@eaglepanel/shared";
 import {
   ActivityIcon,
+  BlocksIcon,
   EllipsisVerticalIcon,
   LayoutDashboardIcon,
   ListChecksIcon,
@@ -41,6 +42,7 @@ import {
 import { api } from "@/lib/api";
 import { useSystemInfo } from "@/lib/system-info";
 import { useAttention } from "@/lib/system-packages";
+import { needsAttention, useWordPressStatus } from "@/lib/wordpress";
 
 function useIsActive() {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
@@ -134,6 +136,8 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => api.get<JobDto[]>("/jobs") });
   const running = jobs.data?.filter((job) => job.status === "running" || job.status === "pending").length ?? 0;
   const attention = useAttention();
+  const wordpress = useWordPressStatus();
+  const wordpressAttention = wordpress.data?.installs.filter(needsAttention).length ?? 0;
 
   const nav = [
     { to: "/", title: "Overview", icon: LayoutDashboardIcon, badge: null },
@@ -141,6 +145,7 @@ export function AppSidebar(props: ComponentProps<typeof Sidebar>) {
     { to: "/jobs", title: "Jobs", icon: ListChecksIcon, badge: running > 0 ? String(running) : null },
     { to: "/activity", title: "Activity", icon: ActivityIcon, badge: null },
     { to: "/updates", title: "Updates", icon: PackageIcon, badge: attention?.total ? String(attention.total) : null },
+    { to: "/wordpress", title: "WordPress", icon: BlocksIcon, badge: wordpressAttention > 0 ? String(wordpressAttention) : null },
   ] as const;
 
   return (

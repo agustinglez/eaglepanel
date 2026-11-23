@@ -25,6 +25,7 @@ function titleFor(pathname: string): string {
   if (pathname.startsWith("/jobs")) return "Jobs";
   if (pathname.startsWith("/activity")) return "Activity";
   if (pathname.startsWith("/updates")) return "Updates";
+  if (pathname.startsWith("/wordpress")) return "WordPress";
   if (pathname.startsWith("/settings")) return "Settings";
   return "EaglePanel";
 }

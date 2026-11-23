@@ -69,7 +69,7 @@ import {
 const ACCOUNT_MARKER = "eaglepanel";
 const QUOTA_FILESYSTEM = "/";
 
-type HostingOp = Exclude<AgentOpName, "system.ping" | "system.info" | `packages.${string}`>;
+type HostingOp = Exclude<AgentOpName, "system.ping" | "system.info" | `packages.${string}` | `panel.${string}` | `wordpress.${string}`>;
 export type HostingHandlers = {
   [N in HostingOp]: (params: AgentOpParams<N>, host: Host) => Promise<AgentOpResult<N>>;
 };

@@ -27,7 +27,7 @@ curl -fsSL https://github.com/agustinglez/eaglepanel/releases/latest/download/ge
 
 Use `--firewall open` instead if your sites are not behind Cloudflare. The script downloads the latest release, checks its SHA256 and runs the installer, which shows its plan before changing anything, asks how the panel will be reached and, at the end, prints the panel address and the admin password (only once).
 
-To update, on the server (the choices are saved; `eagle upgrade --check` only tells whether there is a newer release):
+To update, use **Update now** under Updates in the panel, or on the server (the choices are saved; `eagle upgrade --check` only tells whether there is a newer release):
 
 ```bash
 sudo eagle upgrade

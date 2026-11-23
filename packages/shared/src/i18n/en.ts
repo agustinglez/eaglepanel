@@ -21,4 +21,8 @@ export const en: Record<string, string> = {
   "{{count}} rows in {{ms}} ms._other": "{{count}} rows in {{ms}} ms.",
   "{{count}} known vulnerabilities in {{names}}_one": "{{count}} known vulnerability in {{names}}",
   "{{count}} known vulnerabilities in {{names}}_other": "{{count}} known vulnerabilities in {{names}}",
+  "{{count}} installations_one": "{{count}} installation",
+  "{{count}} installations_other": "{{count}} installations",
+  "{{count}} need attention_one": "{{count}} needs attention",
+  "{{count}} need attention_other": "{{count}} need attention",
 };

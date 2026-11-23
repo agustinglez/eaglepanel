@@ -112,6 +112,21 @@ const installedPackageSchema = z.object({
   candidate: z.string().nullable(),
 });
 
+/** A release as `eagle upgrade --version` takes it: SemVer without build metadata ("0.2.0", "1.0.0-rc.1"). */
+export const releaseVersionSchema = z.string().regex(/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/, "Invalid version");
+
+const panelUpgradeStatusSchema = z.object({
+  /** The upgrade unit is running. */
+  running: z.boolean(),
+  /** Of the last upgrade started from the panel; null if none was. */
+  version: z.string().nullable(),
+  startedAt: z.number().nullable(),
+  /** Exit code of `eagle upgrade`. Null while it runs, or if it stopped without one (the server restarted). */
+  exitCode: z.number().nullable(),
+  /** Last lines of its output. */
+  log: z.array(z.string()),
+});
+
 export const packageOps = {
   "packages.status": {
     /** `refresh` runs `apt-get update` first, to see what the repositories published since the last time. */
@@ -135,7 +150,21 @@ export const packageOps = {
     params: z.object({ id: systemComponentIdSchema }).strict(),
     result: z.object({ upgraded: z.array(z.string()) }),
   },
+  /**
+   * Starts `eagle upgrade --version V` in its own systemd unit: the installer restarts the agent and the API, and the
+   * upgrade must outlive them. It returns as soon as the unit starts; `panel.upgradeStatus` follows it.
+   */
+  "panel.upgrade": {
+    params: z.object({ version: releaseVersionSchema }).strict(),
+    result: z.object({ ok: z.literal(true) }),
+  },
+  "panel.upgradeStatus": {
+    params: z.object({}).strict(),
+    result: panelUpgradeStatusSchema,
+  },
 } as const;
+
+export type PanelUpgradeStatusDto = z.infer<typeof panelUpgradeStatusSchema>;
 
 export type VulnerabilitySeverity = "critical" | "high" | "medium" | "low" | "negligible" | "unknown";
 

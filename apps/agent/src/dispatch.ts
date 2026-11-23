@@ -11,6 +11,8 @@ import { hostname, loadavg, platform, release, totalmem, freemem, uptime } from 
 import type { Host } from "./host";
 import { hostingHandlers } from "./hosting";
 import { packageHandlers } from "./packages";
+import { panelUpgradeHandlers } from "./panel-upgrade";
+import { wordpressHandlers } from "./wordpress";
 
 /** PRETTY_NAME from /etc/os-release, read once: it only changes with a distribution upgrade, which restarts the agent. */
 let osName: string | null | undefined;
@@ -43,6 +45,8 @@ const handlers: Handlers = {
   }),
   ...hostingHandlers,
   ...packageHandlers,
+  ...panelUpgradeHandlers,
+  ...wordpressHandlers,
 };
 
 function isOpName(op: string): op is AgentOpName {

@@ -1,6 +1,6 @@
 import { BackupSettingsCard } from "@/components/backups";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { GLOBAL_HOOK_PATH, type JobCreatedDto, type MeDto, type ServerSettingsDto } from "@eaglepanel/shared";
+import { GLOBAL_HOOK_PATH, type JobCreatedDto, type MeDto, type ServerSettingsDto, type WordPressSettingsDto } from "@eaglepanel/shared";
 import { QRCodeSVG } from "qrcode.react";
 import { useState, type SyntheticEvent } from "react";
 import { useTranslation } from "react-i18next";
@@ -163,6 +163,58 @@ function HooksDomainForm({ saved }: { saved: string | null }) {
   );
 }
 
+/** Wordfence Intelligence API key for the WordPress monitor. It is never sent back to the browser. */
+function WordfenceCard() {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const current = useQuery({ queryKey: ["wordpress-settings"], queryFn: () => api.get<WordPressSettingsDto>("/settings/wordpress") });
+  const [key, setKey] = useState("");
+  const save = useMutation({
+    mutationFn: (value: string | null) => api.post<WordPressSettingsDto>("/settings/wordpress", { wordfenceKey: value }),
+    onSuccess: (data) => {
+      setKey("");
+      queryClient.setQueryData(["wordpress-settings"], data);
+      void queryClient.invalidateQueries({ queryKey: ["wordpress"] });
+    },
+  });
+  const configured = current.data?.wordfenceConfigured ?? false;
+
+  function submit(event: SyntheticEvent) {
+    event.preventDefault();
+    if (key.trim()) save.mutate(key.trim());
+  }
+
+  return (
+    <Card className="max-w-3xl">
+      <CardHeader>
+        <CardTitle>{t("WordPress vulnerabilities")}</CardTitle>
+        <CardDescription>
+          {t("The WordPress monitor looks up known vulnerabilities of core, plugins and themes in Wordfence Intelligence. Its feed is free, also for commercial use, but needs an API key: create a wordfence.com account and generate one under Integrations.")}
+        </CardDescription>
+        <CardAction><Badge variant="outline">{configured ? t("Active") : t("No API key")}</Badge></CardAction>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        <form onSubmit={submit} className="flex flex-wrap items-end gap-2">
+          <div className="grid gap-2">
+            <Label htmlFor="wordfence-key">{configured ? t("Replace API key") : t("API key")}</Label>
+            <Input id="wordfence-key" type="password" autoComplete="off" value={key} onChange={(event) => setKey(event.target.value)} spellCheck={false} className="w-80" />
+          </div>
+          <Button type="submit" variant="outline" disabled={save.isPending || !key.trim()}>{t("Save")}</Button>
+          {configured && (
+            <Button type="button" variant="ghost" disabled={save.isPending} onClick={() => save.mutate(null)}>{t("Remove")}</Button>
+          )}
+        </form>
+        {save.isError && <ErrorAlert message={save.error.message} />}
+        {save.isSuccess && (
+          <p className="text-sm text-muted-foreground">
+            {save.data.wordfenceConfigured ? t("Saved. The vulnerability database is being downloaded; it takes a minute.") : t("API key removed.")}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export function SettingsPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -184,6 +236,7 @@ export function SettingsPage() {
       </Card>
       <BackupSettingsCard />
       <HooksDomainCard />
+      <WordfenceCard />
     </Page>
   );
 }

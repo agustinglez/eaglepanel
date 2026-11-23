@@ -52,6 +52,15 @@ async function login(): Promise<string> {
   return header.split(";")[0] ?? "";
 }
 
+describe("panel upgrade", () => {
+  test("not started without a newer version, and only by an administrator", async () => {
+    expect((await post("/system/update/install", {})).status).toBe(401);
+    const cookie = await login();
+    // Tests check no update source.
+    expect((await post("/system/update/install", {}, cookie)).status).toBe(400);
+  });
+});
+
 describe("authentication", () => {
   test("routes require a session", async () => {
     for (const path of ["/auth/me", "/system/info", "/jobs", "/audit"]) {
@@ -257,5 +266,26 @@ describe("system and audit log", () => {
     const response = await app.request("/api/auth/me");
     expect(response.headers.get("strict-transport-security")).toBeNull();
     expect(response.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+  });
+});
+
+describe("WordPress", () => {
+  test("the Wordfence key is saved without being shown, and can be removed", async () => {
+    expect((await app.request("/api/wordpress")).status).toBe(401);
+    const cookie = await login();
+    const get = async () => (await app.request("/api/settings/wordpress", { headers: { cookie } })).json();
+    expect(await get()).toEqual({ wordfenceConfigured: false });
+    expect((await post("/settings/wordpress", { wordfenceKey: "short" }, cookie)).status).toBe(400);
+    const key = "wf-test-key-0123456789abcdef";
+    expect((await post("/settings/wordpress", { wordfenceKey: key }, cookie)).status).toBe(200);
+    expect(await get()).toEqual({ wordfenceConfigured: true });
+    const status = await (await app.request("/api/wordpress", { headers: { cookie } })).text();
+    expect(status).not.toContain(key);
+    expect(JSON.parse(status)).toMatchObject({ installs: [], vulnerabilities: { configured: true } });
+    expect((await post("/settings/wordpress", { wordfenceKey: null }, cookie)).status).toBe(200);
+    expect(await get()).toEqual({ wordfenceConfigured: false });
+    const audit = await (await app.request("/api/audit", { headers: { cookie } })).text();
+    expect(audit).toContain("wordfence.key_set");
+    expect(audit).not.toContain(key);
   });
 });

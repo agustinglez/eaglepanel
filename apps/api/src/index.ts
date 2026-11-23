@@ -35,6 +35,7 @@ const app = createApp({
   // Next to the database: the same directory the service already writes to.
   metricsFile: dbPath === ":memory:" ? undefined : join(dirname(dbPath), "metrics.json"),
   rootDir: join(import.meta.dir, "..", "..", ".."),
+  dataDir: dbPath === ":memory:" ? undefined : dirname(dbPath),
 });
 
 // File manager uploads go up to MAX_UPLOAD_BYTES; the other routes have their own cap.

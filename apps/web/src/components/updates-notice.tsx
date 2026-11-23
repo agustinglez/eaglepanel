@@ -6,6 +6,7 @@ import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/u
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { bannerHiddenFor, hideBannerFor, markModalShown, modalShown, useAttention, type Attention } from "@/lib/system-packages";
+import { useStartPanelUpgrade, useUpdateStatus } from "@/lib/update-status";
 
 function useSummary(attention: Attention | null): string[] {
   const { t } = useTranslation();
@@ -71,6 +72,10 @@ export function UpdatesDialog() {
   const summary = useSummary(attention);
   const [open, setOpen] = useState(false);
   const pending = attention !== null && attention.total > 0;
+  const panel = useUpdateStatus();
+  const upgrade = useStartPanelUpgrade();
+  // A custom manifest is installed by hand: only "Review" then.
+  const canUpgrade = Boolean(attention?.panelUpdate) && panel.data?.source === "github";
 
   useEffect(() => {
     if (pending && !modalShown()) {
@@ -91,11 +96,13 @@ export function UpdatesDialog() {
             <li key={line}>{line}</li>
           ))}
         </ul>
+        {upgrade.isError && <p className="text-sm text-destructive">{upgrade.error.message}</p>}
         <DialogFooter>
           <Button variant="outline" onClick={() => setOpen(false)}>
             {t("Later")}
           </Button>
           <Button
+            variant={canUpgrade ? "outline" : "default"}
             onClick={() => {
               setOpen(false);
               void navigate({ to: "/updates" });
@@ -103,6 +110,22 @@ export function UpdatesDialog() {
           >
             {t("Review")}
           </Button>
+          {canUpgrade && (
+            <Button
+              disabled={upgrade.isPending}
+              onClick={() =>
+                upgrade.mutate(undefined, {
+                  // The Updates page shows the progress and reloads when it ends.
+                  onSuccess: () => {
+                    setOpen(false);
+                    void navigate({ to: "/updates" });
+                  },
+                })
+              }
+            >
+              {t("Update EaglePanel to v{{version}}", { version: attention?.panelUpdate })}
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

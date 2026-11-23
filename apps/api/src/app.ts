@@ -1,5 +1,5 @@
-import { METRICS_RANGES, systemComponent, systemComponentIdSchema, type AuditEntryDto, type JobCreatedDto, type JobDto, type MeDto, type MetricsRange } from "@eaglepanel/shared";
-import { desc } from "drizzle-orm";
+import { METRICS_RANGES, releaseVersionSchema, systemComponent, systemComponentIdSchema, type AuditEntryDto, type PanelUpgradeStatusDto, type JobCreatedDto, type JobDto, type MeDto, type MetricsRange, type WordPressSettingsDto, type WordPressStatusDto } from "@eaglepanel/shared";
+import { desc, eq } from "drizzle-orm";
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { bodyLimit } from "hono/body-limit";
@@ -26,7 +26,7 @@ import {
   type Admin,
 } from "./auth";
 import type { Db } from "./db";
-import { auditLog } from "./db/schema";
+import { auditLog, settings } from "./db/schema";
 import { createHostingRoutes } from "./hosting";
 import { registerDatabaseAdminRoutes } from "./database-admin";
 import { registerFileRoutes } from "./files";
@@ -35,6 +35,7 @@ import { createEnvironmentHealth } from "./environment-health";
 import { createMetricsMonitor } from "./metrics";
 import { createUpdateChecker, readCurrentVersion, updateSourceFromEnv } from "./updates";
 import { createPackageMonitor } from "./system-packages";
+import { createWordPressMonitor, WORDFENCE_KEY_SETTING } from "./wordpress";
 import type { JobRunner } from "./jobs";
 
 const CSRF_HEADER = "x-eaglepanel";
@@ -66,6 +67,8 @@ export interface AppDeps {
   metricsFile?: string;
   /** Project root, where the package writes its VERSION file. */
   rootDir?: string;
+  /** Directory the API writes its caches to (the Wordfence index). Without it, they stay in memory. */
+  dataDir?: string;
 }
 
 type Env = { Variables: { admin: Admin; sessionToken: string } };
@@ -86,7 +89,7 @@ function peerAddress(c: Context): string | undefined {
   }
 }
 
-export function createApp({ db, agent, jobs, webDist, secureCookie = false, localAddresses = [], schedule = false, metricsFile, rootDir }: AppDeps) {
+export function createApp({ db, agent, jobs, webDist, secureCookie = false, localAddresses = [], schedule = false, metricsFile, rootDir, dataDir }: AppDeps) {
   const throttle = new LoginThrottle();
   const localThrottle = new LoginThrottle(LOCAL_MAX_FAILED_LOGINS);
   const app = new Hono<Env>();
@@ -117,9 +120,10 @@ export function createApp({ db, agent, jobs, webDist, secureCookie = false, loca
     await next();
   });
 
-  // The server accepts large bodies for file uploads. Everything else is small JSON.
+  // The server accepts large bodies for file uploads and database imports, which check their own size. Everything else is small JSON.
   const jsonLimit = bodyLimit({ maxSize: MAX_JSON_BYTES, onError: (c) => c.json({ error: "The request is too large" }, 413) });
-  api.use(async (c, next) => (c.req.path.endsWith("/files/upload") ? next() : jsonLimit(c, next)));
+  const streamedUpload = /^\/api\/accounts\/[^/]+\/(files\/upload|databases\/[^/]+\/import)$/;
+  api.use(async (c, next) => (streamedUpload.test(c.req.path) ? next() : jsonLimit(c, next)));
 
   const requireAdmin = createMiddleware<Env>(async (c, next) => {
     const token = getCookie(c, SESSION_COOKIE);
@@ -250,6 +254,28 @@ export function createApp({ db, agent, jobs, webDist, secureCookie = false, loca
   if (schedule) updates.start();
   api.get("/system/update", (c) => c.json(updates.get()));
   api.post("/system/update/check", async (c) => c.json(await updates.check()));
+  // Upgrade from the panel: the agent starts `eagle upgrade` apart, which restarts the API; the screen polls the status.
+  api.get("/system/update/install", async (c) => {
+    try {
+      return c.json((await agent.call("panel.upgradeStatus", {})) satisfies PanelUpgradeStatusDto);
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "The agent is not responding" }, 503);
+    }
+  });
+  api.post("/system/update/install", async (c) => {
+    const { latest, updateAvailable, source } = updates.get();
+    if (source !== "github") return c.json({ error: "This server checks a custom update manifest: install its packages by hand" }, 400);
+    if (!updateAvailable || !latest) return c.json({ error: "There is no newer version" }, 409);
+    const version = releaseVersionSchema.safeParse(latest);
+    if (!version.success) return c.json({ error: "Invalid version" }, 400);
+    try {
+      await agent.call("panel.upgrade", { version: version.data });
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "The upgrade did not start" }, 409);
+    }
+    audit(db, "panel.upgrade", `to ${version.data}`);
+    return c.json({ ok: true }, 202);
+  });
 
   // System packages: versions, pending updates and known vulnerabilities. Tests make no outside requests.
   const packages = createPackageMonitor({ agent });
@@ -270,6 +296,25 @@ export function createApp({ db, agent, jobs, webDist, secureCookie = false, loca
     void done.finally(() => packages.check({ refresh: false }));
     audit(db, "package.upgrade", def.name);
     return c.json({ jobId } satisfies JobCreatedDto, 202);
+  });
+
+  // WordPress installations: core, plugin and theme versions and their known vulnerabilities. Tests make no outside requests.
+  const wordpress = createWordPressMonitor({ db, agent, dataDir, online: schedule });
+  if (schedule) wordpress.start();
+  api.get("/wordpress", (c) => c.json(wordpress.get() satisfies WordPressStatusDto));
+  api.post("/wordpress/check", async (c) => c.json((await wordpress.check({ force: true })) satisfies WordPressStatusDto));
+  const wordfenceKey = () => db.select().from(settings).where(eq(settings.key, WORDFENCE_KEY_SETTING)).get()?.value ?? null;
+  api.get("/settings/wordpress", (c) => c.json({ wordfenceConfigured: wordfenceKey() !== null } satisfies WordPressSettingsDto));
+  const wordpressSettingsSchema = z.object({ wordfenceKey: z.string().trim().regex(/^[!-~]{16,1024}$/, "Invalid API key").nullable() }).strict();
+  api.post("/settings/wordpress", async (c) => {
+    const body = wordpressSettingsSchema.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: body.error.issues[0]?.message ?? "Invalid data" }, 400);
+    const value = body.data.wordfenceKey;
+    if (value) db.insert(settings).values({ key: WORDFENCE_KEY_SETTING, value }).onConflictDoUpdate({ target: settings.key, set: { value } }).run();
+    else db.delete(settings).where(eq(settings.key, WORDFENCE_KEY_SETTING)).run();
+    wordpress.keyChanged(value !== null);
+    audit(db, value ? "wordfence.key_set" : "wordfence.key_removed");
+    return c.json({ wordfenceConfigured: value !== null } satisfies WordPressSettingsDto);
   });
 
   const environmentHealth = createEnvironmentHealth({ db, agent });

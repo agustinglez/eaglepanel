@@ -42,6 +42,7 @@ import { fileRequestSchema } from "./files";
 import { backupOps } from "./backups";
 import { dbAdminOps } from "./dbadmin";
 import { packageOps } from "./packages";
+import { wordpressOps } from "./wordpress";
 
 const ok = z.object({ ok: z.literal(true) });
 /** A full git commit: what GitHub sends in `after`. */
@@ -215,6 +216,7 @@ export const agentOps = {
   ...backupOps,
   ...dbAdminOps,
   ...packageOps,
+  ...wordpressOps,
   /** File manager. Runs as the account user; the result depends on `request.op`. */
   "files.run": {
     params: z.object({ username: usernameSchema, request: fileRequestSchema }).strict(),
