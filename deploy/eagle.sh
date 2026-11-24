@@ -16,6 +16,9 @@ Usage: eagle <command>
   eagle net tailscale        through the Tailscale IP
   eagle net wireguard [IP]   through the IP of a WireGuard interface
   eagle net cloudflared      how to connect with cloudflared
+  eagle mail status          whether this server runs mail, and its name
+  eagle mail on [NAME]       install the mail server (Stalwart); NAME: its mail name, like mail.yourdomain.com
+  eagle mail off             stop it and close its ports (mailboxes and data are kept: eagle mail on brings them back)
   eagle upgrade              install the latest release (the saved choices are kept)
   eagle upgrade --check      only say whether there is a newer release
   eagle upgrade --version V  install that release (--force to reinstall it or go back to an older one)
@@ -121,8 +124,23 @@ upgrade() {
   bash "$work/eaglepanel/deploy/install.sh" "${mode[@]}" </dev/null
 }
 
+# Mail is optional: the installer of the installed version turns it on or off (a full run: every step checks itself).
+mail() {
+  local conf=/etc/eaglepanel/install.conf
+  case "${1:-status}" in
+    status)
+      if systemctl is-active --quiet stalwart; then echo "Mail: on, as $(sed -n 's/^MAIL_HOSTNAME=//p' "$conf" | tail -n 1)"
+      elif systemctl is-enabled --quiet stalwart 2>/dev/null; then echo "Mail: on, but Stalwart is not running (journalctl -u stalwart)"
+      else echo "Mail: off (to install it: eagle mail on)"; fi ;;
+    on) if [ -n "${2:-}" ]; then exec bash "$INSTALLER" --mail --mail-hostname "$2"; else exec bash "$INSTALLER" --mail; fi ;;
+    off) exec bash "$INSTALLER" --no-mail ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
 case "${1:-}" in
   net) shift; net "$@" ;;
+  mail) shift; mail "$@" ;;
   upgrade) shift; upgrade "$@" ;;
   version) cat "$APP/VERSION" ;;
   ""|-h|--help|help) usage ;;

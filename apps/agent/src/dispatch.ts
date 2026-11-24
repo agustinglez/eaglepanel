@@ -13,6 +13,7 @@ import { hostingHandlers } from "./hosting";
 import { packageHandlers } from "./packages";
 import { panelUpgradeHandlers } from "./panel-upgrade";
 import { wordpressHandlers } from "./wordpress";
+import { mailHandlers } from "./mail";
 
 /** PRETTY_NAME from /etc/os-release, read once: it only changes with a distribution upgrade, which restarts the agent. */
 let osName: string | null | undefined;
@@ -47,6 +48,7 @@ const handlers: Handlers = {
   ...packageHandlers,
   ...panelUpgradeHandlers,
   ...wordpressHandlers,
+  ...mailHandlers,
 };
 
 function isOpName(op: string): op is AgentOpName {

@@ -134,6 +134,13 @@
       "when": 1795205061845,
       "tag": "0018_environment_extras",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1795523191226,
+      "tag": "0019_mail",
+      "breakpoints": true
     }
   ]
 }

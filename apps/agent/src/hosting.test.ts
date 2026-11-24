@@ -285,6 +285,20 @@ describe("OLS configuration", () => {
     expect(files.get(`${PANEL_CONF_DIR}/listeners.conf`)).toContain("address                 *:80");
   });
 
+  test("mail names answer only the ACME validation, and only on port 80", () => {
+    const { block, files } = renderPanelConf([https], null, [], ["mail.b.com", "mail.a.com", "mail.a.com"]);
+    const text = [block, ...files.values()].join("\n");
+    expect(block).toContain(`include ${PANEL_CONF_DIR}/acme.conf`);
+    expect(block).not.toContain("acme/vhost.conf");
+    expect(listener(text, "eaglepanel-http")).toContain("map                     eaglepanel-acme mail.a.com, mail.b.com");
+    expect(listener(text, "eaglepanel-https")).not.toContain("eaglepanel-acme");
+    const vhost = files.get(`${PANEL_CONF_DIR}/acme/vhost.conf`)!;
+    expect(vhost).toContain("context /.well-known/acme-challenge/ {");
+    expect(vhost).toContain("address                 127.0.0.1:8402");
+    expect(vhost).not.toContain("errorlog");
+    expect(renderPanelConf([https], null).files.has(`${PANEL_CONF_DIR}/acme.conf`)).toBe(false);
+  });
+
   test("the vhosts are included before the listeners that map to them", () => {
     const { block } = renderPanelConf([http, https], null);
     expect(block.indexOf("listeners.conf")).toBeGreaterThan(block.indexOf("sites/web.conf"));

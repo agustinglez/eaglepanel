@@ -5,6 +5,7 @@ import { useState, type SyntheticEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { Page } from "@/components/app-shell";
 import { ActionFeedback, useJobAction } from "@/components/job-action";
+import { MailSection } from "@/components/mail";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -503,7 +504,7 @@ function DeleteDomainCard({ account, domain }: { account: AccountDto; domain: Do
         <CardDescription>
           {environments.length > 0
             ? t("Its environments have to be deleted or moved to another domain first: {{names}}.", { names: environments.join(", ") })
-            : t("Deletes the domain, its subdomains and its certificate. No files are deleted.")}
+            : t("Deletes the domain, its subdomains, its mail and its certificate. No files are deleted.")}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
@@ -513,7 +514,7 @@ function DeleteDomainCard({ account, domain }: { account: AccountDto; domain: Do
             <AlertDialogContent>
               <AlertDialogHeader>
                 <AlertDialogTitle>{t("Delete {{name}}?", { name: domain.fqdn })}</AlertDialogTitle>
-                <AlertDialogDescription>{t("Deletes the domain, its subdomains and its certificate. No files are deleted.")}</AlertDialogDescription>
+                <AlertDialogDescription>{t("Deletes the domain, its subdomains, its mail and its certificate. No files are deleted.")}</AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogCancel>{t("Cancel")}</AlertDialogCancel>
@@ -547,6 +548,7 @@ export function DomainDetailPage() {
         <div className="flex flex-col gap-4">
           <HostnamesCard account={account.data} domain={domain} />
           <CertificateCard account={account.data} domain={domain} />
+          <MailSection username={username} zone={zone} />
           <DeleteDomainCard account={account.data} domain={domain} />
         </div>
       )}

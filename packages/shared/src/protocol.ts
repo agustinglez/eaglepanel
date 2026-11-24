@@ -43,6 +43,7 @@ import { backupOps } from "./backups";
 import { dbAdminOps } from "./dbadmin";
 import { packageOps } from "./packages";
 import { wordpressOps } from "./wordpress";
+import { mailOps } from "./mail";
 
 const ok = z.object({ ok: z.literal(true) });
 /** A full git commit: what GitHub sends in `after`. */
@@ -217,6 +218,7 @@ export const agentOps = {
   ...dbAdminOps,
   ...packageOps,
   ...wordpressOps,
+  ...mailOps,
   /** File manager. Runs as the account user; the result depends on `request.op`. */
   "files.run": {
     params: z.object({ username: usernameSchema, request: fileRequestSchema }).strict(),
@@ -319,6 +321,8 @@ export const agentOps = {
       restart: z.boolean().optional(),
       /** Server-wide webhook domain: publishes only GLOBAL_HOOK_PATH to the panel. */
       hooks: z.object({ fqdn: fqdnSchema, certZone: fqdnSchema.nullable() }).strict().nullable().optional(),
+      /** Mail names (`mail.<domain>`): on port 80 they only answer the ACME validation, proxied to MAIL_ACME_PORT. */
+      acmeHosts: z.array(fqdnSchema).default([]),
     }).strict(),
     result: z.object({ changed: z.boolean() }),
   },

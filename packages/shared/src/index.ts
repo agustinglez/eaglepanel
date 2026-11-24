@@ -5,4 +5,5 @@ export * from "./backups";
 export * from "./dbadmin";
 export * from "./packages";
 export * from "./wordpress";
+export * from "./mail";
 export * from "./i18n/index";

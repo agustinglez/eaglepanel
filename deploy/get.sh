@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # EaglePanel - downloads a release, verifies it and runs its installer. Published with every release.
 #
-#   curl -fsSL https://github.com/agustinglez/eaglepanel/releases/latest/download/get.sh | sudo bash -s -- --firewall cloudflare
+#   curl -fsSL https://eagle.agust.in | sudo bash
+#
+# eagle.agust.in redirects to this file in the latest GitHub release; the package always comes from GitHub.
 #
 # Every option goes to deploy/install.sh (see its --help). To update, the same line without options: the choices
 # made on the first run are saved. A specific version instead of the latest: ... | sudo EAGLEPANEL_VERSION=0.2.0 bash

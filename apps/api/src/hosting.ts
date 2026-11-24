@@ -38,6 +38,7 @@ import {
   type JobCreatedDto,
   type ServerSettingsDto,
   type VhostDto,
+  mailHostOf,
 } from "@eaglepanel/shared";
 import { and, asc, eq } from "drizzle-orm";
 import { Hono, type Context } from "hono";
@@ -49,7 +50,9 @@ import type { Db } from "./db";
 import { registerAppRoutes } from "./apps";
 import { createBackups } from "./backups";
 import { registerMigrationRoutes } from "./migration";
-import { accounts, appEnv, apps, certificates, databases, deployQueue, domains, hostnames, settings, vhosts } from "./db/schema";
+import { mailDomainsIn, mailReservedConflict, registerMailRoutes } from "./mail";
+import type { DnsLookup } from "./mail-dns";
+import { accounts, appEnv, apps, certificates, databases, deployQueue, domains, hostnames, mailDomains, settings, vhosts } from "./db/schema";
 import type { JobRunner, JobStep } from "./jobs";
 import type { WebhookDeps } from "./webhooks";
 
@@ -130,6 +133,8 @@ export interface HostingDeps {
   db: Db;
   agent: AgentClient;
   jobs: JobRunner;
+  /** The public DNS the mail records are checked against. Tests pass a fake one. */
+  dnsLookup?: DnsLookup;
 }
 
 async function readBody<S extends z.ZodType>(c: Context, schema: S): Promise<{ data: z.infer<S> } | { error: string }> {
@@ -137,7 +142,7 @@ async function readBody<S extends z.ZodType>(c: Context, schema: S): Promise<{ d
   return parsed.success ? { data: parsed.data } : { error: parsed.error.issues[0]?.message ?? "Invalid data" };
 }
 
-export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
+export function createHostingRoutes({ db, agent, jobs, dnsLookup }: HostingDeps) {
   const routes = new Hono();
 
   const accountRow = (username: string) => db.select().from(accounts).where(eq(accounts.username, username)).get();
@@ -240,7 +245,11 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
       return { domain, certZone, originPull: certZone !== null && certificate!.originPull, suspended: accountRow(username)?.suspended ?? false, hosts };
     });
     const domain = hooksDomain();
-    await agent.call("ols.sync", { sites, redirects, restart: options.restart, hooks: domain ? { fqdn: domain, certZone: zoneCovering(domain) } : null });
+    const acmeHosts = db.select({ domain: mailDomains.domain }).from(mailDomains).all().map((row) => mailHostOf(row.domain));
+    // The server mail name gets its certificate the same way.
+    const mailServer = await agent.call("mail.status", {}).catch(() => null);
+    if (mailServer?.hostname && !mailServer.hostname.endsWith(".invalid") && !acmeHosts.includes(mailServer.hostname)) acmeHosts.push(mailServer.hostname);
+    await agent.call("ols.sync", { sites, redirects, restart: options.restart, hooks: domain ? { fqdn: domain, certZone: zoneCovering(domain) } : null, acmeHosts });
   }
 
   async function writeSite(row: VhostRow) {
@@ -465,6 +474,7 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
     const zones = accountCerts(username).map(({ zone }) => zone);
     const dbNames = accountDatabases(username).map(({ name }) => shortDbName(username, name));
     const appsToRemove = accountApps(username);
+    const mailZones = mailDomainsIn(db, accountDomains(username).map(({ fqdn }) => fqdn));
 
     return startJob(c, "account.delete", `Delete account ${username}`, [
       {
@@ -488,9 +498,12 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
           for (const name of dbNames) await agent.call("db.delete", { username, name });
           for (const app of appsToRemove) await agent.call("app.remove", { appId: app.id, username });
           await agent.call("account.delete", { username });
+          for (const domain of mailZones) await agent.call("mail.domain.remove", { domain });
           for (const zone of zones) await agent.call("cert.remove", { zone });
           await backups.dropExportsOf(username);
           db.delete(accounts).where(eq(accounts.username, username)).run();
+          // Its mail names stop answering the certificate validation.
+          if (mailZones.length > 0) await syncSites();
         },
       },
       backups.purgeStep(username),
@@ -536,12 +549,15 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
     if (extras.length > 0) return c.json({ error: `First remove from their environments: ${extras.join(", ")}` }, 409);
 
     const certificate = certificateRow(zone);
+    const hasMail = mailDomainsIn(db, [zone]).length > 0;
     return startJob(c, "domain.delete", `Delete domain ${zone}`, [{
-      name: "Delete the domain, its subdomains and its certificate",
+      name: hasMail ? "Delete the domain, its subdomains, its mail and its certificate" : "Delete the domain, its subdomains and its certificate",
       run: async () => {
+        if (hasMail) await agent.call("mail.domain.remove", { domain: zone });
         if (certificate) await agent.call("cert.remove", { zone });
         db.delete(domains).where(eq(domains.fqdn, zone)).run();
         if (certificate) db.delete(certificates).where(eq(certificates.zone, zone)).run();
+        if (hasMail) await syncSites();
       },
     }], `${username}: ${zone}`);
   });
@@ -559,6 +575,8 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
     if (!domain) return c.json({ error: "Add its domain to the account first" }, 400);
     if (hostnameRow(fqdn)) return c.json({ error: "That subdomain already exists" }, 409);
     if (hooksDomain() === fqdn) return c.json({ error: "That domain is the server webhook domain" }, 409);
+    const reserved = mailReservedConflict(db, fqdn);
+    if (reserved) return c.json({ error: reserved }, 409);
 
     return startJob(c, "hostname.create", `Add subdomain ${fqdn}`, [dbStep("Register in the panel", () => {
       db.insert(hostnames).values({ fqdn, username, domain: domain.fqdn, createdAt: Date.now() }).run();
@@ -1186,6 +1204,7 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
   const backups = createBackups({ db, agent, jobs, writeSite, syncSites });
   registerMigrationRoutes(routes, { db, agent, jobs, writeSite, syncSites, domainConflict, requestDeploy });
   backups.register(routes, startJob);
+  const mail = registerMailRoutes(routes, { db, agent, readBody, startJob, lookup: dnsLookup, syncSites: () => syncSites() });
 
   /**
    * Once per start: if what the agent writes for every environment changed since the last time, it rewrites them all,
@@ -1218,6 +1237,6 @@ export function createHostingRoutes({ db, agent, jobs }: HostingDeps) {
     }).id;
   }
 
-  return { routes, webhookDeps, resumeDeploys, applyServerConfig, backups, accountExists: (username: string) => accountRow(username) !== undefined };
+  return { routes, webhookDeps, resumeDeploys, applyServerConfig, backups, mail, accountExists: (username: string) => accountRow(username) !== undefined };
 
 }

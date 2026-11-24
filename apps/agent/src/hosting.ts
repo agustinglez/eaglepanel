@@ -69,7 +69,7 @@ import {
 const ACCOUNT_MARKER = "eaglepanel";
 const QUOTA_FILESYSTEM = "/";
 
-type HostingOp = Exclude<AgentOpName, "system.ping" | "system.info" | `packages.${string}` | `panel.${string}` | `wordpress.${string}`>;
+type HostingOp = Exclude<AgentOpName, "system.ping" | "system.info" | `packages.${string}` | `panel.${string}` | `wordpress.${string}` | `mail.${string}`>;
 export type HostingHandlers = {
   [N in HostingOp]: (params: AgentOpParams<N>, host: Host) => Promise<AgentOpResult<N>>;
 };
@@ -201,9 +201,9 @@ async function writePanelConf(host: Host, config: string, files: Map<string, str
   await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
 }
 
-async function syncOls({ sites, restart, hooks = null, redirects = [] }: AgentOpParams<"ols.sync">, host: Host): Promise<AgentOpResult<"ols.sync">> {
+async function syncOls({ sites, restart, hooks = null, redirects = [], acmeHosts = [] }: AgentOpParams<"ols.sync">, host: Host): Promise<AgentOpResult<"ols.sync">> {
   const current = (await host.readFile(HTTPD_CONFIG)) ?? "";
-  const { block, files } = renderPanelConf(sites, hooks, redirects);
+  const { block, files } = renderPanelConf(sites, hooks, redirects, acmeHosts);
   const next = applyBlock(current, block);
   // What the current block uses, to compare, to undo, and to delete what stops being used.
   const firstLevel = await readFiles(host, includedPanelFiles(panelBlock(current), () => null));
@@ -215,7 +215,7 @@ async function syncOls({ sites, restart, hooks = null, redirects = [] }: AgentOp
   if (next === current && !filesChanged && !restart && !hooksChanged) return { changed: false };
 
   // Also before validating. Without a hooks domain the directory is deleted at the end, once OLS no longer uses it.
-  if (hooksConf || redirects.length > 0) {
+  if (hooksConf || redirects.length > 0 || acmeHosts.length > 0) {
     await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "711", "/srv/eaglepanel"]);
     await must(host, "install", ["-d", "-o", "root", "-g", "root", "-m", "755", SUSPENDED_DOC_ROOT]);
   }

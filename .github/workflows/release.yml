@@ -44,7 +44,7 @@ jobs:
           # Also under a fixed name, so releases/latest/download/eaglepanel.tar.gz always points to the newest one.
           cp "eaglepanel-$VERSION.tar.gz" eaglepanel.tar.gz
           sha256sum eaglepanel.tar.gz >eaglepanel.tar.gz.sha256
-          # The one-line installer: curl -fsSL .../releases/latest/download/get.sh | sudo bash -s -- [options]
+          # The one-line installer (eagle.agust.in redirects here): curl -fsSL .../releases/latest/download/get.sh | sudo bash -s -- [options]
           cp ../deploy/get.sh get.sh
           prerelease=()
           case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac

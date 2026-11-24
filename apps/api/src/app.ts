@@ -37,6 +37,7 @@ import { createUpdateChecker, readCurrentVersion, updateSourceFromEnv } from "./
 import { createPackageMonitor } from "./system-packages";
 import { createWordPressMonitor, WORDFENCE_KEY_SETTING } from "./wordpress";
 import type { JobRunner } from "./jobs";
+import type { DnsLookup } from "./mail-dns";
 
 const CSRF_HEADER = "x-eaglepanel";
 /** App variables (up to 200 of 32 KB) and certificates fit comfortably. */
@@ -69,6 +70,8 @@ export interface AppDeps {
   rootDir?: string;
   /** Directory the API writes its caches to (the Wordfence index). Without it, they stay in memory. */
   dataDir?: string;
+  /** The public DNS the mail records are checked against. Tests pass a fake one. */
+  dnsLookup?: DnsLookup;
 }
 
 type Env = { Variables: { admin: Admin; sessionToken: string } };
@@ -89,7 +92,7 @@ function peerAddress(c: Context): string | undefined {
   }
 }
 
-export function createApp({ db, agent, jobs, webDist, secureCookie = false, localAddresses = [], schedule = false, metricsFile, rootDir, dataDir }: AppDeps) {
+export function createApp({ db, agent, jobs, webDist, secureCookie = false, localAddresses = [], schedule = false, metricsFile, rootDir, dataDir, dnsLookup }: AppDeps) {
   const throttle = new LoginThrottle();
   const localThrottle = new LoginThrottle(LOCAL_MAX_FAILED_LOGINS);
   const app = new Hono<Env>();
@@ -354,7 +357,7 @@ export function createApp({ db, agent, jobs, webDist, secureCookie = false, loca
     });
   });
 
-  const hosting = createHostingRoutes({ db, agent, jobs });
+  const hosting = createHostingRoutes({ db, agent, jobs, dnsLookup });
   api.route("/", hosting.routes);
   const files = new Hono();
   registerFileRoutes(files, { db, agent, accountExists: (username) => hosting.accountExists(username) });
@@ -368,6 +371,7 @@ export function createApp({ db, agent, jobs, webDist, secureCookie = false, loca
   hosting.resumeDeploys();
   if (schedule) hosting.backups.startScheduler();
   if (schedule) hosting.applyServerConfig();
+  if (schedule) hosting.mail.startCertificateScheduler();
 
   api.get("/audit", (c) => {
     const rows = db.select().from(auditLog).orderBy(desc(auditLog.id)).limit(100).all();

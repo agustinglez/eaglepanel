@@ -1,4 +1,4 @@
-import { ACCOUNT_HOOK_PATH, APP_PORT, appAddresses, GLOBAL_HOOK_PATH, PANEL_API_PORT, type AgentOpParams, type LogLevel, type PhpOptions } from "@eaglepanel/shared";
+import { ACCOUNT_HOOK_PATH, APP_PORT, appAddresses, GLOBAL_HOOK_PATH, MAIL_ACME_PORT, PANEL_API_PORT, type AgentOpParams, type LogLevel, type PhpOptions } from "@eaglepanel/shared";
 
 export const LSWS = "/usr/local/lsws";
 export const HTTPD_CONFIG = `${LSWS}/conf/httpd_config.conf`;
@@ -485,6 +485,9 @@ const HOOKS_REGISTRATION_PATH = `${PANEL_CONF_DIR}/hooks.conf`;
 const redirectRegistrationPath = (domain: string) => `${PANEL_CONF_DIR}/redirects/${domain}.conf`;
 export const redirectVhostPath = (domain: string) => `${PANEL_CONF_DIR}/redirects/${domain}/vhost.conf`;
 const LISTENERS_PATH = `${PANEL_CONF_DIR}/listeners.conf`;
+const ACME_REGISTRATION_PATH = `${PANEL_CONF_DIR}/acme.conf`;
+export const ACME_VHOST_PATH = `${PANEL_CONF_DIR}/acme/vhost.conf`;
+export const ACME_VHOST = "eaglepanel-acme";
 /** Slugs have letters and digits only: the `_` keeps these names apart from any environment. */
 export const redirectVhostName = (domain: string) => `redirect_${domain}`;
 
@@ -525,6 +528,31 @@ ${rules}END_rules
 ${vhostSsl(certZone, originPull)}`;
 }
 
+/**
+ * Mail names on port 80: only the ACME validation path, proxied to lego while it validates (503 the rest of the
+ * time). Everything else is the empty directory, 404. No logs, no PHP.
+ */
+export function renderAcmeVhost(): string {
+  return `docRoot                   ${SUSPENDED_DOC_ROOT}
+
+extprocessor eaglepanel-acme {
+  type                    proxy
+  address                 127.0.0.1:${MAIL_ACME_PORT}
+  maxConns                4
+  pcKeepAliveTimeout      5
+  initTimeout             20
+  retryTimeout            0
+  respBuffer              0
+}
+
+context /.well-known/acme-challenge/ {
+  type                    proxy
+  handler                 eaglepanel-acme
+  addDefaultCharset       off
+}
+`;
+}
+
 export interface PanelConf {
   /** What goes between the marks of `httpd_config.conf`. */
   block: string;
@@ -532,7 +560,7 @@ export interface PanelConf {
   files: Map<string, string>;
 }
 
-export function renderPanelConf(sites: SyncedSite[], hooks: HooksSite | null, redirects: RedirectSite[] = []): PanelConf {
+export function renderPanelConf(sites: SyncedSite[], hooks: HooksSite | null, redirects: RedirectSite[] = [], acmeHosts: string[] = []): PanelConf {
   const sorted = [...sites].sort((a, b) => a.site.localeCompare(b.site));
   const sortedRedirects = [...redirects].sort((a, b) => a.domain.localeCompare(b.domain));
   const files = new Map<string, string>();
@@ -572,6 +600,19 @@ export function renderPanelConf(sites: SyncedSite[], hooks: HooksSite | null, re
     files.set(redirectVhostPath(redirect.domain), renderRedirectVhost(redirect));
   }
 
+  const acmeNames = [...new Set(acmeHosts)].sort();
+  if (acmeNames.length > 0) {
+    files.set(ACME_REGISTRATION_PATH, `virtualhost ${ACME_VHOST} {
+  vhRoot                  ${SUSPENDED_DOC_ROOT}
+  configFile              ${relativeToLsws(ACME_VHOST_PATH)}
+  allowSymbolLink         0
+  enableScript            0
+  restrained              1
+}
+`);
+    files.set(ACME_VHOST_PATH, renderAcmeVhost());
+  }
+
   // One line per vhost with all its names: the hostname first, then its aliases.
   const mapLine = (vhost: string, names: string[]) => `  map                     ${vhost} ${names.join(", ")}`;
   const maps = (secure: boolean) => [
@@ -583,6 +624,8 @@ export function renderPanelConf(sites: SyncedSite[], hooks: HooksSite | null, re
       return names.length > 0 ? [mapLine(redirectVhostName(redirect.domain), names)] : [];
     }),
     ...(hooks && (!secure || hooks.certZone) ? [mapLine(HOOKS_VHOST, [hooks.fqdn])] : []),
+    // Port 80 only: on 443 these names are not OLS's (mail clients connect to Stalwart, on its own ports).
+    ...(!secure && acmeNames.length > 0 ? [mapLine(ACME_VHOST, acmeNames)] : []),
   ];
 
   const listeners: string[] = [];

@@ -207,3 +207,39 @@ export const accountExports = sqliteTable("account_exports", {
   createdAt: integer("created_at").notNull(),
   expiresAt: integer("expires_at").notNull(),
 });
+
+/** A domain of an account with mail. Stalwart holds the mail itself; the panel, what exists and whose it is. */
+export const mailDomains = sqliteTable("mail_domains", {
+  domain: text("domain").primaryKey().references(() => domains.fqdn, { onDelete: "cascade" }),
+  username: text("username").notNull().references(() => accounts.username, { onDelete: "cascade" }),
+  /** Where mail to addresses that do not exist goes. Null: it is rejected. */
+  catchAll: text("catch_all"),
+  /** Let's Encrypt certificate of mail.<domain>, installed in Stalwart. Null: it has none yet. */
+  certNotAfter: integer("cert_not_after"),
+  /** Why the last attempt failed; null once one works. */
+  certError: text("cert_error"),
+  /** Last attempt, failed or not: failures wait before trying again (Let's Encrypt limits failed validations). */
+  certAttemptAt: integer("cert_attempt_at"),
+  createdAt: integer("created_at").notNull(),
+}, (table) => [index("mail_domains_username").on(table.username)]);
+
+/** The password is not stored: only Stalwart knows it, and it is shown once when generated. */
+export const mailboxes = sqliteTable("mailboxes", {
+  address: text("address").primaryKey(),
+  domain: text("domain").notNull().references(() => mailDomains.domain, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  quotaMb: integer("quota_mb").notNull(),
+  /** Other names of the same domain that deliver to this mailbox. */
+  aliases: text("aliases", { mode: "json" }).$type<string[]>().notNull().default([]),
+  passwordChangedAt: integer("password_changed_at").notNull(),
+  createdAt: integer("created_at").notNull(),
+}, (table) => [index("mailboxes_domain").on(table.domain)]);
+
+/** Addresses that only forward, to recipients inside or outside the server. */
+export const mailForwarders = sqliteTable("mail_forwarders", {
+  address: text("address").primaryKey(),
+  domain: text("domain").notNull().references(() => mailDomains.domain, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  recipients: text("recipients", { mode: "json" }).$type<string[]>().notNull(),
+  createdAt: integer("created_at").notNull(),
+}, (table) => [index("mail_forwarders_domain").on(table.domain)]);

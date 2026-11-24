@@ -639,7 +639,7 @@ export const web: Record<string, string> = {
   "Unassigned": "Sin asignar",
   "Delete domain": "Eliminar dominio",
   "Its environments have to be deleted or moved to another domain first: {{names}}.": "Primero hay que eliminar sus entornos o pasarlos a otro dominio: {{names}}.",
-  "Deletes the domain, its subdomains and its certificate. No files are deleted.": "Elimina el dominio, sus subdominios y su certificado. No se borra ningún archivo.",
+  "Deletes the domain, its subdomains, its mail and its certificate. No files are deleted.": "Elimina el dominio, sus subdominios, su correo y su certificado. No se borra ningún archivo.",
   "The domain does not exist.": "El dominio no existe.",
   "Not needed: {{name}} also answers for www.{{name}}.": "No hace falta: {{name}} responde también por www.{{name}}.",
   "The environment is unpublished and its domain is left unassigned. Its files remain in the account's home directory.": "El entorno deja de publicarse y su dominio queda sin asignar. Sus archivos quedan en la carpeta de la cuenta.",

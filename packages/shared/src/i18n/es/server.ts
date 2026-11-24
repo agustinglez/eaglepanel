@@ -455,6 +455,7 @@ export const server: Record<string, string> = {
   "It is an app: it has no files to upload over FTP": "Es una app: no tiene archivos para subir por FTP",
   "That domain already belongs to an account": "Ese dominio ya es de una cuenta",
   "Delete the domain, its subdomains and its certificate": "Eliminar el dominio, sus subdominios y su certificado",
+  "Delete the domain, its subdomains, its mail and its certificate": "Eliminar el dominio, sus subdominios, su correo y su certificado",
   "Delete domain {{zone}}": "Eliminar el dominio {{zone}}",
   "Add subdomain {{fqdn}}": "Agregar el subdominio {{fqdn}}",
   "Delete subdomain {{fqdn}}": "Eliminar el subdominio {{fqdn}}",

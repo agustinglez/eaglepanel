@@ -9,6 +9,7 @@ import { ActionFeedback, useJobAction } from "@/components/job-action";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ServerMailCard } from "@/components/server-mail";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -234,6 +235,7 @@ export function SettingsPage() {
         </CardHeader>
         <CardContent>{me?.totpEnabled ? <DisableTotp /> : <EnableTotp />}</CardContent>
       </Card>
+      <ServerMailCard />
       <BackupSettingsCard />
       <HooksDomainCard />
       <WordfenceCard />

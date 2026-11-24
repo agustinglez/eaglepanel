@@ -23,6 +23,7 @@ export function JobTracker({ jobId, onFinished }: { jobId: string; onFinished?: 
     if (!finished) return;
     void queryClient.invalidateQueries({ queryKey: ["accounts"] });
     void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+    void queryClient.invalidateQueries({ queryKey: ["mail"] });
     onFinished?.(finished);
     // Runs once per job, when it finishes.
     // eslint-disable-next-line react-hooks/exhaustive-deps

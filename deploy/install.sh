@@ -24,11 +24,15 @@
 #
 #   --firewall cloudflare  ports 80 and 443 from Cloudflare ranges only (servers behind its proxy)
 #   --firewall open        ports 80 and 443 from any source
+#                          Asked on a first installation with a terminal; without one, it is required.
 #   --panel-access private|public|tailscale|wireguard   how the panel is reached (always over HTTPS).
 #                          Without this option, it is asked when a terminal is available; otherwise, private network.
 #   --panel-ip IP          the exact IP, when there is more than one for that mode
 #   --panel-port PORT      8090 by default
 #   --admin-password-file PATH  the new admin password is written to that file (root only) instead of the screen
+#   --mail / --no-mail     install the mail server (Stalwart) or not. Asked on a first installation with a terminal;
+#                          without one, no mail. Later: eagle mail on|off
+#   --mail-hostname NAME   the server's name for mail (EHLO, PTR): mail.yourserver.com. By default, `hostname -f`
 #   --yes                  no questions: apply the plan (always the case without a terminal)
 #   Choices are saved: later runs do not need them again. To change panel access later: eagle net
 
@@ -46,6 +50,14 @@ BUN_SHA256_arm64=baa6bb36f51d6e58561e02bbea825038a9df454f673d6d776e8bbf86f8c7850
 RESTIC_VERSION=0.19.1
 RESTIC_SHA256_amd64=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
 RESTIC_SHA256_arm64=a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465
+# Mail server. Hashes: the sha256 digest GitHub publishes for each release asset.
+STALWART_VERSION=1.2.0
+STALWART_SHA256_amd64=ee79b1552acc3c89e4354405c7a716874826e4db7537a4b32c7b1677e08688c8
+STALWART_SHA256_arm64=51729601c4e3957045ec2abb556f58b418df152923065d96d13324cee5f6dd02
+# ACME client for the certificates of mail.<domain> (Let's Encrypt). The agent runs it when one is due.
+LEGO_VERSION=5.7.0
+LEGO_SHA256_amd64=ffc7f0d75810a70affffb10fc20a8db4d6dd4917f8f88cda9b54fb08c82a1967
+LEGO_SHA256_arm64=e160829c92883a198adefc055b317b2200f5e11cd2ab8ec3e44aa9d6e12c9186
 # The distribution restic works from this version on (--stdin-from-command).
 RESTIC_MIN=0.17.0
 # Repository key fingerprints: if the downloaded key does not match, nothing is installed.
@@ -76,6 +88,11 @@ FTP_CERT=/etc/ssl/private/eaglepanel-ftp.pem
 PASV_MIN=9000
 PASV_MAX=10000
 CF_IPS="$CONF_DIR/cloudflare-ips.txt"
+STALWART_CONF=/etc/stalwart
+STALWART_DATA=/var/lib/stalwart
+# `admin:<secret>`: Stalwart's administrator (STALWART_RECOVERY_ADMIN) and what the agent signs in with. Root only.
+MAIL_ADMIN="$CONF_DIR/mail-admin"
+MAIL_HTTP=127.0.0.1:8480
 KEYRINGS=/usr/share/keyrings
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
@@ -90,6 +107,9 @@ ADMIN_PASSWORD_FILE=""
 PANEL_ACCESS=""
 PANEL_IP=""
 PANEL_PORT=""
+MAIL_HOSTNAME=""
+# yes|no: whether this server runs mail. From --mail/--no-mail, the saved choice, or a question.
+MAIL=""
 NET_ONLY=0
 NET_STATUS=0
 UPGRADE=0
@@ -105,6 +125,9 @@ while [ $# -gt 0 ]; do
     --panel-access) PANEL_ACCESS="${2:-}"; shift ;;
     --panel-ip) PANEL_IP="${2:-}"; shift ;;
     --panel-port) PANEL_PORT="${2:-}"; shift ;;
+    --mail-hostname) MAIL_HOSTNAME="${2:-}"; shift ;;
+    --mail) MAIL=yes ;;
+    --no-mail) MAIL=no ;;
     # Used by `eagle net`: panel access only, on an existing installation.
     --net-only) NET_ONLY=1 ;;
     --net-status) NET_STATUS=1 ;;
@@ -232,6 +255,7 @@ preflight() {
 
   if [ "$CHECK_ONLY" -eq 0 ]; then
     FIREWALL="${FIREWALL:-$(setting FIREWALL)}"
+    if [ -z "$FIREWALL" ] && [ "$INTERACTIVE" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then ask_firewall; fi
     case "$FIREWALL" in
       cloudflare|open) ok "site firewall: $FIREWALL" ;;
       *) [ "$PLAN_ONLY" -eq 1 ] && info "site firewall: not chosen yet (--firewall cloudflare|open)" || die "--firewall cloudflare|open is required on the first installation" ;;
@@ -249,8 +273,85 @@ preflight() {
     ADMIN_USER="${ADMIN_USER:-$(setting ADMIN_USER)}"
     ADMIN_USER="${ADMIN_USER:-admin}"
     grep -qE '^[a-zA-Z0-9._-]{3,64}$' <<<"$ADMIN_USER" || die "invalid admin username: $ADMIN_USER"
+    choose_mail
   fi
 }
+
+# Whether this server runs mail. Servers that already have it keep it; a new one is asked (no, without a terminal).
+choose_mail() {
+  [ -n "$MAIL" ] || MAIL="$(setting MAIL)"
+  if [ -z "$MAIL" ]; then
+    if systemctl is-enabled --quiet stalwart 2>/dev/null; then MAIL=yes
+    elif [ "$INTERACTIVE" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && [ ! -f "$SETTINGS" ]; then ask_mail
+    else MAIL=no; fi
+  fi
+  case "$MAIL" in yes|no) ;; *) die "invalid saved mail choice: $MAIL (use --mail or --no-mail)" ;; esac
+  # Kept even with mail off: turning it back on keeps its name.
+  MAIL_HOSTNAME="${MAIL_HOSTNAME:-$(setting MAIL_HOSTNAME)}"
+  if [ "$MAIL" = no ]; then
+    ok "mail: not installed$( [ "$PLAN_ONLY" -eq 1 ] || echo " (to add it later: eagle mail on)")"
+    return 0
+  fi
+  MAIL_HOSTNAME="$(tr '[:upper:]' '[:lower:]' <<<"${MAIL_HOSTNAME:-$(hostname -f 2>/dev/null || hostname)}")"
+  if ! mail_fqdn "$MAIL_HOSTNAME" && [ "$INTERACTIVE" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then ask_mail_hostname; fi
+  if ! mail_fqdn "$MAIL_HOSTNAME"; then
+    # It has to be a real name for mail to be accepted elsewhere, but not having one must not stop an update.
+    info "WARNING: the server has no full name ($MAIL_HOSTNAME): mail greets as ${MAIL_HOSTNAME%%.*}.invalid until you set one in Settings > Server mail"
+    MAIL_HOSTNAME="$(tr -cd 'a-z0-9-' <<<"${MAIL_HOSTNAME%%.*}").invalid"
+  fi
+  ok "mail: Stalwart, as $MAIL_HOSTNAME"
+}
+
+# ---------------------------------------------------------------------------- First-installation questions
+# Only with someone at the terminal (through /dev/tty: stdin is /dev/null) and without --yes. Each one has its flag.
+ask_tty() { local answer; printf '%s' "$1" >/dev/tty; read -r answer </dev/tty || answer=""; printf '%s' "$answer"; }
+
+ask_firewall() {
+  local answer
+  printf '\n  How do visitors reach the sites?\n' >/dev/tty
+  printf '    1) Through Cloudflare (proxied, orange cloud): ports 80 and 443 only from Cloudflare\n' >/dev/tty
+  printf '    2) Directly: ports 80 and 443 open to anyone\n' >/dev/tty
+  while :; do
+    answer="$(ask_tty '  Option [1]: ')"
+    case "${answer:-1}" in
+      1) FIREWALL=cloudflare; return ;;
+      2) FIREWALL=open; return ;;
+      *) printf '  Choose 1 or 2.\n' >/dev/tty ;;
+    esac
+  done
+}
+
+ask_mail() {
+  local answer
+  printf '\n  Mail server (Stalwart): mailboxes, forwarders and catch-all for the domains of the accounts.\n' >/dev/tty
+  printf '  It uses about 150 MB of RAM and opens ports 25, 465, 587 and 993. It can be added later: eagle mail on\n' >/dev/tty
+  while :; do
+    answer="$(ask_tty '  Install it? [y/N]: ')"
+    case "$answer" in
+      y|Y|yes|Yes) MAIL=yes; return ;;
+      ""|n|N|no|No) MAIL=no; return ;;
+      *) printf '  Answer y or n.\n' >/dev/tty ;;
+    esac
+  done
+}
+
+ask_mail_hostname() {
+  local answer
+  printf '\n  The server name for mail is what other servers see (and what its IP reverse DNS must point to).\n' >/dev/tty
+  printf '  This server is called %s, which is not a full name.\n' "$MAIL_HOSTNAME" >/dev/tty
+  while :; do
+    answer="$(ask_tty '  Mail name, like mail.yourdomain.com (empty: set it later in Settings): ')"
+    answer="$(tr '[:upper:]' '[:lower:]' <<<"$answer")"
+    [ -z "$answer" ] && return
+    if mail_fqdn "$answer"; then MAIL_HOSTNAME="$answer"; return; fi
+    printf '  That is not a valid name.\n' >/dev/tty
+  done
+}
+
+valid_fqdn() { grep -qE '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$' <<<"$1"; }
+# A name other mail servers can resolve: not one of the suffixes only a local network uses (hostname -f often gives
+# them: vps1.localdomain), nor the placeholder .invalid.
+mail_fqdn() { valid_fqdn "$1" && ! grep -qE '\.(localdomain|localhost|local|lan|internal|home|intranet|corp|private|invalid)$' <<<"$1"; }
 
 save_settings() {
   install -d -m 755 "$CONF_DIR"
@@ -262,6 +363,8 @@ ADMIN_USER=$ADMIN_USER
 PANEL_ACCESS=$PANEL_ACCESS
 PANEL_ADDRESS=$PANEL_ADDRESS
 PANEL_PORT=$PANEL_PORT
+MAIL=$MAIL
+MAIL_HOSTNAME=$MAIL_HOSTNAME
 EOF
 }
 
@@ -569,6 +672,32 @@ plan_tools() {
   else plan_row "Bun" "not installed" "install $BUN_VERSION in /usr/local/bin"; fi
 }
 
+plan_mail() {
+  local svc now=() changes="" manual="" current=""
+  [ -x /usr/local/bin/stalwart ] && current="$(/usr/local/bin/stalwart --version 2>/dev/null | awk '{ print $NF }' | tr -d v || true)"
+  if [ "$MAIL" != yes ]; then
+    if systemctl is-enabled --quiet stalwart 2>/dev/null; then
+      plan_row "Mail (Stalwart)" "$current" "stop and disable it, close its ports (mailboxes and data stay in $STALWART_DATA)"
+    else
+      plan_row "Mail (Stalwart)" "${current:-not installed}" "skip (optional: eagle mail on)"
+    fi
+    return 0
+  fi
+  # Another mail server on port 25 would keep the mail: Stalwart takes its place.
+  for svc in postfix exim4 sendmail; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null || systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+      now+=("$svc running")
+      changes+="stop and disable $svc: Stalwart receives and sends the server's mail on port 25$NL"
+      manual+="systemctl disable --now $svc$NL"
+    fi
+  done
+  if [ -n "$changes" ]; then
+    plan_row "Mail (Stalwart)" "$(joined "${now[@]}")" "stop it and install Stalwart $STALWART_VERSION (details below)"
+    review mail "Another mail server is running" "$changes" "mail it keeps in its queue or mailboxes is not moved to Stalwart$NL" "$manual"
+  elif [ "$current" = "$STALWART_VERSION" ]; then plan_row "Mail (Stalwart)" "$current" "use it"
+  else plan_row "Mail (Stalwart)" "${current:-not installed}" "install $STALWART_VERSION: ports 25, 465, 587 and 993"; fi
+}
+
 plan_firewall() {
   local ports web changes="" notes="" manual="" wan rules=/etc/ufw/before.rules line closed
   ports="$(ssh_ports | paste -sd, -)"
@@ -578,7 +707,7 @@ plan_firewall() {
     *) web="80/443 (choose with --firewall cloudflare|open)" ;;
   esac
   if ! command -v ufw >/dev/null || ! ufw status 2>/dev/null | grep -q "Status: active"; then
-    plan_row "Firewall (ufw)" "$(command -v ufw >/dev/null && echo inactive || echo "not installed")" "enable: SSH ($ports), FTP and $web; the rest closed"
+    plan_row "Firewall (ufw)" "$(command -v ufw >/dev/null && echo inactive || echo "not installed")" "enable: SSH ($ports), FTP, $([ "$MAIL" = yes ] && echo "mail, ")and $web; the rest closed"
     # MySQL, Redis, Memcached and the OLS WebAdmin are moved to 127.0.0.1 before the firewall step; the panel port is its own.
     closed="$(ufw_would_close "$(ssh_ports)" "3306 33060 6379 11211 7080 8088 ${PANEL_PORT:-8090} $(setting PANEL_PORT)" | paste -sd' ' -)"
     if [ -n "$closed" ]; then
@@ -591,6 +720,10 @@ plan_firewall() {
   if ! ufw status | grep -q 'EaglePanel FTP'; then
     changes+="allow FTP: 21/tcp and the passive ports $PASV_MIN-$PASV_MAX/tcp$NL"
     manual+="ufw allow 21/tcp comment 'EaglePanel FTP'${NL}ufw allow $PASV_MIN:$PASV_MAX/tcp comment 'EaglePanel FTP pasivo'$NL"
+  fi
+  if [ "$MAIL" = yes ] && ! ufw status | grep -q 'EaglePanel mail'; then
+    changes+="allow mail from anywhere: 25, 465, 587 and 993/tcp$NL"
+    manual+="ufw allow 25,465,587,993/tcp comment 'EaglePanel mail'$NL"
   fi
   if [ "$FIREWALL" = cloudflare ] && ! ufw status | grep -q 'EaglePanel Cloudflare'; then
     changes+="allow 80/443 from each Cloudflare range$NL"
@@ -645,6 +778,7 @@ installation_plan() {
   plan_ftp
   plan_apps
   plan_tools
+  plan_mail
   plan_firewall
   print_plan
   if [ ${#BLOCKERS[@]} -gt 0 ]; then
@@ -1054,6 +1188,136 @@ tools() {
   fi
 }
 
+# ---------------------------------------------------------------------------- Mail
+stalwart_unit() {
+  cat <<EOF
+# Generated by EaglePanel. Do not edit by hand.
+[Unit]
+Description=Stalwart mail server (EaglePanel)
+After=network-online.target
+Wants=network-online.target
+Conflicts=postfix.service exim4.service sendmail.service
+
+[Service]
+User=stalwart
+Group=stalwart
+# The administrator the panel signs in with. Without it Stalwart has none: it only has mail accounts.
+EnvironmentFile=$STALWART_CONF/stalwart.env
+ExecStart=/usr/local/bin/stalwart --config $STALWART_CONF/config.json
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=$STALWART_DATA
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+mail_jmap_ok() {
+  [ "$(curl -s -m 3 -o /dev/null -w '%{http_code}' -u "$(cat "$MAIL_ADMIN")" "http://$MAIL_HTTP/jmap/session" 2>/dev/null || true)" = "200" ]
+}
+
+wait_mail_jmap() {
+  local tries=0
+  until mail_jmap_ok || [ "$tries" -ge 60 ]; do tries=$((tries + 1)); sleep 1; done
+  mail_jmap_ok
+}
+
+mail_server() {
+  if [ "$MAIL" != yes ]; then
+    # Turned off: the service stops, its data stays. eagle mail on brings it back as it was.
+    if systemctl is-enabled --quiet stalwart 2>/dev/null || systemctl is-active --quiet stalwart 2>/dev/null; then
+      step "Mail (off)"
+      systemctl disable --now stalwart >/dev/null 2>&1 || true
+      ok "Stalwart stopped and disabled; its data stays in $STALWART_DATA (eagle mail on to turn it back on)"
+    fi
+    return 0
+  fi
+  step "Mail (Stalwart $STALWART_VERSION)"
+  local current="" svc
+  [ -x /usr/local/bin/stalwart ] && current="$(/usr/local/bin/stalwart --version 2>/dev/null | awk '{ print $NF }' | tr -d v || true)"
+  if [ "$current" != "$STALWART_VERSION" ]; then
+    local sha_var="STALWART_SHA256_$ARCH" asset tmp
+    asset="stalwart-$([ "$ARCH" = amd64 ] && echo x86_64 || echo aarch64)-unknown-linux-gnu.tar.gz"
+    tmp="$(mktemp -d)"
+    download "https://github.com/stalwartlabs/stalwart/releases/download/v${STALWART_VERSION}/$asset" "${!sha_var}" "$tmp/stalwart.tar.gz"
+    tar -xzf "$tmp/stalwart.tar.gz" -C "$tmp" stalwart
+    install -m 755 "$tmp/stalwart" /usr/local/bin/stalwart.new && mv -f /usr/local/bin/stalwart.new /usr/local/bin/stalwart
+    rm -rf "$tmp"
+  fi
+  local lego_current=""
+  [ -x /usr/local/bin/lego ] && lego_current="$(/usr/local/bin/lego --version 2>/dev/null | awk '{ print $3 }' || true)"
+  if [ "$lego_current" != "$LEGO_VERSION" ]; then
+    local lego_sha="LEGO_SHA256_$ARCH" lego_tmp
+    lego_tmp="$(mktemp -d)"
+    download "https://github.com/go-acme/lego/releases/download/v${LEGO_VERSION}/lego_v${LEGO_VERSION}_linux_${ARCH}.tar.gz" "${!lego_sha}" "$lego_tmp/lego.tar.gz"
+    tar -xzf "$lego_tmp/lego.tar.gz" -C "$lego_tmp" lego
+    install -m 755 "$lego_tmp/lego" /usr/local/bin/lego.new && mv -f /usr/local/bin/lego.new /usr/local/bin/lego
+    rm -rf "$lego_tmp"
+  fi
+  install -d -o root -g root -m 700 /var/lib/eaglepanel/acme
+  for svc in postfix exim4 sendmail; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null || systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+      systemctl disable --now "$svc" >/dev/null 2>&1 || true
+      info "stopped $svc: Stalwart takes port 25"
+    fi
+  done
+  id stalwart >/dev/null 2>&1 || useradd --system --home-dir "$STALWART_DATA" --no-create-home --shell /usr/sbin/nologin stalwart
+  install -d -o stalwart -g stalwart -m 700 "$STALWART_DATA"
+  install -d -o root -g stalwart -m 750 "$STALWART_CONF"
+  # Only the data store lives in the file: everything else is in the database, managed by the panel.
+  write_file "$STALWART_CONF/config.json" 640 <<EOF || true
+{"@type":"RocksDb","path":"$STALWART_DATA/"}
+EOF
+  chgrp stalwart "$STALWART_CONF/config.json"
+  if [ ! -s "$MAIL_ADMIN" ]; then
+    install -d -m 755 "$CONF_DIR"
+    (umask 077; printf 'admin:%s\n' "$(openssl rand -base64 33 | tr -d '/+=\n' | cut -c1-40)" >"$MAIL_ADMIN")
+  fi
+  chmod 600 "$MAIL_ADMIN"
+  local env_changed=0 unit_changed=0
+  write_file "$STALWART_CONF/stalwart.env" 600 <<EOF && env_changed=1 || true
+# Generated by EaglePanel. Do not edit by hand.
+STALWART_RECOVERY_ADMIN=$(cat "$MAIL_ADMIN")
+EOF
+  stalwart_unit | write_file /etc/systemd/system/stalwart.service 644 && unit_changed=1 || true
+  [ "$unit_changed" -eq 1 ] && systemctl daemon-reload
+
+  # Without listeners declared, Stalwart's first normal start would create its defaults (HTTP on 443 and 8080,
+  # where OLS is): the first configuration is done in recovery mode, which only opens the HTTP listener on loopback.
+  local code=0
+  if ! systemctl is-active --quiet stalwart; then
+    systemctl stop stalwart-setup 2>/dev/null || true
+    systemctl reset-failed stalwart-setup 2>/dev/null || true
+    systemd-run --quiet --unit stalwart-setup --uid stalwart --gid stalwart \
+      -p EnvironmentFile="$STALWART_CONF/stalwart.env" -p AmbientCapabilities=CAP_NET_BIND_SERVICE \
+      -E STALWART_RECOVERY_MODE=1 -E STALWART_RECOVERY_MODE_PORT="${MAIL_HTTP##*:}" -E STALWART_RECOVERY_MODE_BIND="${MAIL_HTTP%%:*}" \
+      /usr/local/bin/stalwart --config "$STALWART_CONF/config.json"
+    wait_mail_jmap || { systemctl stop stalwart-setup 2>/dev/null || true; die "Stalwart did not start (journalctl -u stalwart-setup)"; }
+    /usr/local/bin/bun "$HERE/stalwart-setup.ts" --url "http://$MAIL_HTTP" --admin-file "$MAIL_ADMIN" --hostname "$MAIL_HOSTNAME" || code=$?
+    systemctl stop stalwart-setup
+    [ "$code" -eq 0 ] || [ "$code" -eq 10 ] || die "Stalwart could not be configured"
+    systemctl enable --now stalwart >/dev/null 2>&1
+  else
+    [ "$env_changed" -eq 1 ] || [ "$unit_changed" -eq 1 ] || [ "$current" != "$STALWART_VERSION" ] && systemctl restart stalwart
+    wait_mail_jmap || die "Stalwart does not answer (journalctl -u stalwart)"
+    /usr/local/bin/bun "$HERE/stalwart-setup.ts" --url "http://$MAIL_HTTP" --admin-file "$MAIL_ADMIN" --hostname "$MAIL_HOSTNAME" || code=$?
+    [ "$code" -eq 0 ] || [ "$code" -eq 10 ] || die "Stalwart could not be configured"
+    [ "$code" -eq 10 ] && systemctl restart stalwart
+  fi
+  systemctl enable stalwart >/dev/null 2>&1
+  wait_mail_jmap || die "Stalwart does not answer (journalctl -u stalwart)"
+  ok "Stalwart $STALWART_VERSION: $MAIL_HOSTNAME, ports 25, 465, 587 and 993"
+  ok "lego $LEGO_VERSION: certificates of mail.<domain>"
+}
+
 # ---------------------------------------------------------------------------- Firewall
 firewall() {
   step "Firewall (ufw)"
@@ -1069,6 +1333,16 @@ firewall() {
   backup /etc/ufw/user6.rules
   ufw allow 21/tcp comment 'EaglePanel FTP' >/dev/null
   ufw allow "$PASV_MIN:$PASV_MAX/tcp" comment 'EaglePanel FTP pasivo' >/dev/null
+  # Mail cannot go through Cloudflare: these are open to anyone, whatever --firewall says.
+  if [ "$MAIL" = yes ]; then
+    ufw allow 25,465,587,993/tcp comment 'EaglePanel mail' >/dev/null
+  else
+    local mail_rule
+    while ufw status numbered | grep -q "EaglePanel mail"; do
+      mail_rule="$(ufw status numbered | grep "EaglePanel mail" | sed -n 1p | sed -E 's/^\[ *([0-9]+)\].*/\1/')"
+      ufw --force delete "$mail_rule" >/dev/null
+    done
+  fi
 
   # Sites: only the panel's own rules (with their comment) are added or removed. Others are not touched.
   local wanted=() rule
@@ -1135,7 +1409,7 @@ firewall() {
   else
     ufw reload >/dev/null || { cp -a "$BACKUPS/$STAMP$rules" "$rules" 2>/dev/null; ufw reload >/dev/null || true; die "ufw rejected the rules: before.rules was restored"; }
   fi
-  ok "ufw enabled: $([ "$active" -eq 0 ] && echo "SSH ($ports), ")FTP and 80/443 $([ "$FIREWALL" = cloudflare ] && echo "from Cloudflare only" || echo "open")"
+  ok "ufw enabled: $([ "$active" -eq 0 ] && echo "SSH ($ports), ")FTP, $([ "$MAIL" = yes ] && echo "mail, ")80/443 $([ "$FIREWALL" = cloudflare ] && echo "from Cloudflare only" || echo "open")"
 }
 
 # ---------------------------------------------------------------------------- Panel access
@@ -1651,10 +1925,10 @@ verify() {
   systemctl is-active --quiet lshttpd && ok "OpenLiteSpeed running" || bad "OpenLiteSpeed stopped"
   grep -qE '^useIpInProxyHeader[[:space:]]+2' "$OLS_CONF" 2>/dev/null && ok "OLS takes the real IP from Cloudflare only" || bad "OLS without useIpInProxyHeader 2"
   ss -ulnH | grep -qE ':443[[:space:]]' && bad "QUIC open on UDP 443" || ok "no QUIC"
-  if grep -qE "(\*|0\.0\.0\.0|\[::\]):(8088|7080|3306|33060|6379|11211|8090)[[:space:]]" <<<"$listening"; then
-    bad "an internal service is exposed to the network: $(grep -E "(\*|0\.0\.0\.0|\[::\]):(8088|7080|3306|33060|6379|11211|8090)[[:space:]]" <<<"$listening" | awk '{ print $4 }' | paste -sd' ' -)"
+  if grep -qE "(\*|0\.0\.0\.0|\[::\]):(8088|7080|3306|33060|6379|11211|8090|8480)[[:space:]]" <<<"$listening"; then
+    bad "an internal service is exposed to the network: $(grep -E "(\*|0\.0\.0\.0|\[::\]):(8088|7080|3306|33060|6379|11211|8090|8480)[[:space:]]" <<<"$listening" | awk '{ print $4 }' | paste -sd' ' -)"
   else
-    ok "MySQL, the OLS WebAdmin and the internal panel API are not exposed"
+    ok "MySQL, the OLS WebAdmin, the mail administration and the internal panel API are not exposed"
   fi
   "$LSWS/lsphp$PHP_VERSION/bin/php" -m 2>/dev/null | grep -qx redis && ok "lsphp$PHP_VERSION with redis, memcached and mysqli" || bad "lsphp$PHP_VERSION is missing its extensions"
   mysql --protocol=socket -uroot -N -e 'SELECT 1' >/dev/null 2>&1 && ok "MySQL responds" || bad "MySQL does not respond"
@@ -1662,6 +1936,19 @@ verify() {
   systemctl is-active --quiet vsftpd && ok "vsftpd running" || bad "vsftpd stopped"
   command -v inotifywait >/dev/null && ok "inotifywait (.htaccess changes)" || bad "inotifywait is missing: .htaccess changes need a manual OLS restart"
   command -v restic >/dev/null && ok "restic $(restic version | awk '{ print $2 }')" || bad "restic is missing"
+  local mail_on="${MAIL:-$(setting MAIL)}"
+  # Servers installed before mail was optional have no saved choice: they have mail if Stalwart is enabled.
+  [ -n "$mail_on" ] || { systemctl is-enabled --quiet stalwart 2>/dev/null && mail_on=yes || mail_on=no; }
+  if [ "$mail_on" = yes ]; then
+    systemctl is-active --quiet stalwart && ok "Stalwart (mail) running" || bad "Stalwart (mail) stopped"
+    [ -x /usr/local/bin/lego ] && ok "lego $(/usr/local/bin/lego --version | awk '{ print $3 }')" || bad "lego is missing: mail certificates cannot be issued"
+    [ -f "$MAIL_ADMIN" ] && [ "$(stat -c %a "$MAIL_ADMIN")" = 600 ] && ok "the mail administrator is readable by root only" || bad "$MAIL_ADMIN is missing or readable by others"
+    for port in 25 465 587 993; do
+      grep -qE ":$port[[:space:]]" <<<"$listening" || bad "nothing listens on port $port (mail)"
+    done
+  else
+    systemctl is-active --quiet stalwart && bad "Stalwart is running but mail is off (eagle mail off)" || ok "mail: not installed"
+  fi
   ufw status | grep -q "Status: active" && ok "ufw enabled" || bad "ufw disabled"
   local ping='{"op":"system.ping","params":{}}'
   curl -s -m 5 --unix-socket /run/eaglepanel/agent.sock -H 'content-type: application/json' -d "$ping" http://agent/op 2>/dev/null | grep -q '"sandbox":false' && ok "the agent responds" || bad "the agent does not respond"
@@ -1769,6 +2056,7 @@ main() {
   ftp_server
   apps_runtime
   tools
+  mail_server
   firewall
   panel
   verify

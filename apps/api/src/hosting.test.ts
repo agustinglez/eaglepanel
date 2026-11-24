@@ -656,12 +656,14 @@ describe("delete account", () => {
     expect((await get("/accounts/acme")).status).toBe(200);
   });
 
-  test("deletes the account and leaves OLS without public ports", async () => {
+  test("deletes the account and leaves OLS with port 80 only for the server mail name", async () => {
     expect((await runJob("/accounts/acme/delete", { confirm: "acme" })).status).toBe("succeeded");
     expect((await get("/accounts/acme")).status).toBe(404);
     expect(removedVhost("examplecom")).toBe(true);
     const config = await httpd();
-    expect(config).not.toContain("*:80");
+    expect(config).not.toContain("*:443");
+    expect(config).not.toContain("examplecom");
+    expect(config).toContain("map                     eaglepanel-acme mail.sandbox.test");
     expect(config).toContain("listener Default{");
   });
 
