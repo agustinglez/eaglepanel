@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { DEFAULT_MAILBOX_QUOTA_MB, MAIL_INSTALL_COMMAND, type DnsRecordDto, type DnsRecordState, type ForwarderDto, type JobCreatedDto, type MailboxDto, type MailCertificateDto, type MailDomainDto } from "@eaglepanel/shared";
+import { DEFAULT_MAILBOX_QUOTA_MB, MAIL_INSTALL_COMMAND, type DnsRecordDto, type DnsRecordState, type ForwarderDto, type JobCreatedDto, type MailboxDto, type MailCertificateDto, type MailDomainDto, type MailImportScanDto } from "@eaglepanel/shared";
 import { EllipsisVerticalIcon, RefreshCwIcon } from "lucide-react";
 import { useState, type SyntheticEvent } from "react";
 import { useTranslation } from "react-i18next";
@@ -8,6 +8,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -55,6 +56,7 @@ export function MailSection({ username, zone }: { username: string; zone: string
       <DnsCard username={username} zone={zone} data={data} />
       <ClientSettingsCard base={base} data={data} />
       <CatchAllCard base={base} data={data} />
+      <ImportCard username={username} zone={zone} base={base} data={data} />
       <DisableMailCard base={base} zone={zone} />
     </>
   );
@@ -529,6 +531,184 @@ function CatchAllCard({ base, data }: { base: string; data: MailDomainDto }) {
         <ActionFeedback action={save} />
       </CardContent>
     </Card>
+  );
+}
+
+/** Mail from the previous server: a cPanel backup uploaded to the account, or an IMAP copy of one mailbox. */
+function ImportCard({ username, zone, base, data }: { username: string; zone: string; base: string; data: MailDomainDto }) {
+  const { t } = useTranslation();
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t("Import mail")}</CardTitle>
+        <CardDescription>{t("Bring the mail from the previous server. It can be run again: what is already here is not duplicated, so a last run after changing the MX brings what arrived in between.")}</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-8">
+        <BackupImport username={username} zone={zone} base={base} />
+        <ImapImport base={base} data={data} />
+      </CardContent>
+    </Card>
+  );
+}
+
+function BackupImport({ username, zone, base }: { username: string; zone: string; base: string }) {
+  const { t } = useTranslation();
+  const [path, setPath] = useState("");
+  const [skipped, setSkipped] = useState<Set<string>>(new Set());
+  const scanQuery = useQuery({
+    queryKey: [...mailQueryKey(username, zone), "import"],
+    queryFn: () => api.get<{ scan: MailImportScanDto | null }>(`${base}/import`),
+  });
+  const scanAction = useJobAction((value: string) => api.post<JobCreatedDto>(`${base}/import/scan`, { path: value }));
+  const importAction = useJobAction((names: string[]) => api.post<JobCreatedDto>(`${base}/import/backup`, { mailboxes: names }));
+  const discard = useJobAction(async () => ({ ...(await api.post<{ ok: true }>(`${base}/import/discard`)), jobId: null }));
+  const scan = scanQuery.data?.scan ?? null;
+  const chosen = scan ? scan.mailboxes.filter((box) => !skipped.has(box.name)).map((box) => box.name) : [];
+
+  function submit(event: SyntheticEvent) {
+    event.preventDefault();
+    setSkipped(new Set());
+    scanAction.mutate(path.trim());
+  }
+
+  return (
+    <section className="flex flex-col gap-3">
+      <h3 className="font-medium">{t("From a cPanel backup")}</h3>
+      <p className="text-sm text-muted-foreground">
+        {t("Upload the full cPanel backup (backup-….tar.gz) to this account with the file manager or by FTP, or a folder with its mail, and give its path inside the account. Only the mail of {{domain}} is read from it. Mailboxes that do not exist here are created with the same password and quota they had in cPanel.", { domain: zone })}
+      </p>
+      <form onSubmit={submit} className="flex flex-col gap-2 sm:flex-row sm:items-end">
+        <div className="grid flex-1 gap-2">
+          <Label htmlFor="import-path">{t("Path in the account")}</Label>
+          <Input id="import-path" value={path} onChange={(event) => setPath(event.target.value)} placeholder="backup-11.24.2026_10-00-00_user.tar.gz" spellCheck={false} />
+        </div>
+        <Button type="submit" variant="outline" disabled={scanAction.isPending || path.trim() === ""}>{t("Look for mailboxes")}</Button>
+      </form>
+      <ActionFeedback action={scanAction} />
+
+      {scan && (
+        <div className="flex flex-col gap-3">
+          <p className="text-sm text-muted-foreground">{t("Found in {{path}}:", { path: scan.path })}</p>
+          {scan.mailboxes.length === 0 ? (
+            <p className="text-sm">{t("No mailboxes of {{domain}} in that backup.", { domain: zone })}</p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-8" />
+                  <TableHead>{t("Mailbox")}</TableHead>
+                  <TableHead className="text-right">{t("Messages")}</TableHead>
+                  <TableHead className="text-right">{t("Size")}</TableHead>
+                  <TableHead>{t("Password")}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {scan.mailboxes.map((box) => (
+                  <TableRow key={box.name}>
+                    <TableCell>
+                      <Checkbox
+                        checked={!skipped.has(box.name)}
+                        onCheckedChange={(on) => setSkipped((current) => {
+                          const next = new Set(current);
+                          if (on) next.delete(box.name);
+                          else next.add(box.name);
+                          return next;
+                        })}
+                      />
+                    </TableCell>
+                    <TableCell className="font-medium">{box.name}@{zone}</TableCell>
+                    <TableCell className="text-right tabular-nums">{box.messages}</TableCell>
+                    <TableCell className="text-right tabular-nums">{formatBytes(box.bytes)}</TableCell>
+                    <TableCell>
+                      {box.exists
+                        ? <Badge variant="outline">{t("Already here: keeps its own")}</Badge>
+                        : box.passwordHash
+                          ? <Badge variant="secondary">{t("Same as in cPanel")}</Badge>
+                          : <Badge variant="outline">{t("New: regenerate it after")}</Badge>}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button disabled={importAction.isPending || chosen.length === 0} onClick={() => importAction.mutate(chosen)}>
+              {t("Import {{count}} mailboxes", { count: chosen.length })}
+            </Button>
+            <Button variant="ghost" disabled={discard.isPending} onClick={() => discard.mutate()}>{t("Discard")}</Button>
+          </div>
+          <ActionFeedback action={importAction} />
+          <ActionFeedback action={discard} />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ImapImport({ base, data }: { base: string; data: MailDomainDto }) {
+  const { t } = useTranslation();
+  const [mailbox, setMailbox] = useState(data.mailboxes[0]?.name ?? "");
+  const [host, setHost] = useState("");
+  const [port, setPort] = useState("993");
+  const [user, setUser] = useState("");
+  const [password, setPassword] = useState("");
+  const [verify, setVerify] = useState(true);
+  const copy = useJobAction((input: { name: string; host: string; port: number; user: string; password: string; verify: boolean }) => {
+    const { name, ...source } = input;
+    return api.post<JobCreatedDto>(`${base}/mailboxes/${name}/import`, source);
+  });
+
+  function submit(event: SyntheticEvent) {
+    event.preventDefault();
+    copy.mutate({ name: mailbox, host: host.trim(), port: Number(port) || 993, user: user.trim(), password, verify });
+    setPassword("");
+  }
+
+  return (
+    <section className="flex flex-col gap-3">
+      <h3 className="font-medium">{t("From another server (IMAP)")}</h3>
+      <p className="text-sm text-muted-foreground">
+        {t("Copies every folder of a mailbox of the previous server into one here, as long as it still answers. The password is used for the copy and is not stored.")}
+      </p>
+      {data.mailboxes.length === 0 ? (
+        <p className="text-sm">{t("Create the mailbox here first.")}</p>
+      ) : (
+        <form onSubmit={submit} className="grid gap-3 sm:grid-cols-2">
+          <div className="grid gap-2">
+            <Label htmlFor="imap-mailbox">{t("Into")}</Label>
+            <select id="imap-mailbox" className="h-9 rounded-md border bg-transparent px-3 text-sm" value={mailbox} onChange={(event) => setMailbox(event.target.value)}>
+              {data.mailboxes.map((box) => <option key={box.name} value={box.name}>{box.address}</option>)}
+            </select>
+          </div>
+          <div className="grid grid-cols-[1fr_6rem] gap-2">
+            <div className="grid gap-2">
+              <Label htmlFor="imap-host">{t("Server")}</Label>
+              <Input id="imap-host" value={host} onChange={(event) => setHost(event.target.value)} placeholder="mail.oldserver.com" spellCheck={false} required />
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="imap-port">{t("Port")}</Label>
+              <Input id="imap-port" inputMode="numeric" value={port} onChange={(event) => setPort(event.target.value)} />
+            </div>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="imap-user">{t("User")}</Label>
+            <Input id="imap-user" value={user} onChange={(event) => setUser(event.target.value)} placeholder="name@domain.com" spellCheck={false} autoComplete="off" required />
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="imap-password">{t("Password")}</Label>
+            <Input id="imap-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" required />
+          </div>
+          <label className="flex items-center gap-2 text-sm sm:col-span-2">
+            <Checkbox checked={verify} onCheckedChange={(on) => setVerify(on === true)} />
+            {t("Check the server certificate (turn it off only for an IP or a self-signed certificate)")}
+          </label>
+          <div className="sm:col-span-2">
+            <Button type="submit" variant="outline" disabled={copy.isPending || !mailbox || !host.trim() || !user.trim() || !password}>{t("Copy")}</Button>
+          </div>
+        </form>
+      )}
+      <ActionFeedback action={copy} />
+    </section>
   );
 }
 

@@ -1,10 +1,44 @@
 import { z } from "zod";
-import { fqdnSchema, generatedSecretSchema } from "./validators";
+import { fqdnSchema, generatedSecretSchema, usernameSchema } from "./validators";
 
 /**
  * Mail runs on Stalwart, one instance per server. The agent manages it through its JMAP administration API on
  * loopback; the panel keeps what each account has (domains with mail, mailboxes, forwarders) in its own database.
  */
+
+/** Identifies a cPanel backup being imported: its extracted copy on the server. */
+export const mailImportIdSchema = z.string().regex(/^[a-f0-9]{32}$/);
+/** Where the backup is, inside the account's home directory: a backup file or a folder. */
+export const mailImportPathSchema = z.string().trim().min(1, "Give the path of the backup").max(1024)
+  .refine((value) => !/[\u0000\r\n]/.test(value) && !value.split("/").includes(".."), "Invalid path");
+/** The old server: a name or an IP, its IMAP port with TLS, and its user and password (never stored). */
+export const imapSourceSchema = z.object({
+  host: z.string().trim().min(1).max(253).regex(/^[A-Za-z0-9.:-]+$/, "Invalid server"),
+  port: z.number().int().min(1).max(65535).default(993),
+  user: z.string().min(1).max(320),
+  password: z.string().min(1).max(512),
+  verify: z.boolean().default(true),
+}).strict();
+export const mailImportCursorSchema = z.object({ folder: z.number().int().min(0), position: z.number().int().min(0) }).strict();
+
+export interface ScannedMailboxDto {
+  name: string;
+  messages: number;
+  bytes: number;
+  /** Its quota in cPanel; null: unlimited or not in the backup. */
+  quotaBytes: number | null;
+  /** The backup has its password (hash): it keeps it. */
+  passwordHash: boolean;
+  /** It already exists here: its messages are added, the password is not touched. */
+  exists: boolean;
+}
+
+/** A cPanel backup read for a domain: what it has, before importing. */
+export interface MailImportScanDto {
+  importId: string;
+  path: string;
+  mailboxes: ScannedMailboxDto[];
+}
 
 /** The part before the @. Lowercase only: Stalwart and every client compare addresses that way. */
 export const mailLocalPartSchema = z
@@ -125,6 +159,35 @@ export const mailOps = {
       quotaMb: mailQuotaMbSchema,
       aliases: z.array(mailLocalPartSchema).max(MAX_MAILBOX_ALIASES),
     }).strict(),
+    result: ok,
+  },
+  /** Extracts the domain's mail from a cPanel backup in the account (or reads a folder in place) and lists its mailboxes. */
+  "mail.import.scan": {
+    params: z.object({ username: usernameSchema, path: mailImportPathSchema, domain: fqdnSchema, importId: mailImportIdSchema }).strict(),
+    result: z.object({
+      mailboxes: z.array(z.object({ name: z.string(), messages: z.number(), bytes: z.number(), quotaBytes: z.number().nullable(), passwordHash: z.boolean() })),
+    }),
+  },
+  /** Creates a mailbox of the backup with its cPanel password (its hash), or with `password` if the backup has none. */
+  "mail.import.account": {
+    params: z.object({ importId: mailImportIdSchema, domain: fqdnSchema, name: z.string().min(1).max(64), quotaMb: z.number().int().min(10), password: generatedSecretSchema }).strict(),
+    result: z.object({ passwordKept: z.boolean() }),
+  },
+  /** One stretch of the copy (a couple of minutes at most): call again with the cursor until `done`. */
+  "mail.import.run": {
+    params: z.object({
+      domain: fqdnSchema,
+      name: z.string().min(1).max(64),
+      source: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("backup"), importId: mailImportIdSchema }).strict(),
+        imapSourceSchema.extend({ kind: z.literal("imap") }).strict(),
+      ]),
+      cursor: mailImportCursorSchema,
+    }).strict(),
+    result: z.object({ done: z.boolean(), cursor: mailImportCursorSchema, imported: z.number(), skipped: z.number() }),
+  },
+  "mail.import.discard": {
+    params: z.object({ importId: mailImportIdSchema }).strict(),
     result: ok,
   },
   "mail.mailbox.remove": {

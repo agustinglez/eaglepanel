@@ -1,6 +1,6 @@
-import { DEFAULT_LIMITS, type AccountDto, type AgentOpName, type JobDto, type MailDomainDto, type ServerMailDto } from "@eaglepanel/shared";
+import { DEFAULT_LIMITS, type AccountDto, type AgentOpName, type JobDto, type MailDomainDto, type MailImportScanDto, type ServerMailDto } from "@eaglepanel/shared";
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dispatch } from "../../agent/src/dispatch";
@@ -327,6 +327,62 @@ describe("certificate of mail.<domain>", () => {
     expect(callsTo("mail.cert.issue")).toHaveLength(1);
     expect((await runJob(certPath)).status).toBe("succeeded");
     expect((await mail()).certificate).toMatchObject({ state: "valid", error: null });
+  });
+});
+
+describe("importing mail", () => {
+  const importState = async () => ((await (await app.request(`/api${MAIL}/import`, { headers: { cookie } })).json()) as { scan: MailImportScanDto | null }).scan;
+
+  /** A cPanel home in the account: two mailboxes, one of them with its password hash. */
+  function cpanelFolder() {
+    const home = host.resolvePath("/home/acme/old/homedir");
+    for (const [name, file] of [["info", "1.M1.host!2,S"], ["ventas", "2.M2.host!2,"]] as const) {
+      mkdirSync(join(home, "mail", "example.com", name, "cur"), { recursive: true });
+      writeFileSync(join(home, "mail", "example.com", name, "cur", file), "Message-ID: <x@old>\r\n\r\nhi\r\n");
+    }
+    mkdirSync(join(home, "etc", "example.com"), { recursive: true });
+    writeFileSync(join(home, "etc", "example.com", "shadow"), "info:$6$salt$hash:1\n");
+    writeFileSync(join(home, "etc", "example.com", "quota"), "info:2147483648\n");
+  }
+
+  test("reads the backup, imports the chosen mailboxes with their cPanel quota and drops the copy", async () => {
+    await runJob(`${MAIL}/enable`);
+    cpanelFolder();
+    expect((await runJob(`${MAIL}/import/scan`, { path: "old" })).status).toBe("succeeded");
+    const scan = await importState();
+    expect(scan?.mailboxes.map(({ name, messages, passwordHash, exists }) => ({ name, messages, passwordHash, exists }))).toEqual([
+      { name: "info", messages: 1, passwordHash: true, exists: false },
+      { name: "ventas", messages: 1, passwordHash: false, exists: false },
+    ]);
+
+    expect((await runJob(`${MAIL}/import/backup`, { mailboxes: ["info"] })).status).toBe("succeeded");
+    const mail = (await (await app.request(`/api${MAIL}`, { headers: { cookie } })).json()) as MailDomainDto;
+    expect(mail.mailboxes.map(({ name, quotaMb }) => ({ name, quotaMb }))).toEqual([{ name: "info", quotaMb: 2048 }]);
+    expect(callsTo("mail.import.account")).toMatchObject([{ domain: "example.com", name: "info", quotaMb: 2048 }]);
+    expect(callsTo("mail.import.run")).toMatchObject([{ name: "info", source: { kind: "backup" } }]);
+    expect(await importState()).toBeNull();
+  });
+
+  test("paths outside the account and addresses already in use are refused", async () => {
+    await runJob(`${MAIL}/enable`);
+    expect((await post(`${MAIL}/import/scan`, { path: "../otra" })).status).toBe(400);
+    expect((await post(`${MAIL}/import/backup`, { mailboxes: ["info"] })).status).toBe(409);
+    cpanelFolder();
+    await runJob(`${MAIL}/forwarders`, { name: "ventas", recipients: ["a@b.com"] });
+    await runJob(`${MAIL}/import/scan`, { path: "old" });
+    const refused = await post(`${MAIL}/import/backup`, { mailboxes: ["ventas"] });
+    expect(refused.status).toBe(409);
+    expect(((await refused.json()) as { error: string }).error).toContain("ventas@example.com");
+  });
+
+  test("an IMAP copy goes into an existing mailbox, and its password is not kept in the job", async () => {
+    await runJob(`${MAIL}/enable`);
+    await runJob(`${MAIL}/mailboxes`, { name: "info" });
+    const job = await runJob(`${MAIL}/mailboxes/info/import`, { host: "mail.old.test", user: "info@example.com", password: "old-secret" });
+    expect(job.status).toBe("succeeded");
+    expect(callsTo("mail.import.run")).toMatchObject([{ name: "info", source: { kind: "imap", host: "mail.old.test", port: 993, verify: true } }]);
+    expect(JSON.stringify(job)).not.toContain("old-secret");
+    expect((await post(`${MAIL}/mailboxes/nadie/import`, { host: "x", user: "u", password: "p" })).status).toBe(404);
   });
 });
 

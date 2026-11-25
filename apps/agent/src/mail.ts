@@ -2,6 +2,7 @@ import { MAIL_HTTP_PORT, mailHostOf, type AgentOpParams, type AgentOpResult, typ
 import type { Host } from "./host";
 import { connect } from "node:net";
 import { forgetCertificate, INSTALL_CONF, obtainCertificate } from "./mail-cert";
+import { backupPasswordHash, discardImport, importFromBackup, importFromImap, jmapSink, scanBackup, type MailboxSink } from "./mail-import";
 import { ROUNDCUBE_CONFIG_DIR, ROUNDCUBE_DIR } from "./ols";
 
 /** Mail servers of large providers, always up: if none answers on port 25, the provider blocks it. */
@@ -115,7 +116,8 @@ export function createJmap(host: Host, fetcher: Fetcher = fetch) {
 
 export type Jmap = ReturnType<typeof createJmap>;
 
-export function createMailHandlers(jmapFor: (host: Host) => Jmap) {
+/** `sinkFor` writes into a mailbox (JMAP as that mailbox): replaceable in tests. */
+export function createMailHandlers(jmapFor: (host: Host) => Jmap, sinkFor: (host: Host, address: string) => Promise<MailboxSink> = jmapSink) {
   async function domainId(jmap: Jmap, domain: string): Promise<string | null> {
     const found = await jmap.get<{ name: string }>("x:Domain", await jmap.ids("x:Domain", { name: domain }), ["name"]);
     return found.find((row) => row.name === domain)?.id ?? null;
@@ -331,6 +333,35 @@ export function createMailHandlers(jmapFor: (host: Host) => Jmap) {
         if (!password) throw new Error(`${name}@${domain} does not exist: a password is needed to create it`);
         await jmap.set("x:Account", { create: { a: { "@type": "User", name, domainId: id, ...value } } });
       }
+      return { ok: true };
+    },
+
+    "mail.import.scan": async (params: AgentOpParams<"mail.import.scan">, host: Host): Promise<AgentOpResult<"mail.import.scan">> => {
+      return { mailboxes: await scanBackup(host, params) };
+    },
+
+    "mail.import.account": async ({ importId, domain, name, quotaMb, password }: AgentOpParams<"mail.import.account">, host: Host): Promise<AgentOpResult<"mail.import.account">> => {
+      const hash = await backupPasswordHash(host, importId, domain, name);
+      if (host.sandbox) return { passwordKept: hash !== null };
+      const jmap = jmapFor(host);
+      const id = await requireDomain(jmap, domain);
+      if ((await accountsOf(jmap, id)).some((row) => row.name === name)) return { passwordKept: false };
+      await jmap.set("x:Account", { create: { a: {
+        "@type": "User", name, domainId: id, quotas: { maxDiskQuota: quotaMb * MB }, aliases: {},
+        credentials: { "0": { "@type": "Password", secret: hash ?? password } },
+      } } });
+      return { passwordKept: hash !== null };
+    },
+
+    "mail.import.run": async ({ domain, name, source, cursor }: AgentOpParams<"mail.import.run">, host: Host): Promise<AgentOpResult<"mail.import.run">> => {
+      if (host.sandbox) return { done: true, cursor, imported: 0, skipped: 0 };
+      const sink = await sinkFor(host, `${name}@${domain}`);
+      if (source.kind === "backup") return importFromBackup(host, sink, { importId: source.importId, domain, name, cursor });
+      return importFromImap(sink, source, cursor);
+    },
+
+    "mail.import.discard": async ({ importId }: AgentOpParams<"mail.import.discard">, host: Host): Promise<AgentOpResult<"mail.import.discard">> => {
+      await discardImport(host, importId);
       return { ok: true };
     },
 

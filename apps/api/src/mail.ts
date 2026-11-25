@@ -6,13 +6,18 @@ import {
   MAX_FORWARDER_RECIPIENTS,
   emailAddressSchema,
   fqdnSchema,
+  imapSourceSchema,
   isMailReserved,
   mailLocalPartSchema,
+  mailImportPathSchema,
   mailQuotaMbSchema,
   webmailHostOf,
+  type AgentOpParams,
   type DnsRecordDto,
   type MailCertificateDto,
   type MailDomainDto,
+  type MailImportScanDto,
+  type ScannedMailboxDto,
   type ServerMailDto,
   type WebmailDto,
 } from "@eaglepanel/shared";
@@ -21,6 +26,7 @@ import type { Context, Hono } from "hono";
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import type { AgentClient } from "./agent-client";
+import { audit } from "./audit";
 import type { Db } from "./db";
 import { certificates, domains, hostnames, mailDomains, mailForwarders, mailboxes, settings } from "./db/schema";
 import type { JobStep } from "./jobs";
@@ -582,6 +588,124 @@ export function registerMailRoutes(routes: Hono, { db, agent, readBody, startJob
         db.delete(mailForwarders).where(eq(mailForwarders.address, forwarder.address)).run();
       },
     }], `${found.username}: ${forwarder.address}`);
+  });
+
+  // ---------------------------------------------------------------- Importing mail from another server
+  /** The cPanel backup read for each domain, until it is imported or discarded. Lost on restart: read it again. */
+  const scans = new Map<string, { importId: string; username: string; path: string; mailboxes: Omit<ScannedMailboxDto, "exists">[] }>();
+
+  /** Calls the agent until the copy is complete: each call is a couple of minutes at most. */
+  async function copyAll(zone: string, name: string, source: AgentOpParams<"mail.import.run">["source"]): Promise<{ imported: number; skipped: number }> {
+    let cursor = { folder: 0, position: 0 };
+    let imported = 0;
+    let skipped = 0;
+    for (;;) {
+      const result = await agent.call("mail.import.run", { domain: zone, name, source, cursor });
+      imported += result.imported;
+      skipped += result.skipped;
+      cursor = result.cursor;
+      if (result.done) return { imported, skipped };
+    }
+  }
+
+  async function discardScan(zone: string) {
+    const scan = scans.get(zone);
+    scans.delete(zone);
+    if (scan) await agent.call("mail.import.discard", { importId: scan.importId });
+  }
+
+  routes.get("/accounts/:username/domains/:zone/mail/import", (c) => {
+    const found = target(c);
+    if (!found) return c.json({ error: "Not found" }, 404);
+    const scan = scans.get(found.zone);
+    if (!scan || scan.username !== found.username) return c.json({ scan: null });
+    const existing = new Set(mailboxRows(found.zone).map((row) => row.name));
+    const dto: MailImportScanDto = { importId: scan.importId, path: scan.path, mailboxes: scan.mailboxes.map((box) => ({ ...box, exists: existing.has(box.name) })) };
+    return c.json({ scan: dto });
+  });
+
+  routes.post("/accounts/:username/domains/:zone/mail/import/scan", async (c) => {
+    const found = target(c);
+    if (!found) return c.json({ error: "Not found" }, 404);
+    const body = await readBody(c, z.object({ path: mailImportPathSchema }).strict());
+    if ("error" in body) return c.json({ error: body.error }, 400);
+    const { username, zone } = found;
+    const { path } = body.data;
+    const importId = randomBytes(16).toString("hex");
+    return startJob(c, "mail.import.scan", `Read the cPanel backup ${path}`, [{
+      name: `Look for the mail of ${zone}`,
+      run: async () => {
+        await discardScan(zone);
+        const { mailboxes: found } = await agent.call("mail.import.scan", { username, path, domain: zone, importId });
+        scans.set(zone, { importId, username, path, mailboxes: found });
+      },
+      compensate: async () => {
+        await agent.call("mail.import.discard", { importId });
+      },
+    }], `${username}: ${zone} from ${path}`);
+  });
+
+  routes.post("/accounts/:username/domains/:zone/mail/import/discard", async (c) => {
+    const found = target(c);
+    if (!found) return c.json({ error: "Not found" }, 404);
+    await discardScan(found.zone);
+    return c.json({ ok: true });
+  });
+
+  routes.post("/accounts/:username/domains/:zone/mail/import/backup", async (c) => {
+    const found = target(c);
+    if (!found) return c.json({ error: "Not found" }, 404);
+    const { username, zone } = found;
+    const scan = scans.get(zone);
+    if (!scan || scan.username !== username) return c.json({ error: "Read the backup first" }, 409);
+    const body = await readBody(c, z.object({ mailboxes: z.array(mailLocalPartSchema).min(1).max(1000) }).strict());
+    if ("error" in body) return c.json({ error: body.error }, 400);
+    const chosen = scan.mailboxes.filter((box) => body.data.mailboxes.includes(box.name));
+    if (chosen.length === 0) return c.json({ error: "None of those mailboxes is in the backup" }, 400);
+    for (const box of chosen) {
+      const owner = addressOwner(zone, box.name);
+      // A mailbox with that name gets the messages; a forwarder or an alias with it cannot.
+      if (owner && !mailboxRow(zone, box.name)) {
+        return c.json({ error: `${box.name}@${zone} is already used by ${owner === `${box.name}@${zone}` ? "a forwarder" : owner}` }, 409);
+      }
+    }
+    const { importId } = scan;
+    const steps: JobStep[] = chosen.map((box) => {
+      const address = `${box.name}@${zone}`;
+      return {
+        name: `Import ${address} (${box.messages} messages)`,
+        run: async () => {
+          if (!mailboxRow(zone, box.name)) {
+            // Room for what it brings, and at least what it had in cPanel.
+            const needed = Math.ceil((box.bytes * 1.2) / (1024 * 1024)) + 50;
+            const quotaMb = Math.max(box.quotaBytes ? Math.ceil(box.quotaBytes / (1024 * 1024)) : DEFAULT_MAILBOX_QUOTA_MB, needed, 10);
+            await agent.call("mail.import.account", { importId, domain: zone, name: box.name, quotaMb, password: generateSecret() });
+            const now = Date.now();
+            db.insert(mailboxes).values({ address, domain: zone, name: box.name, quotaMb, aliases: [], passwordChangedAt: now, createdAt: now }).run();
+          }
+          const counts = await copyAll(zone, box.name, { kind: "backup", importId });
+          audit(db, "mail.import", `${address} from the cPanel backup ${scan.path}: ${counts.imported} imported, ${counts.skipped} already there or skipped`);
+        },
+      };
+    });
+    steps.push({ name: "Delete the extracted copy", run: () => discardScan(zone) });
+    return startJob(c, "mail.import.backup", `Import mail of ${zone} from the cPanel backup`, steps, `${username}: ${chosen.map((box) => box.name).join(", ")}`);
+  });
+
+  routes.post("/accounts/:username/domains/:zone/mail/mailboxes/:name/import", async (c) => {
+    const found = target(c);
+    const box = found && mailboxRow(found.zone, c.req.param("name"));
+    if (!found || !box) return c.json({ error: "Not found" }, 404);
+    const body = await readBody(c, imapSourceSchema);
+    if ("error" in body) return c.json({ error: body.error }, 400);
+    const source = { kind: "imap" as const, ...body.data };
+    return startJob(c, "mail.import.imap", `Copy mail into ${box.address}`, [{
+      name: `Copy ${source.user} from ${source.host}`,
+      run: async () => {
+        const counts = await copyAll(found.zone, box.name, source);
+        audit(db, "mail.import", `${box.address} from ${source.user} at ${source.host}: ${counts.imported} copied, ${counts.skipped} already there or skipped`);
+      },
+    }], `${found.username}: ${box.address} from ${source.host}`);
   });
 
   return {
