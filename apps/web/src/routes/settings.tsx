@@ -1,6 +1,6 @@
 import { BackupSettingsCard } from "@/components/backups";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { GLOBAL_HOOK_PATH, type JobCreatedDto, type MeDto, type ServerSettingsDto, type WordPressSettingsDto } from "@eaglepanel/shared";
+import { GLOBAL_HOOK_PATH, type JobCreatedDto, type MeDto, type MysqlSettingsDto, type ServerSettingsDto, type WordPressSettingsDto } from "@eaglepanel/shared";
 import { QRCodeSVG } from "qrcode.react";
 import { useState, type SyntheticEvent } from "react";
 import { useTranslation } from "react-i18next";
@@ -164,6 +164,38 @@ function HooksDomainForm({ saved }: { saved: string | null }) {
   );
 }
 
+/** MySQL's performance_schema: off by default; on only while a slow database is being looked into. */
+function MysqlCard() {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const current = useQuery({ queryKey: ["mysql-settings"], queryFn: () => api.get<MysqlSettingsDto>("/settings/mysql") });
+  const change = useJobAction((enabled: boolean) => api.post<JobCreatedDto>("/settings/mysql", { performanceSchema: enabled }));
+  const data = current.data;
+  const on = data?.running ?? data?.configured ?? false;
+
+  return (
+    <Card className="max-w-3xl">
+      <CardHeader>
+        <CardTitle>{t("MySQL diagnostics")}</CardTitle>
+        <CardDescription>
+          {t("performance_schema records which queries run, how long they take and what they wait for. It reserves a few hundred MB of RAM, so it is off: turn it on to look into a slow database, and off again when done.")}
+        </CardDescription>
+        {data && <CardAction><Badge variant={on ? "default" : "outline"}>{data.running === null ? t("MySQL is not answering") : on ? t("On") : t("Off")}</Badge></CardAction>}
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        {data?.memoryMb != null && <p className="text-sm text-muted-foreground">{t("MySQL uses {{mb}} MB of RAM now.", { mb: data.memoryMb })}</p>}
+        <div>
+          <Button variant="outline" disabled={!data || data.running === null || change.isPending} onClick={() => change.mutate(!on)}>
+            {on ? t("Turn off") : t("Turn on")}
+          </Button>
+        </div>
+        <p className="text-sm text-muted-foreground">{t("Changing it restarts MySQL: sites are a few seconds without their databases.")}</p>
+        <ActionFeedback action={change} onFinished={() => void queryClient.invalidateQueries({ queryKey: ["mysql-settings"] })} />
+      </CardContent>
+    </Card>
+  );
+}
+
 /** Wordfence Intelligence API key for the WordPress monitor. It is never sent back to the browser. */
 function WordfenceCard() {
   const { t } = useTranslation();
@@ -239,6 +271,7 @@ export function SettingsPage() {
       <BackupSettingsCard />
       <HooksDomainCard />
       <WordfenceCard />
+      <MysqlCard />
     </Page>
   );
 }

@@ -36,6 +36,7 @@ import {
   type DomainDto,
   type HostnameMode,
   type JobCreatedDto,
+  type MysqlSettingsDto,
   type ServerSettingsDto,
   type VhostDto,
   mailHostOf,
@@ -1168,6 +1169,24 @@ export function createHostingRoutes({ db, agent, jobs, dnsLookup }: HostingDeps)
   });
 
   routes.get("/settings/server", (c) => c.json({ hooksDomain: hooksDomain() } satisfies ServerSettingsDto));
+
+  routes.get("/settings/mysql", async (c) => {
+    const state = await agent.call("mysql.diagnostics.get", {}).catch(() => ({ running: null, configured: false, memoryMb: null }));
+    return c.json(state satisfies MysqlSettingsDto);
+  });
+
+  // Restarts MySQL: every site is a few seconds without its database.
+  routes.post("/settings/mysql", async (c) => {
+    const body = await readBody(c, z.object({ performanceSchema: z.boolean() }).strict());
+    if ("error" in body) return c.json({ error: body.error }, 400);
+    const enabled = body.data.performanceSchema;
+    return startJob(c, "mysql.diagnostics", `${enabled ? "Turn on" : "Turn off"} MySQL performance_schema`, [{
+      name: "Restart MySQL with the new setting",
+      run: async () => {
+        await agent.call("mysql.diagnostics.set", { enabled });
+      },
+    }], enabled ? "on" : "off");
+  });
 
   const serverSettingsSchema = z.object({ hooksDomain: fqdnSchema.nullable() }).strict();
 

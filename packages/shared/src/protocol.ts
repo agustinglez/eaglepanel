@@ -214,6 +214,19 @@ export const agentOps = {
     params: z.object({ username: usernameSchema }).strict(),
     result: ok,
   },
+  /**
+   * MySQL's performance_schema (its internal statistics: queries, waits, memory). Off by default: it reserves a few
+   * hundred MB that a hosting server does not use. `running` is what MySQL has now, `configured` what it starts with.
+   */
+  "mysql.diagnostics.get": {
+    params: z.object({}).strict(),
+    result: z.object({ running: z.boolean().nullable(), configured: z.boolean(), memoryMb: z.number().nullable() }),
+  },
+  /** Writes the setting and restarts MySQL (a few seconds without databases). */
+  "mysql.diagnostics.set": {
+    params: z.object({ enabled: z.boolean() }).strict(),
+    result: z.object({ running: z.boolean().nullable(), configured: z.boolean(), memoryMb: z.number().nullable() }),
+  },
   ...backupOps,
   ...dbAdminOps,
   ...packageOps,
@@ -511,6 +524,13 @@ export interface AccountDto {
 }
 
 /** Server settings. */
+/** Settings › MySQL: whether performance_schema runs (null: MySQL is not answering) and what MySQL uses now. */
+export interface MysqlSettingsDto {
+  running: boolean | null;
+  configured: boolean;
+  memoryMb: number | null;
+}
+
 export interface ServerSettingsDto {
   /** Server-wide webhook domain: one URL for every app on the server. */
   hooksDomain: string | null;
