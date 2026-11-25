@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { dispatch } from "./dispatch";
 import type { CommandResult, Host, RunOptions } from "./host";
-import { applyBlock, CERTS_DIR, firstConfigError, HTTPD_CONFIG, includedPanelFiles, PANEL_CONF_DIR, redirectVhostPath, renderPanelConf, renderRedirectVhost, renderVhost, type HooksSite, type RedirectSite, type SyncedSite } from "./ols";
+import { applyBlock, CERTS_DIR, firstConfigError, HTTPD_CONFIG, includedPanelFiles, listenerIsOpen, PANEL_CONF_DIR, redirectVhostPath, renderPanelConf, renderRedirectVhost, renderVhost, type HooksSite, type RedirectSite, type SyncedSite } from "./ols";
 
 const fixture = (name: string) => readFileSync(join(import.meta.dir, "testdata", name), "utf8");
 
@@ -297,6 +297,42 @@ describe("OLS configuration", () => {
     expect(vhost).toContain("address                 127.0.0.1:8402");
     expect(vhost).not.toContain("errorlog");
     expect(renderPanelConf([https], null).files.has(`${PANEL_CONF_DIR}/acme.conf`)).toBe(false);
+  });
+
+  test("with IPv6 each listener gets a twin on [ANY] with the same maps", () => {
+    const text = [...renderPanelConf([https], null, [], ["mail.a.com"], true).files.values()].join("\n");
+    for (const [name, port] of [["eaglepanel-http", 80], ["eaglepanel-https", 443]] as const) {
+      const v4 = listener(text, `${name} `);
+      const v6 = listener(text, `${name}-v6 `);
+      expect(v4).toContain(`address                 *:${port}\n`);
+      expect(v6).toContain(`address                 [ANY]:${port}\n`);
+      expect(v6.split("\n").slice(2)).toEqual(v4.split("\n").slice(2));
+    }
+    expect([...renderPanelConf([https], null).files.values()].join("\n")).not.toContain("[ANY]");
+  });
+
+  test("a listener is open only on its own family", () => {
+    expect(listenerIsOpen("*:80", "0.0.0.0:80")).toBe(true);
+    expect(listenerIsOpen("*:80", "*:80")).toBe(false);
+    expect(listenerIsOpen("[ANY]:80", "*:80")).toBe(true);
+    expect(listenerIsOpen("[ANY]:80", "[::]:80")).toBe(true);
+    expect(listenerIsOpen("[ANY]:80", "0.0.0.0:80")).toBe(false);
+    expect(listenerIsOpen("[ANY]:443", "[::]:80")).toBe(false);
+    expect(listenerIsOpen("127.0.0.1:8088", "127.0.0.1:8088")).toBe(true);
+  });
+
+  test("the public IPv6 is the global one it goes out from", async () => {
+    const routes = (v6: string) => new (class extends FakeHost {
+      override async run(_command: string, args: string[]) {
+        const stdout = args[0] === "-6" ? v6 : "1.1.1.1 via 203.0.113.1 dev ens3 src 203.0.113.5 uid 0\n";
+        return { code: v6 === "" && args[0] === "-6" ? 2 : 0, stdout, stderr: "" };
+      }
+    })();
+    const ipOf = async (v6: string) => (await call(routes(v6), "system.publicIp", {})) as { result: { ip: string; ip6: string | null } };
+    expect((await ipOf("2606:4700:4700::1111 from :: via fe80::1 dev ens3 src 2001:DB8:1::F32D metric 1024 pref medium\n")).result)
+      .toEqual({ ip: "203.0.113.5", ip6: "2001:db8:1::f32d" });
+    expect((await ipOf("")).result.ip6).toBeNull(); // no IPv6 route
+    expect((await ipOf("2606:4700:4700::1111 via fe80::1 dev eth0 src fd00::5 metric 1024\n")).result.ip6).toBeNull(); // ULA
   });
 
   test("the vhosts are included before the listeners that map to them", () => {

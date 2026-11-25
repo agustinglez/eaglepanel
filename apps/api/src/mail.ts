@@ -21,7 +21,7 @@ import type { AgentClient } from "./agent-client";
 import type { Db } from "./db";
 import { domains, hostnames, mailDomains, mailForwarders, mailboxes, settings } from "./db/schema";
 import type { JobStep } from "./jobs";
-import { checkPtr, checkRecords, expectedRecords, mailHostOf, publicLookup, serverRecords, type DnsLookup } from "./mail-dns";
+import { checkPtr, checkRecords, expectedRecords, mailHostOf, publicLookup, sameAddress, serverRecords, type DnsLookup } from "./mail-dns";
 
 const catchAllSchema = z.object({ address: emailAddressSchema.nullable() }).strict();
 const createMailboxSchema = z.object({ name: mailLocalPartSchema, quotaMb: mailQuotaMbSchema.default(DEFAULT_MAILBOX_QUOTA_MB) }).strict();
@@ -114,14 +114,19 @@ export function registerMailRoutes(routes: Hono, { db, agent, readBody, startJob
   const certificateDue = (state: { notAfter: number | null }) => state.notAfter === null || state.notAfter - Date.now() < MAIL_CERT_RENEW_DAYS * DAY;
   const recentlyFailed = (state: CertificateState) => state.error !== null && state.attemptAt !== null && Date.now() - state.attemptAt < CERT_RETRY_MS;
 
-  const publicIp = () => agent.call("system.publicIp", {}).then(({ ip }) => ip).catch(() => null);
+  const publicIps = () => agent.call("system.publicIp", {}).catch(() => ({ ip: null, ip6: null }));
 
-  /** The validation connects to the address of the name: it has to be this server's. */
+  /**
+   * The validation connects to the address of the name: it has to be this server's. An AAAA elsewhere would be tried
+   * first, so it has to be this server's too, or not be there.
+   */
   async function pointsHere(name: string): Promise<boolean> {
-    const ip = await publicIp();
-    if (!ip) return false;
-    const found = await (ip.includes(":") ? lookup.aaaa(name) : lookup.a(name)).catch(() => [] as string[]);
-    return found.includes(ip);
+    const { ip, ip6 } = await publicIps();
+    if (!ip && !ip6) return false;
+    const [a, aaaa] = await Promise.all([lookup.a(name), lookup.aaaa(name)].map((query) => query.catch(() => [] as string[])));
+    const matches = (found: string[], own: string | null) => own !== null && found.some((value) => sameAddress(value, own));
+    if (aaaa!.length > 0 && !matches(aaaa!, ip6)) return false;
+    return matches(a!, ip) || matches(aaaa!, ip6);
   }
 
   function queueCertificate(key: string, task: () => Promise<void>): Promise<void> {
@@ -210,25 +215,32 @@ export function registerMailRoutes(routes: Hono, { db, agent, readBody, startJob
   }
 
   // ---------------------------------------------------------------- Server mail (Settings)
-  let serverCache: { at: number; records: DnsRecordDto[]; ptr: ServerMailDto["ptr"] } | null = null;
+  let serverCache: { at: number; records: DnsRecordDto[]; ptrs: ServerMailDto["ptrs"] } | null = null;
   let outboundCache: { at: number; port25: boolean } | null = null;
 
   async function toServerMailDto(refresh: boolean): Promise<ServerMailDto> {
     const status = await agent.call("mail.status", {}).catch(() => null);
     const hostname = status?.hostname ?? null;
     const named = hostname !== null && !hostname.endsWith(".invalid");
-    const ip = await publicIp();
+    const { ip, ip6 } = await publicIps();
     const empty: ServerMailDto = {
-      installed: status?.installed ?? false, running: status?.running ?? false, hostname, named, ip,
-      records: [], ptr: { state: "unknown", found: [] }, port25: "unknown", checkedAt: null,
+      installed: status?.installed ?? false, running: status?.running ?? false, hostname, named, ip, ip6,
+      records: [], ptrs: [], port25: "unknown", checkedAt: null,
       certificate: certificateDto(SERVER_CERT, serverCertificate(hostname), false),
     };
     if (!status?.running || !named) return empty;
 
-    const expected = serverRecords(hostname, ip);
+    const expected = serverRecords(hostname, ip, ip6);
     const stale = !serverCache || refresh || Date.now() - serverCache.at > DNS_CACHE_MS
       || serverCache.records.length !== expected.length || serverCache.records.some((record, index) => record.value !== expected[index]!.value || record.name !== expected[index]!.name);
-    if (stale) serverCache = { at: Date.now(), records: await checkRecords(expected, lookup), ptr: ip ? await checkPtr(ip, hostname, lookup) : { state: "unknown", found: [] } };
+    if (stale) {
+      const ips = [ip, ip6].filter((value): value is string => value !== null);
+      const [records, ptrs] = await Promise.all([
+        checkRecords(expected, lookup),
+        Promise.all(ips.map(async (value) => ({ ip: value, ...(await checkPtr(value, hostname, lookup)) }))),
+      ]);
+      serverCache = { at: Date.now(), records, ptrs };
+    }
     if (!outboundCache || refresh || Date.now() - outboundCache.at > OUTBOUND_CACHE_MS) {
       const result = await agent.call("mail.server.outbound", {}).catch(() => null);
       outboundCache = result ? { at: Date.now(), port25: result.port25 } : null;
@@ -238,7 +250,7 @@ export function registerMailRoutes(routes: Hono, { db, agent, readBody, startJob
     return {
       ...empty,
       records: serverCache!.records,
-      ptr: serverCache!.ptr,
+      ptrs: serverCache!.ptrs,
       port25: outboundCache ? (outboundCache.port25 ? "open" : "blocked") : "unknown",
       checkedAt: serverCache!.at,
       certificate: certificateDto(SERVER_CERT, serverCertificate(hostname), pointed),
@@ -305,10 +317,10 @@ export function registerMailRoutes(routes: Hono, { db, agent, readBody, startJob
     } catch (error) {
       serverError = error instanceof Error ? error.message : "The mail server is not answering";
     }
-    const ip = await agent.call("system.publicIp", {}).then(({ ip }) => ip).catch(() => null);
+    const { ip, ip6 } = await publicIps();
 
     let cached = dnsCache.get(zone);
-    const expected = expectedRecords(zone, ip, dkim);
+    const expected = expectedRecords(zone, ip, dkim, ip6);
     const stale = !cached || refresh || Date.now() - cached.at > DNS_CACHE_MS
       || cached.records.length !== expected.length || cached.records.some((record, index) => record.value !== expected[index]!.value);
     if (stale) {

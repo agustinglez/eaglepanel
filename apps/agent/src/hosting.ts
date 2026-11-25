@@ -24,7 +24,7 @@ import {
   panelBlock,
   renderPanelConf,
   keyPath,
-  listenerPort,
+  listenerIsOpen,
   logrotatePath,
   LSWS,
   ORIGIN_PULL_CA_PATH,
@@ -134,8 +134,8 @@ export async function stopOlsFully(host: Host, { attempts = 90, delayMs = 500 } 
 /** Checks the actual result: a port that is still open stays exposed even if it is no longer in the configuration. */
 async function assertNotListening(host: Host, addresses: string[]): Promise<void> {
   const { stdout } = await must(host, "ss", ["-tlnH"]);
-  const open = new Set(stdout.split("\n").map((line) => line.trim().split(/\s+/)[3] ?? "").map(listenerPort));
-  const still = addresses.filter((address) => open.has(listenerPort(address)));
+  const open = stdout.split("\n").map((line) => line.trim().split(/\s+/)[3] ?? "").filter(Boolean);
+  const still = addresses.filter((address) => open.some((local) => listenerIsOpen(address, local)));
   if (still.length > 0) throw new Error(`OpenLiteSpeed is still listening on ${still.join(", ")} after being stopped`);
 }
 
@@ -203,7 +203,9 @@ async function writePanelConf(host: Host, config: string, files: Map<string, str
 
 async function syncOls({ sites, restart, hooks = null, redirects = [], acmeHosts = [] }: AgentOpParams<"ols.sync">, host: Host): Promise<AgentOpResult<"ols.sync">> {
   const current = (await host.readFile(HTTPD_CONFIG)) ?? "";
-  const { block, files } = renderPanelConf(sites, hooks, redirects, acmeHosts);
+  // Without IPv6 in the kernel, a listener on [ANY] would not bind and OLS would not start.
+  const ipv6 = (await host.readFile("/proc/net/if_inet6")) !== null;
+  const { block, files } = renderPanelConf(sites, hooks, redirects, acmeHosts, ipv6);
   const next = applyBlock(current, block);
   // What the current block uses, to compare, to undo, and to delete what stops being used.
   const firstLevel = await readFiles(host, includedPanelFiles(panelBlock(current), () => null));
@@ -326,7 +328,13 @@ export const hostingHandlers: HostingHandlers = {
 
   "system.publicIp": async (_params, host) => {
     const { stdout } = await host.run("ip", ["-4", "route", "get", "1.1.1.1"]);
-    return { ip: /\bsrc (\d{1,3}(?:\.\d{1,3}){3})\b/.exec(stdout)?.[1] ?? null };
+    // The address it would go out from to the internet, if global: not link-local (fe80::) nor ULA (fc00::/7).
+    const v6 = await host.run("ip", ["-6", "route", "get", "2606:4700:4700::1111"]);
+    const ip6 = v6.code === 0 ? /\bsrc ([0-9a-f]*:[0-9a-f:]+)/i.exec(v6.stdout)?.[1]?.toLowerCase() ?? null : null;
+    return {
+      ip: /\bsrc (\d{1,3}(?:\.\d{1,3}){3})\b/.exec(stdout)?.[1] ?? null,
+      ip6: ip6 && /^[23]/.test(ip6) ? ip6 : null,
+    };
   },
 
   "ftp.setPassword": async ({ username, password }, host) => {

@@ -560,7 +560,8 @@ export interface PanelConf {
   files: Map<string, string>;
 }
 
-export function renderPanelConf(sites: SyncedSite[], hooks: HooksSite | null, redirects: RedirectSite[] = [], acmeHosts: string[] = []): PanelConf {
+/** `ipv6`: the kernel has IPv6. Tested in WSL: `*:80` and `[ANY]:80` bind side by side and serve the same vhosts. */
+export function renderPanelConf(sites: SyncedSite[], hooks: HooksSite | null, redirects: RedirectSite[] = [], acmeHosts: string[] = [], ipv6 = false): PanelConf {
   const sorted = [...sites].sort((a, b) => a.site.localeCompare(b.site));
   const sortedRedirects = [...redirects].sort((a, b) => a.domain.localeCompare(b.domain));
   const files = new Map<string, string>();
@@ -629,13 +630,15 @@ export function renderPanelConf(sites: SyncedSite[], hooks: HooksSite | null, re
   ];
 
   const listeners: string[] = [];
+  // `*` is IPv4 only: with IPv6 each listener gets a twin on `[ANY]`, with the same maps.
+  const listen = (name: string, port: number, body: string) => {
+    listeners.push(`listener ${name} {\n  address                 *:${port}\n${body}}\n`);
+    if (ipv6) listeners.push(`listener ${name}-v6 {\n  address                 [ANY]:${port}\n${body}}\n`);
+  };
   const httpMaps = maps(false);
   if (httpMaps.length > 0) {
-    listeners.push(`listener eaglepanel-http {
-  address                 *:80
-  secure                  0
+    listen("eaglepanel-http", 80, `  secure                  0
 ${httpMaps.join("\n")}
-}
 `);
   }
 
@@ -648,14 +651,11 @@ ${httpMaps.join("\n")}
   const httpsMaps = maps(true);
   if (fallbackZone && httpsMaps.length > 0) {
     const originPull = secureSites.some((site) => site.originPull) || secureRedirects.some((redirect) => redirect.originPull);
-    listeners.push(`listener eaglepanel-https {
-  address                 *:443
-  secure                  1
+    listen("eaglepanel-https", 443, `  secure                  1
   keyFile                 ${keyPath(fallbackZone)}
   certFile                ${certPath(fallbackZone)}
   certChain               0
 ${originPull ? originPullSsl : ""}${httpsMaps.join("\n")}
-}
 `);
   }
   if (listeners.length > 0) files.set(LISTENERS_PATH, listeners.join("\n"));
@@ -711,8 +711,21 @@ export function removedListeners(before: string, after: string): string[] {
   return [...panelListenerAddresses(before)].filter((address) => !next.has(address));
 }
 
-/** Port of `*:443`, or `127.0.0.1:443`. */
+/** Port of `*:443`, `[ANY]:443` or `127.0.0.1:443`. */
 export const listenerPort = (address: string) => address.slice(address.lastIndexOf(":") + 1);
+
+/**
+ * Whether a local address from `ss` belongs to that listener: `*` is `0.0.0.0`, `[ANY]` is `[::]` (or `*` when the
+ * socket also takes IPv4). By port alone, dropping the IPv6 listener would look still open because of the IPv4 one.
+ */
+export function listenerIsOpen(address: string, local: string): boolean {
+  if (listenerPort(local) !== listenerPort(address)) return false;
+  const host = address.slice(0, address.lastIndexOf(":"));
+  const localHost = local.slice(0, local.lastIndexOf(":"));
+  if (host === "*") return localHost === "0.0.0.0";
+  if (host === "[ANY]") return localHost === "[::]" || localHost === "*";
+  return localHost === host;
+}
 
 /** `-t` returns 1 with mere warnings: what invalidates the configuration is an [ERROR] line. */
 export function firstConfigError(output: string): string | null {

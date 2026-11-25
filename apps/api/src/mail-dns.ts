@@ -9,12 +9,9 @@ export { mailHostOf };
  * What the domain needs at its DNS provider to receive and send mail through this server. SPF lists only the MX
  * (this server); DMARC starts in `none`, to see who sends on the domain's behalf before rejecting anything.
  */
-export function expectedRecords(domain: string, ip: string | null, dkim: DkimKey[]): ExpectedRecord[] {
+export function expectedRecords(domain: string, ip: string | null, dkim: DkimKey[], ip6: string | null = null): ExpectedRecord[] {
   const mailHost = mailHostOf(domain);
-  const records: ExpectedRecord[] = [];
-  if (ip) {
-    records.push({ type: ip.includes(":") ? "AAAA" : "A", name: mailHost, value: ip, purpose: "Points the mail name to this server", dnsOnly: true });
-  }
+  const records: ExpectedRecord[] = addressRecords(mailHost, ip, ip6, "Points the mail name to this server");
   records.push(
     { type: "MX", name: domain, value: mailHost, priority: 10, purpose: "Receives the domain's mail", dnsOnly: false },
     { type: "TXT", name: domain, value: "v=spf1 mx -all", purpose: "SPF: only this server sends for the domain", dnsOnly: false },
@@ -36,11 +33,16 @@ export function expectedRecords(domain: string, ip: string | null, dkim: DkimKey
  * The server's own mail name: where it says it is from when it delivers (EHLO), and what its address resolves back to
  * (PTR). Some servers check SPF for that name too, so it gets its own, separate from any domain.
  */
-export function serverRecords(hostname: string, ip: string | null): ExpectedRecord[] {
-  const records: ExpectedRecord[] = [];
-  if (ip) records.push({ type: ip.includes(":") ? "AAAA" : "A", name: hostname, value: ip, purpose: "Points the server mail name to this server", dnsOnly: true });
+export function serverRecords(hostname: string, ip: string | null, ip6: string | null = null): ExpectedRecord[] {
+  const records = addressRecords(hostname, ip, ip6, "Points the server mail name to this server");
   records.push({ type: "TXT", name: hostname, value: "v=spf1 a -all", purpose: "SPF of the name the server greets with", dnsOnly: false });
   return records;
+}
+
+/** A for the IPv4 and AAAA for the IPv6, when the server has them. */
+function addressRecords(name: string, ip: string | null, ip6: string | null, purpose: string): ExpectedRecord[] {
+  return [...(ip ? [ip] : []), ...(ip6 ? [ip6] : [])]
+    .map((value) => ({ type: value.includes(":") ? "AAAA" as const : "A" as const, name, value, purpose, dnsOnly: true }));
 }
 
 /** The reverse DNS of the IP has to be the server name: without it, many providers reject or file mail as spam. */
@@ -76,8 +78,37 @@ export function publicLookup(): DnsLookup {
     a: (name) => empty(resolver.resolve4(name)),
     aaaa: (name) => empty(resolver.resolve6(name)),
     mx: (name) => empty(resolver.resolveMx(name)),
-    txt: (name) => empty(resolver.resolveTxt(name)).then((rows) => rows.map((chunks) => chunks.join(""))),
+    txt: (name) => empty(resolver.resolveTxt(name)).then((rows) => joinTxtChunks(rows.map((chunks) => chunks.join("")))),
   };
+}
+
+/**
+ * A TXT value over 255 bytes travels in pieces of up to 255 inside one record (a 2048-bit DKIM key, for example).
+ * Bun's resolver hands each piece over as a record of its own (seen with a 420-character DKIM key: 255 + 165), so a
+ * piece of exactly 255 is joined to the next one. A separate record of exactly 255 characters is not expected here.
+ */
+export function joinTxtChunks(values: string[]): string[] {
+  const joined: string[] = [];
+  let open = false;
+  for (const value of values) {
+    if (open) joined[joined.length - 1] += value;
+    else joined.push(value);
+    open = new TextEncoder().encode(value).length === 255;
+  }
+  return joined;
+}
+
+/** The same address however it is written: IPv6 can be shortened in several ways. */
+export function sameAddress(a: string, b: string): boolean {
+  if (!a.includes(":") || !b.includes(":")) return a === b;
+  return expandIpv6(a) === expandIpv6(b);
+}
+function expandIpv6(address: string): string {
+  const [head, tail = null] = address.toLowerCase().split("::");
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const groups = tail === null ? left : [...left, ...Array(8 - left.length - right.length).fill("0"), ...right];
+  return groups.map((group) => group.padStart(4, "0")).join(":");
 }
 
 const normalize = (value: string) => value.replace(/\s+/g, " ").replace(/\s*;\s*/g, ";").trim().toLowerCase();
@@ -86,9 +117,10 @@ const stripDot = (name: string) => name.replace(/\.$/, "").toLowerCase();
 export async function checkRecord(record: ExpectedRecord, lookup: DnsLookup): Promise<DnsRecordDto> {
   try {
     if (record.type === "A" || record.type === "AAAA") {
-      const found = await (record.type === "A" ? lookup.a(record.name) : lookup.aaaa(record.name));
+      const found = (await (record.type === "A" ? lookup.a(record.name) : lookup.aaaa(record.name))).map((value) => value.toLowerCase());
       // Behind the Cloudflare proxy it answers Cloudflare addresses: mail would never arrive.
-      return { ...record, state: found.length === 0 ? "missing" : found.includes(record.value) && found.length === 1 ? "ok" : "different", found };
+      const ok = found.length === 1 && sameAddress(found[0]!, record.value);
+      return { ...record, state: found.length === 0 ? "missing" : ok ? "ok" : "different", found };
     }
     if (record.type === "MX") {
       const found = await lookup.mx(record.name);

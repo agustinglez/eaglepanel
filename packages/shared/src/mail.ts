@@ -194,9 +194,11 @@ export interface ServerMailDto {
   hostname: string | null;
   named: boolean;
   ip: string | null;
+  /** Global IPv6 it goes out from, if it has one: mail to Gmail and others then leaves over IPv6. */
+  ip6: string | null;
   records: DnsRecordDto[];
-  /** Reverse DNS of the IP: set at the server provider, not in the domain DNS. */
-  ptr: { state: DnsRecordState; found: string[] };
+  /** Reverse DNS of each IP (IPv4 first): set at the server provider, not in the domain DNS. */
+  ptrs: { ip: string; state: DnsRecordState; found: string[] }[];
   /** Outgoing port 25: "blocked" means mail to other servers cannot leave. */
   port25: "open" | "blocked" | "unknown";
   certificate: MailCertificateDto;

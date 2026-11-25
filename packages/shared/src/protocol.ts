@@ -230,7 +230,7 @@ export const agentOps = {
   },
   "system.publicIp": {
     params: z.object({}).strict(),
-    result: z.object({ ip: z.string().nullable() }),
+    result: z.object({ ip: z.string().nullable(), ip6: z.string().nullable().default(null) }),
   },
   "ftp.setPassword": {
     params: z.object({ username: usernameSchema, password: generatedSecretSchema }).strict(),

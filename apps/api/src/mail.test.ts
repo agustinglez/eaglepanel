@@ -12,7 +12,7 @@ import { hashPassword, setAdminCredentials } from "./auth";
 import { openDb, type Db } from "./db";
 import { auditLog, jobSteps } from "./db/schema";
 import { JobRunner } from "./jobs";
-import { checkRecord, expectedRecords, type DnsLookup } from "./mail-dns";
+import { checkRecord, expectedRecords, joinTxtChunks, type DnsLookup } from "./mail-dns";
 import { createSiteAccount } from "./test-support";
 
 const PASSWORD = "test-password-value";
@@ -33,12 +33,13 @@ let calls: { op: AgentOpName; params: unknown }[];
 let failOn: AgentOpName | null;
 let mailInstalled: boolean;
 let mailHostname: string;
-let dns: { ptr: Record<string, string[]>; a: Record<string, string[]>; mx: Record<string, { exchange: string; priority: number }[]>; txt: Record<string, string[]> };
+let serverIp6: string | null;
+let dns: { ptr: Record<string, string[]>; a: Record<string, string[]>; aaaa: Record<string, string[]>; mx: Record<string, { exchange: string; priority: number }[]>; txt: Record<string, string[]> };
 
 const lookup: DnsLookup = {
   ptr: async (ip) => dns.ptr[ip] ?? [],
   a: async (name) => dns.a[name] ?? [],
-  aaaa: async () => [],
+  aaaa: async (name) => dns.aaaa[name] ?? [],
   mx: async (name) => dns.mx[name] ?? [],
   txt: async (name) => dns.txt[name] ?? [],
 };
@@ -47,7 +48,7 @@ const agent: AgentClient = {
   call: (async (op: AgentOpName, params: unknown) => {
     calls.push({ op, params });
     if (op === "php.versions") return { versions: ["85"] };
-    if (op === "system.publicIp") return { ip: SERVER_IP };
+    if (op === "system.publicIp") return { ip: SERVER_IP, ip6: serverIp6 };
     if (op === "mail.status") return { installed: mailInstalled, running: mailInstalled, hostname: mailInstalled ? mailHostname : null };
     if (failOn === op) {
       failOn = null;
@@ -98,7 +99,8 @@ beforeEach(async () => {
   failOn = null;
   mailInstalled = true;
   mailHostname = "mail.server.test";
-  dns = { ptr: {}, a: {}, mx: {}, txt: {} };
+  serverIp6 = null;
+  dns = { ptr: {}, a: {}, aaaa: {}, mx: {}, txt: {} };
   db = openDb(":memory:");
   setAdminCredentials(db, "admin", passwordHash);
   jobs = new JobRunner(db);
@@ -241,9 +243,17 @@ describe("DNS check", () => {
   const records = expectedRecords("example.com", SERVER_IP, [{ selector: "s1", algorithm: "rsa", publicKey: "AAAB" }]);
   const find = (type: string, name: string) => records.find((record) => record.type === type && record.name === name)!;
 
+  test("a long TXT that the resolver hands over in 255-byte pieces is one record again", () => {
+    const first = `v=DKIM1; k=rsa; p=${"A".repeat(237)}`;
+    expect(first.length).toBe(255);
+    expect(joinTxtChunks([first, "QAB", "v=spf1 mx -all"])).toEqual([`${first}QAB`, "v=spf1 mx -all"]);
+    expect(joinTxtChunks(["v=DMARC1; p=none", "v=spf1 mx -all"])).toEqual(["v=DMARC1; p=none", "v=spf1 mx -all"]);
+  });
+
   test("each record is ok, missing or different", async () => {
     dns = {
       ptr: {},
+      aaaa: {},
       a: { "mail.example.com": [SERVER_IP] },
       mx: { "example.com": [{ exchange: "mail.example.com.", priority: 10 }] },
       txt: {
@@ -347,7 +357,7 @@ describe("server mail (Settings)", () => {
       `A mail.server.test ${SERVER_IP} missing`,
       "TXT mail.server.test v=spf1 a -all missing",
     ]);
-    expect(dto.ptr.state).toBe("missing");
+    expect(dto.ptrs).toEqual([{ ip: SERVER_IP, state: "missing", found: [] }]);
     expect(dto.certificate.state).toBe("waiting");
 
     dns.a["mail.server.test"] = [SERVER_IP];
@@ -355,12 +365,31 @@ describe("server mail (Settings)", () => {
     dns.ptr[SERVER_IP] = ["mail.server.test."];
     const checked = await settingsMail(true);
     expect(checked.records.every(({ state }) => state === "ok")).toBe(true);
-    expect(checked.ptr).toEqual({ state: "ok", found: ["mail.server.test"] });
+    expect(checked.ptrs).toEqual([{ ip: SERVER_IP, state: "ok", found: ["mail.server.test"] }]);
   });
 
   test("a reverse DNS of the provider is different", async () => {
     dns.ptr[SERVER_IP] = ["vps-1234.provider.net"];
-    expect((await settingsMail(true)).ptr).toEqual({ state: "different", found: ["vps-1234.provider.net"] });
+    expect((await settingsMail(true)).ptrs).toEqual([{ ip: SERVER_IP, state: "different", found: ["vps-1234.provider.net"] }]);
+  });
+
+  test("with IPv6 it also asks for the AAAA and the reverse DNS of that address", async () => {
+    serverIp6 = "2001:db8:1::f32d";
+    dns.aaaa["mail.server.test"] = ["2001:0db8:0001:0000:0000:0000:0000:f32d"]; // written out in full: the same address
+    dns.ptr["2001:db8:1::f32d"] = ["vps-1234.provider.net."];
+    const dto = await settingsMail(true);
+    expect(dto.ip6).toBe("2001:db8:1::f32d");
+    expect(dto.records.map(({ type, state }) => `${type} ${state}`)).toEqual(["A missing", "AAAA ok", "TXT missing"]);
+    expect(dto.ptrs.map(({ ip, state }) => `${ip} ${state}`)).toEqual([`${SERVER_IP} missing`, "2001:db8:1::f32d different"]);
+  });
+
+  test("an AAAA pointing elsewhere holds the certificate back: the validation would try it first", async () => {
+    serverIp6 = "2001:db8:1::f32d";
+    dns.a["mail.server.test"] = [SERVER_IP];
+    dns.aaaa["mail.server.test"] = ["2001:db8:2::1"];
+    expect((await post("/settings/mail/certificate")).status).toBe(409);
+    dns.aaaa["mail.server.test"] = ["2001:db8:1::f32d"];
+    expect((await runJob("/settings/mail/certificate")).status).toBe("succeeded");
   });
 
   test("its certificate is requested once the name points here", async () => {

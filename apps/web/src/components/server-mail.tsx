@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { MAIL_INSTALL_COMMAND, type DnsRecordState, type JobCreatedDto, type ServerMailDto } from "@eaglepanel/shared";
+import { MAIL_INSTALL_COMMAND, type JobCreatedDto, type ServerMailDto } from "@eaglepanel/shared";
 import { RefreshCwIcon } from "lucide-react";
 import { useState, type SyntheticEvent } from "react";
 import { useTranslation } from "react-i18next";
@@ -43,7 +43,7 @@ export function ServerMailCard() {
 
   const data = query.data;
   const ready = data?.running && data.named;
-  const pending = data ? data.records.filter(({ state }) => state !== "ok").length + (data.ptr.state === "ok" ? 0 : 1) : 0;
+  const pending = data ? data.records.filter(({ state }) => state !== "ok").length + data.ptrs.filter(({ state }) => state !== "ok").length : 0;
 
   return (
     <Card className="max-w-3xl">
@@ -121,7 +121,7 @@ export function ServerMailCard() {
               : <p className="text-sm text-muted-foreground">{t("{{count}} records missing or different.", { count: pending })}</p>}
             <div className="flex flex-col gap-3">
               {data.records.map((record) => <DnsRecordRow key={`${record.type} ${record.name}`} record={record} />)}
-              <PtrRow hostname={data.hostname!} ip={data.ip} ptr={data.ptr} />
+              {data.ptrs.map((ptr) => <PtrRow key={ptr.ip} hostname={data.hostname!} ptr={ptr} />)}
             </div>
             {data.checkedAt && <p className="text-xs text-muted-foreground">{t("Checked {{date}} against public DNS.", { date: formatDateTime(data.checkedAt) })}</p>}
           </>
@@ -167,13 +167,13 @@ function Port25({ state }: { state: ServerMailDto["port25"] }) {
 }
 
 /** The reverse DNS is not set in the domain DNS but at the provider of the server (or its IP). */
-function PtrRow({ hostname, ip, ptr }: { hostname: string; ip: string | null; ptr: { state: DnsRecordState; found: string[] } }) {
+function PtrRow({ hostname, ptr }: { hostname: string; ptr: ServerMailDto["ptrs"][number] }) {
   const { t } = useTranslation();
   return (
     <div className="flex flex-col gap-2 rounded-lg border p-3">
       <div className="flex flex-wrap items-center gap-2">
         <Badge variant="secondary" className="font-mono">PTR</Badge>
-        <span className="min-w-0 font-mono text-sm break-all">{ip ?? "-"}</span>
+        <span className="min-w-0 font-mono text-sm break-all">{ptr.ip}</span>
         <span className="ml-auto"><RecordState state={ptr.state} /></span>
       </div>
       <CopyField value={hostname} mono />
