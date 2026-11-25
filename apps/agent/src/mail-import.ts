@@ -1,7 +1,8 @@
-import { lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { basename, dirname, join, posix } from "node:path";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
+import { zstdDecompressSync } from "node:zlib";
 import type { Host } from "./host";
 import { SandboxHost } from "./host";
 
@@ -111,15 +112,43 @@ export async function maildirMessages(dir: string): Promise<MaildirMessage[]> {
     const entries = await readdir(join(dir, sub), { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
       if (!entry.isFile()) continue;
-      const flags = /[:!]2,([A-Za-z]*)$/.exec(entry.name)?.[1] ?? "";
+      // ":2," on the server; cPanel backups write "_2," (a ":" is not allowed everywhere), and some systems "!2,".
+      const flags = /[:!_]2,([A-Za-z]*)$/.exec(entry.name)?.[1] ?? "";
       if (flags.includes("T")) continue;
       const file = join(dir, sub, entry.name);
       const info = await lstat(file);
       if (!info.isFile()) continue;
-      messages.push({ file, keywords: [...flags].map((flag) => MAILDIR_FLAGS[flag]).filter((value): value is string => !!value), size: info.size, mtime: info.mtime });
+      // Dovecot may keep each message compressed: S= in the name is its real size.
+      const realSize = Number(/,S=(\d+)/.exec(entry.name)?.[1] ?? Number.NaN);
+      const size = Number.isSafeInteger(realSize) ? realSize : info.size;
+      messages.push({ file, keywords: [...flags].map((flag) => MAILDIR_FLAGS[flag]).filter((value): value is string => !!value), size, mtime: info.mtime });
     }
   }
   return messages.sort((a, b) => basename(a.file).localeCompare(basename(b.file)));
+}
+
+/**
+ * A message as it was received. Dovecot's zlib plugin (on in cPanel servers like Banahosting's) keeps each one
+ * compressed, recognized by its first bytes: gzip and zstd here, bzip2 and xz with their tools.
+ */
+export async function readMaildirMessage(file: string): Promise<Uint8Array> {
+  const data = new Uint8Array(await readFile(file));
+  return decompressMessage(data, file);
+}
+
+export async function decompressMessage(data: Uint8Array, label = "a message"): Promise<Uint8Array> {
+  const starts = (...bytes: number[]) => bytes.every((byte, index) => data[index] === byte);
+  if (starts(0x1f, 0x8b)) return Bun.gunzipSync(new Uint8Array(data));
+  if (starts(0x28, 0xb5, 0x2f, 0xfd)) return new Uint8Array(zstdDecompressSync(data));
+  const tool = starts(0x42, 0x5a, 0x68) ? "bzip2" : starts(0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00) ? "xz" : null;
+  if (tool) {
+    const proc = Bun.spawn([tool, "-dc"], { stdin: data, stdout: "pipe", stderr: "pipe" });
+    const [output, code] = await Promise.all([new Response(proc.stdout).arrayBuffer(), proc.exited]);
+    if (code !== 0) throw new Error(`${basename(label)} could not be decompressed with ${tool}`);
+    return new Uint8Array(output);
+  }
+  if (starts(0x5a, 0x4c, 0xff, 0x4c, 0x5a, 0x34)) throw new Error(`${basename(label)} is compressed with Dovecot's lz4, which cannot be read here`);
+  return data;
 }
 
 /** Mailbox names, password hashes and quotas from `etc/<domain>/` of the backup. */
@@ -141,27 +170,34 @@ export function parseCpanelEtc(shadow: string | null, quota: string | null): Map
   return result;
 }
 
-/** Finds `mail/<domain>` (and its `etc/<domain>`) in an extracted backup or a home directory, without following links. */
+/**
+ * Finds `mail/<domain>` and `etc/<domain>` in an extracted backup or a home directory, without following links. They
+ * are usually side by side; when they came in separate files they may not be, and `etc` is looked for on its own.
+ */
 export async function locateDomainMail(root: string, domain: string, maxDepth = 6): Promise<{ mail: string; etc: string | null } | null> {
-  const isDir = async (path: string) => (await lstat(path).catch(() => null))?.isDirectory() ?? false;
-  if (basename(root) === domain && basename(dirname(root)) === "mail") {
-    const etc = join(dirname(dirname(root)), "etc", domain);
-    return { mail: root, etc: (await isDir(etc)) ? etc : null };
-  }
+  const found = await locateDir(root, domain, "mail", maxDepth);
+  if (!found || found.etc) return found;
+  return { mail: found.mail, etc: (await locateDir(root, domain, "etc", maxDepth))?.mail ?? null };
+}
+
+const isDir = async (path: string) => (await lstat(path).catch(() => null))?.isDirectory() ?? false;
+
+/** `kind/<domain>` (mail or etc), with the other one next to it if it is there. */
+async function locateDir(root: string, domain: string, kind: "mail" | "etc", maxDepth: number): Promise<{ mail: string; etc: string | null } | null> {
+  const sibling = async (parent: string) => {
+    if (kind === "etc") return null;
+    const etc = join(parent, "etc", domain);
+    return (await isDir(etc)) ? etc : null;
+  };
+  if (basename(root) === domain && basename(dirname(root)) === kind) return { mail: root, etc: await sibling(dirname(dirname(root))) };
   let level = [root];
   for (let depth = 0; depth <= maxDepth && level.length > 0; depth += 1) {
     const next: string[] = [];
     for (const dir of level) {
-      // Just the mail folder uploaded on its own: mail/<domain> without the rest of the home.
-      if (basename(dir) === "mail" && (await isDir(join(dir, domain)))) {
-        const etc = join(dirname(dir), "etc", domain);
-        return { mail: join(dir, domain), etc: (await isDir(etc)) ? etc : null };
-      }
-      const candidate = join(dir, "mail", domain);
-      if (await isDir(candidate)) {
-        const etc = join(dir, "etc", domain);
-        return { mail: candidate, etc: (await isDir(etc)) ? etc : null };
-      }
+      // Just the folder uploaded on its own: mail/<domain> without the rest of the home.
+      if (basename(dir) === kind && (await isDir(join(dir, domain)))) return { mail: join(dir, domain), etc: await sibling(dirname(dir)) };
+      const candidate = join(dir, kind, domain);
+      if (await isDir(candidate)) return { mail: candidate, etc: await sibling(dir) };
       const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
       for (const entry of entries) {
         if (entry.isDirectory() && !entry.name.startsWith(".") && !["cur", "new", "tmp", "public_html", "node_modules"].includes(entry.name)) next.push(join(dir, entry.name));
@@ -186,8 +222,60 @@ interface ImportMeta {
   etc: string | null;
 }
 
+/** Uploaded through the panel: a backup, or the mail and etc folders, as .tar.gz, .tgz, .tar or .zip. */
+export const UPLOAD_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(tar\.gz|tgz|tar|zip)$/i;
+const MAX_UPLOAD_TOTAL = 100 * 1024 * 1024 * 1024;
+/** Uploads and extracted copies nobody imported: gone after two days. */
+const STALE_MS = 2 * 24 * 3600 * 1000;
+const uploadsDir = (id: string) => `${importDir(id)}/uploads`;
+
+/**
+ * One piece of an upload, appended at `offset`: the browser sends big files in pieces, so there is no size limit per
+ * request and an interrupted piece is sent again from where the file is.
+ */
+export async function appendUpload(host: Host, importId: string, name: string, offset: number, body: ReadableStream<Uint8Array>): Promise<{ size: number }> {
+  if (!UPLOAD_NAME.test(name)) throw new Error("Upload a .tar.gz, .tgz, .tar or .zip file");
+  const root = local(host, IMPORTS_DIR);
+  await mkdir(root, { recursive: true, mode: 0o711 });
+  if (offset === 0) await removeStale(host);
+  const dir = local(host, uploadsDir(importId));
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, name);
+  const current = (await lstat(path).catch(() => null))?.size ?? 0;
+  if (current !== offset) throw new Error(`The upload of ${name} is at ${current} bytes, not ${offset}: send from there`);
+  const file = await open(path, "a", 0o600);
+  let size = current;
+  try {
+    for await (const chunk of body) {
+      size += chunk.byteLength;
+      if (size > MAX_UPLOAD_TOTAL) throw new Error("The file is too big");
+      await file.write(chunk);
+    }
+  } finally {
+    await file.close();
+  }
+  return { size };
+}
+
+async function removeStale(host: Host): Promise<void> {
+  const root = local(host, IMPORTS_DIR);
+  for (const entry of await readdir(root, { withFileTypes: true }).catch(() => [])) {
+    const path = join(root, entry.name);
+    const info = await lstat(path).catch(() => null);
+    if (info && Date.now() - info.mtimeMs > STALE_MS) await rm(path, { recursive: true, force: true });
+  }
+}
+
 /** Only the mail of that domain: other files of the backup are never extracted. */
 async function extractArchive(host: Host, username: string, archive: string, staging: string, domain: string): Promise<void> {
+  // By its first bytes (PK), not its name: a zip renamed .tar.gz is still a zip.
+  const head = new Uint8Array(await Bun.file(local(host, archive)).slice(0, 2).arrayBuffer());
+  if (head[0] === 0x50 && head[1] === 0x4b) {
+    // Exit 11: none of the patterns is in it (for example etc.zip when looking for mail): not an error here.
+    const result = await host.run("runuser", ["-u", username, "--", "unzip", "-qq", "-o", archive, `*mail/${domain}/*`, `*etc/${domain}/*`, "-d", staging]);
+    if (result.code !== 0 && result.code !== 1 && result.code !== 11) throw new Error(`The zip could not be read: ${result.stderr.trim().split("\n").slice(-2).join(" ").slice(0, 300)}`);
+    return;
+  }
   const tar = async (file: string, into: string) => {
     // As the account itself: a crafted archive can only write what its owner could.
     const result = await host.run("runuser", ["-u", username, "--", "tar", "-xf", file, "-C", into, "--no-same-owner", "--no-same-permissions",
@@ -228,27 +316,47 @@ export function homePath(username: string, relativePath: string): string {
   return clean;
 }
 
-export async function scanBackup(host: Host, { username, path, domain, importId }: { username: string; path: string; domain: string; importId: string }): Promise<ScannedMailbox[]> {
-  const source = local(host, homePath(username, path));
-  const info = await lstat(source).catch(() => null);
-  if (!info) throw new Error(`${path} does not exist in the account`);
-  if (info.isSymbolicLink()) throw new Error(`${path} is a link: give the real file or folder`);
-
+/**
+ * Reads the mail of `domain` from the files uploaded for `importId` (`path` undefined), or from a file or folder at
+ * `path` in the account. Archives are extracted by the account's own user, into a copy that only root and it can read.
+ */
+export async function scanBackup(host: Host, { username, path, domain, importId }: { username: string; path?: string; domain: string; importId: string }): Promise<ScannedMailbox[]> {
   await mkdir(local(host, IMPORTS_DIR), { recursive: true, mode: 0o711 });
-  let root = source;
-  if (info.isFile()) {
-    const staging = local(host, importDir(importId));
-    await rm(staging, { recursive: true, force: true });
-    await mkdir(staging, { mode: 0o700 });
-    await host.run("chown", [`${username}:${username}`, importDir(importId)]);
-    await extractArchive(host, username, homePath(username, path), importDir(importId), domain);
-    root = staging;
-  } else if (!info.isDirectory()) {
-    throw new Error(`${path} is neither a backup file nor a folder`);
+  const extracted = `${importDir(importId)}/extracted`;
+  const prepare = async () => {
+    await rm(local(host, extracted), { recursive: true, force: true });
+    await mkdir(local(host, extracted), { recursive: true, mode: 0o700 });
+    await host.run("chown", ["-R", `${username}:${username}`, importDir(importId)]);
+  };
+
+  let root: string;
+  let label: string;
+  if (path === undefined) {
+    label = "the uploaded files";
+    const names = (await readdir(local(host, uploadsDir(importId))).catch(() => [] as string[])).filter((name) => UPLOAD_NAME.test(name)).sort();
+    if (names.length === 0) throw new Error("Nothing was uploaded");
+    await prepare();
+    for (const name of names) await extractArchive(host, username, `${uploadsDir(importId)}/${name}`, extracted, domain);
+    root = local(host, extracted);
+  } else {
+    label = path;
+    const source = local(host, homePath(username, path));
+    const info = await lstat(source).catch(() => null);
+    if (!info) throw new Error(`${path} does not exist in the account`);
+    if (info.isSymbolicLink()) throw new Error(`${path} is a link: give the real file or folder`);
+    if (info.isFile()) {
+      await prepare();
+      await extractArchive(host, username, homePath(username, path), extracted, domain);
+      root = local(host, extracted);
+    } else if (info.isDirectory()) {
+      root = source;
+    } else {
+      throw new Error(`${path} is neither a backup file nor a folder`);
+    }
   }
 
   const found = await locateDomainMail(root, domain);
-  if (!found) throw new Error(`No mail of ${domain} was found in ${path} (it looks for mail/${domain} inside)`);
+  if (!found) throw new Error(`No mail of ${domain} was found in ${label} (it looks for mail/${domain} inside)`);
   const etc = parseCpanelEtc(
     found.etc ? await readFile(join(found.etc, "shadow"), "utf8").catch(() => null) : null,
     found.etc ? await readFile(join(found.etc, "quota"), "utf8").catch(() => null) : null,
@@ -716,7 +824,7 @@ export async function importFromBackup(host: Host, sink: MailboxSink, { importId
     sink, folders, cursor,
     async (folderIndex, position) => (await maildirMessages(folders[folderIndex]!.dir)).map((message, index) => ({ ...message, index: index + 1 })).slice(position),
     (message) => ({ size: message.size, receivedAt: message.mtime, keywords: message.keywords, position: message.index }),
-    async (items) => new Map(await Promise.all(items.map(async (item) => [item, new Uint8Array(await readFile(item.file))] as const))),
+    async (items) => new Map(await Promise.all(items.map(async (item) => [item, await readMaildirMessage(item.file)] as const))),
     Date.now() + BUDGET_MS,
   );
 }

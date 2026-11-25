@@ -9,6 +9,7 @@ import {
   imapSourceSchema,
   isMailReserved,
   mailLocalPartSchema,
+  mailImportIdSchema,
   mailImportPathSchema,
   mailQuotaMbSchema,
   webmailHostOf,
@@ -53,6 +54,8 @@ const serverHostnameSchema = z.object({
 /** Public DNS answers are cached this long per domain: the page polls while a job runs. */
 const DNS_CACHE_MS = 30_000;
 
+/** The browser sends uploads in pieces of 32 MB: this leaves room. */
+const MAX_UPLOAD_PIECE = 100 * 1024 * 1024;
 const generateSecret = () => randomBytes(24).toString("base64url");
 
 const HOUR = 3600_000;
@@ -608,11 +611,44 @@ export function registerMailRoutes(routes: Hono, { db, agent, readBody, startJob
     }
   }
 
+  /** Files being uploaded for each domain, before they are read: the id of their folder on the server. */
+  const uploads = new Map<string, { importId: string; username: string; files: Map<string, number> }>();
+
   async function discardScan(zone: string) {
-    const scan = scans.get(zone);
+    const ids = new Set([scans.get(zone)?.importId, uploads.get(zone)?.importId].filter((id): id is string => !!id));
     scans.delete(zone);
-    if (scan) await agent.call("mail.import.discard", { importId: scan.importId });
+    uploads.delete(zone);
+    for (const importId of ids) await agent.call("mail.import.discard", { importId });
   }
+
+  // The body is one piece of the file, as is. The first piece of the first file (offset 0, no id) starts a new upload.
+  routes.post("/accounts/:username/domains/:zone/mail/import/upload", async (c) => {
+    const found = target(c);
+    if (!found || !agent.stream) return c.json({ error: "Not found" }, 404);
+    const name = c.req.query("name") ?? "";
+    const offset = Number(c.req.query("offset"));
+    const id = c.req.query("id");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(tar\.gz|tgz|tar|zip)$/i.test(name)) return c.json({ error: "Upload a .tar.gz, .tgz, .tar or .zip file" }, 400);
+    if (!Number.isSafeInteger(offset) || offset < 0) return c.json({ error: "Invalid offset" }, 400);
+    const length = Number(c.req.header("content-length") ?? Number.NaN);
+    if (!Number.isFinite(length)) return c.json({ error: "The size is missing" }, 411);
+    if (length > MAX_UPLOAD_PIECE) return c.json({ error: "Each piece can be up to 100 MB" }, 413);
+
+    let upload = uploads.get(found.zone);
+    if (!id) {
+      if (offset !== 0) return c.json({ error: "A new upload starts at the beginning of a file" }, 400);
+      await discardScan(found.zone);
+      upload = { importId: randomBytes(16).toString("hex"), username: found.username, files: new Map() };
+      uploads.set(found.zone, upload);
+    } else if (!upload || upload.importId !== id || upload.username !== found.username) {
+      return c.json({ error: "That upload is no longer here: start it again" }, 409);
+    }
+    const response = await agent.stream("/mail/import/upload", { id: upload.importId, name, offset: String(offset) }, c.req.raw.body ?? new Blob([]).stream(), length);
+    const body = (await response.json().catch(() => null)) as { error?: string; size?: number } | null;
+    if (!response.ok || body?.size === undefined) return c.json({ error: body?.error ?? "Upload failed" }, 400);
+    upload.files.set(name, body.size);
+    return c.json({ importId: upload.importId, size: body.size });
+  });
 
   routes.get("/accounts/:username/domains/:zone/mail/import", (c) => {
     const found = target(c);
@@ -627,22 +663,36 @@ export function registerMailRoutes(routes: Hono, { db, agent, readBody, startJob
   routes.post("/accounts/:username/domains/:zone/mail/import/scan", async (c) => {
     const found = target(c);
     if (!found) return c.json({ error: "Not found" }, 404);
-    const body = await readBody(c, z.object({ path: mailImportPathSchema }).strict());
+    // Either a path in the account, or the files just uploaded (their upload id).
+    const body = await readBody(c, z.union([
+      z.object({ path: mailImportPathSchema }).strict(),
+      z.object({ upload: mailImportIdSchema }).strict(),
+    ]));
     if ("error" in body) return c.json({ error: body.error }, 400);
     const { username, zone } = found;
-    const { path } = body.data;
-    const importId = randomBytes(16).toString("hex");
-    return startJob(c, "mail.import.scan", `Read the cPanel backup ${path}`, [{
+    const uploaded = "upload" in body.data ? uploads.get(zone) : undefined;
+    if ("upload" in body.data && (!uploaded || uploaded.importId !== body.data.upload || uploaded.username !== username || uploaded.files.size === 0)) {
+      return c.json({ error: "Those files are no longer here: upload them again" }, 409);
+    }
+    const path = "path" in body.data ? body.data.path : undefined;
+    const label = path ?? [...uploaded!.files.keys()].join(", ");
+    const importId = uploaded?.importId ?? randomBytes(16).toString("hex");
+    return startJob(c, "mail.import.scan", `Read the cPanel backup ${label}`, [{
       name: `Look for the mail of ${zone}`,
       run: async () => {
-        await discardScan(zone);
-        const { mailboxes: found } = await agent.call("mail.import.scan", { username, path, domain: zone, importId });
-        scans.set(zone, { importId, username, path, mailboxes: found });
+        // A previous backup of the domain goes, except the files this one is made of.
+        const previous = scans.get(zone);
+        scans.delete(zone);
+        if (previous && previous.importId !== importId) await agent.call("mail.import.discard", { importId: previous.importId });
+        if (path !== undefined && uploads.get(zone)) await discardScan(zone);
+        const { mailboxes: found } = await agent.call("mail.import.scan", { username, domain: zone, importId, ...(path !== undefined ? { path } : {}) });
+        scans.set(zone, { importId, username, path: label, mailboxes: found });
       },
       compensate: async () => {
+        if (uploads.get(zone)?.importId === importId) uploads.delete(zone);
         await agent.call("mail.import.discard", { importId });
       },
-    }], `${username}: ${zone} from ${path}`);
+    }], `${username}: ${zone} from ${label}`);
   });
 
   routes.post("/accounts/:username/domains/:zone/mail/import/discard", async (c) => {

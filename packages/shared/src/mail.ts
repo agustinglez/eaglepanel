@@ -36,6 +36,7 @@ export interface ScannedMailboxDto {
 /** A cPanel backup read for a domain: what it has, before importing. */
 export interface MailImportScanDto {
   importId: string;
+  /** Where it was read from: a path in the account, or the names of the uploaded files. */
   path: string;
   mailboxes: ScannedMailboxDto[];
 }
@@ -163,7 +164,8 @@ export const mailOps = {
   },
   /** Extracts the domain's mail from a cPanel backup in the account (or reads a folder in place) and lists its mailboxes. */
   "mail.import.scan": {
-    params: z.object({ username: usernameSchema, path: mailImportPathSchema, domain: fqdnSchema, importId: mailImportIdSchema }).strict(),
+    // Without `path`: the files uploaded for `importId`.
+    params: z.object({ username: usernameSchema, path: mailImportPathSchema.optional(), domain: fqdnSchema, importId: mailImportIdSchema }).strict(),
     result: z.object({
       mailboxes: z.array(z.object({ name: z.string(), messages: z.number(), bytes: z.number(), quotaBytes: z.number().nullable(), passwordHash: z.boolean() })),
     }),

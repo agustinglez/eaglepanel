@@ -1,11 +1,12 @@
 import { DEFAULT_LIMITS, type AccountDto, type AgentOpName, type JobDto, type MailDomainDto, type MailImportScanDto, type ServerMailDto } from "@eaglepanel/shared";
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dispatch } from "../../agent/src/dispatch";
 import { SandboxHost } from "../../agent/src/host";
 import { HTTPD_CONFIG } from "../../agent/src/ols";
+import { handle } from "../../agent/src/server";
 import type { AgentClient } from "./agent-client";
 import { createApp } from "./app";
 import { hashPassword, setAdminCredentials } from "./auth";
@@ -60,6 +61,10 @@ const agent: AgentClient = {
     if (!response.ok) throw new Error(response.error.message);
     return response.result;
   }) as AgentClient["call"],
+  // Uploads go through the agent's own HTTP handler, as on the server.
+  stream: (path, query, body, length) => handle(new Request(`http://agent${path}?${new URLSearchParams(query)}`, {
+    method: "POST", body, headers: length === undefined ? {} : { "content-length": String(length) }, duplex: "half",
+  } as RequestInit), host),
 };
 
 function post(path: string, body: unknown = {}) {
@@ -373,6 +378,30 @@ describe("importing mail", () => {
     const refused = await post(`${MAIL}/import/backup`, { mailboxes: ["ventas"] });
     expect(refused.status).toBe(409);
     expect(((await refused.json()) as { error: string }).error).toContain("ventas@example.com");
+  });
+
+  test("uploads arrive in pieces, in order, and only for the upload of that domain", async () => {
+    await runJob(`${MAIL}/enable`);
+    const piece = (query: string, content: string) => app.request(`/api${MAIL}/import/upload?${query}`, {
+      method: "POST", headers: { cookie, "x-eaglepanel": "1", "content-length": String(content.length) }, body: content,
+    });
+    const first = await piece("name=1-mail.zip&offset=0", "PK12");
+    expect(first.status).toBe(200);
+    const { importId, size } = (await first.json()) as { importId: string; size: number };
+    expect(size).toBe(4);
+    expect((await piece(`name=1-mail.zip&offset=4&id=${importId}`, "3456")).status).toBe(200);
+    // A piece out of place is refused, and says where the file is.
+    const wrong = await piece(`name=1-mail.zip&offset=2&id=${importId}`, "xx");
+    expect(((await wrong.json()) as { error: string }).error).toContain("at 8 bytes");
+    expect((await piece("name=etc.exe&offset=0", "x")).status).toBe(400);
+    expect((await piece(`name=2-etc.zip&offset=0&id=${"f".repeat(32)}`, "x")).status).toBe(409);
+    expect((await readFileSync(join(host.resolvePath(`/var/lib/eaglepanel-imports/${importId}/uploads`), "1-mail.zip"), "utf8"))).toBe("PK123456");
+
+    // In the sandbox nothing is extracted: reading it says where it looked.
+    const scan = await runJob(`${MAIL}/import/scan`, { upload: importId });
+    expect(scan.status).toBe("rolled_back");
+    expect(scan.error).toContain("in the uploaded files");
+    expect((await post(`${MAIL}/import/scan`, { upload: importId })).status).toBe(409);
   });
 
   test("an IMAP copy goes into an existing mailbox, and its password is not kept in the job", async () => {

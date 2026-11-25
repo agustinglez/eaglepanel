@@ -14,10 +14,12 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
+import i18n, { serverText } from "@/lib/i18n";
 import { formatBytes, formatDateTime } from "@/lib/format";
 
 const MB = 1024 * 1024;
@@ -551,39 +553,128 @@ function ImportCard({ username, zone, base, data }: { username: string; zone: st
   );
 }
 
+/** In pieces: no size limit per request, and the bar moves. Returns the upload id the server gave. */
+const UPLOAD_PIECE = 32 * 1024 * 1024;
+
+async function uploadInPieces(base: string, files: File[], onProgress: (percent: number) => void): Promise<string> {
+  const total = files.reduce((sum, file) => sum + file.size, 0);
+  let sent = 0;
+  let id: string | null = null;
+  for (const [index, file] of files.entries()) {
+    // Names the server accepts: letters, digits, dots, hyphens; "mail (1).zip" becomes "1-mail-1-.zip".
+    const extension = /\.(tar\.gz|tgz|tar|zip)$/i.exec(file.name)?.[0] ?? ".zip";
+    const name = `${index + 1}-${file.name.slice(0, file.name.length - extension.length).replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 60)}${extension.toLowerCase()}`;
+    for (let offset = 0; offset < file.size || (offset === 0 && file.size === 0); offset += UPLOAD_PIECE) {
+      const piece = file.slice(offset, offset + UPLOAD_PIECE);
+      const query = new URLSearchParams({ name, offset: String(offset), ...(id ? { id } : {}) });
+      const response = await fetch(`/api${base}/import/upload?${query}`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "x-eaglepanel": "1", "content-type": "application/octet-stream" },
+        body: piece,
+      });
+      const data = (await response.json().catch(() => null)) as { importId?: string; error?: string } | null;
+      if (!response.ok || !data?.importId) throw new Error(data?.error ? serverText(data.error) : i18n.t("Upload failed"));
+      id = data.importId;
+      sent += piece.size;
+      onProgress(total > 0 ? Math.round((sent / total) * 100) : 100);
+      if (file.size === 0) break;
+    }
+  }
+  return id!;
+}
+
 function BackupImport({ username, zone, base }: { username: string; zone: string; base: string }) {
   const { t } = useTranslation();
+  const [mode, setMode] = useState<"one" | "two">("one");
+  const [bundle, setBundle] = useState<File | null>(null);
+  const [mailFile, setMailFile] = useState<File | null>(null);
+  const [etcFile, setEtcFile] = useState<File | null>(null);
   const [path, setPath] = useState("");
+  const [progress, setProgress] = useState<number | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [skipped, setSkipped] = useState<Set<string>>(new Set());
   const scanQuery = useQuery({
     queryKey: [...mailQueryKey(username, zone), "import"],
     queryFn: () => api.get<{ scan: MailImportScanDto | null }>(`${base}/import`),
   });
-  const scanAction = useJobAction((value: string) => api.post<JobCreatedDto>(`${base}/import/scan`, { path: value }));
+  const scanAction = useJobAction((source: { path: string } | { upload: string }) => api.post<JobCreatedDto>(`${base}/import/scan`, source));
   const importAction = useJobAction((names: string[]) => api.post<JobCreatedDto>(`${base}/import/backup`, { mailboxes: names }));
   const discard = useJobAction(async () => ({ ...(await api.post<{ ok: true }>(`${base}/import/discard`)), jobId: null }));
   const scan = scanQuery.data?.scan ?? null;
   const chosen = scan ? scan.mailboxes.filter((box) => !skipped.has(box.name)).map((box) => box.name) : [];
+  const files = mode === "one" ? [bundle].filter((file): file is File => !!file) : [mailFile, etcFile].filter((file): file is File => !!file);
+  const busy = progress !== null || scanAction.isPending;
 
-  function submit(event: SyntheticEvent) {
+  async function upload(event: SyntheticEvent) {
     event.preventDefault();
     setSkipped(new Set());
-    scanAction.mutate(path.trim());
+    setUploadError(null);
+    setProgress(0);
+    try {
+      const upload = await uploadInPieces(base, files, setProgress);
+      scanAction.mutate({ upload });
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setProgress(null);
+    }
   }
+
+  function fromAccount(event: SyntheticEvent) {
+    event.preventDefault();
+    setSkipped(new Set());
+    scanAction.mutate({ path: path.trim() });
+  }
+
+  const fileInput = (id: string, label: string, onChange: (file: File | null) => void) => (
+    <div className="grid gap-2">
+      <Label htmlFor={id}>{label}</Label>
+      <Input id={id} type="file" accept=".zip,.tar,.tgz,.gz" onChange={(event) => onChange(event.target.files?.[0] ?? null)} disabled={busy} />
+    </div>
+  );
 
   return (
     <section className="flex flex-col gap-3">
       <h3 className="font-medium">{t("From a cPanel backup")}</h3>
       <p className="text-sm text-muted-foreground">
-        {t("Upload the full cPanel backup (backup-….tar.gz) to this account with the file manager or by FTP, or a folder with its mail, and give its path inside the account. Only the mail of {{domain}} is read from it. Mailboxes that do not exist here are created with the same password and quota they had in cPanel.", { domain: zone })}
+        {t("Upload the cPanel backup, or just its mail and etc folders compressed (.zip or .tar.gz). Only the mail of {{domain}} is read. Mailboxes that do not exist here are created with the same password and quota they had in cPanel: those are in etc, so without it they get a new password.", { domain: zone })}
       </p>
-      <form onSubmit={submit} className="flex flex-col gap-2 sm:flex-row sm:items-end">
-        <div className="grid flex-1 gap-2">
-          <Label htmlFor="import-path">{t("Path in the account")}</Label>
-          <Input id="import-path" value={path} onChange={(event) => setPath(event.target.value)} placeholder="backup-11.24.2026_10-00-00_user.tar.gz" spellCheck={false} />
+      <form onSubmit={upload} className="flex flex-col gap-3">
+        <div className="flex flex-wrap gap-4 text-sm">
+          <label className="flex items-center gap-2">
+            <input type="radio" name="import-mode" checked={mode === "one"} onChange={() => setMode("one")} disabled={busy} />
+            {t("One file: the backup, or mail and etc together")}
+          </label>
+          <label className="flex items-center gap-2">
+            <input type="radio" name="import-mode" checked={mode === "two"} onChange={() => setMode("two")} disabled={busy} />
+            {t("Two files: mail and etc")}
+          </label>
         </div>
-        <Button type="submit" variant="outline" disabled={scanAction.isPending || path.trim() === ""}>{t("Look for mailboxes")}</Button>
+        {mode === "one" ? (
+          fileInput("import-bundle", t("Backup or mail and etc"), setBundle)
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2">
+            {fileInput("import-mail", t("mail folder"), setMailFile)}
+            {fileInput("import-etc", t("etc folder (passwords and quotas)"), setEtcFile)}
+          </div>
+        )}
+        {progress !== null && <Progress value={progress} />}
+        <div>
+          <Button type="submit" variant="outline" disabled={busy || files.length === 0 || (mode === "two" && !mailFile)}>{t("Upload and look for mailboxes")}</Button>
+        </div>
       </form>
+      {uploadError && <p className="text-sm text-destructive">{uploadError}</p>}
+      <details className="text-sm">
+        <summary className="cursor-pointer text-muted-foreground">{t("It is already in the account (uploaded by FTP)")}</summary>
+        <form onSubmit={fromAccount} className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
+          <div className="grid flex-1 gap-2">
+            <Label htmlFor="import-path">{t("Path in the account")}</Label>
+            <Input id="import-path" value={path} onChange={(event) => setPath(event.target.value)} placeholder="backup-11.24.2026_10-00-00_user.tar.gz" spellCheck={false} />
+          </div>
+          <Button type="submit" variant="outline" disabled={busy || path.trim() === ""}>{t("Look for mailboxes")}</Button>
+        </form>
+      </details>
       <ActionFeedback action={scanAction} />
 
       {scan && (

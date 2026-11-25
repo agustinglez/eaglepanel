@@ -1,9 +1,10 @@
-import { MAX_UPLOAD_BYTES, dbNameSchema, exportIdSchema, filePathSchema, usernameSchema } from "@eaglepanel/shared";
+import { MAX_UPLOAD_BYTES, dbNameSchema, exportIdSchema, filePathSchema, mailImportIdSchema, usernameSchema } from "@eaglepanel/shared";
 import { databaseExists, exportStream, rootSql, sandboxExport, storeUpload } from "./dbadmin";
 import { openExport } from "./exports";
 import { dispatch } from "./dispatch";
 import { downloadFile, uploadFile } from "./files-runner";
 import { requireManaged } from "./hosting";
+import { appendUpload, UPLOAD_NAME } from "./mail-import";
 import type { Host } from "./host";
 
 /** Operations are small JSON. Only file uploads can be large, and they have their own route. */
@@ -88,6 +89,20 @@ export async function handle(request: Request, host: Host): Promise<Response> {
         await sql.close();
       }
       return new Response(exportStream(database, structure === "1"), { headers: { "content-type": "application/gzip" } });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  // Mail import: one piece of a backup (or of its mail and etc folders), appended to what already arrived.
+  if (url.pathname === "/mail/import/upload") {
+    const id = mailImportIdSchema.safeParse(url.searchParams.get("id"));
+    const name = url.searchParams.get("name") ?? "";
+    const offset = Number(url.searchParams.get("offset"));
+    if (!id.success || !UPLOAD_NAME.test(name) || !Number.isSafeInteger(offset) || offset < 0) return errorResponse(new Error("Invalid parameters"));
+    if (!request.body) return errorResponse(new Error("The content is missing"));
+    try {
+      return Response.json(await appendUpload(host, id.data, name, offset, request.body));
     } catch (error) {
       return errorResponse(error);
     }

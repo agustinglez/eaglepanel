@@ -6,7 +6,7 @@ export interface AgentClient {
    * File manager uploads and downloads: the content is streamed, without loading it into memory.
    * Returns the agent response as is; if it is not 2xx, it carries `{ error }`.
    */
-  stream?(path: "/files/download" | "/files/upload" | "/exports/download" | "/db/export" | "/db/upload", query: Record<string, string>, body?: ReadableStream<Uint8Array>, length?: number): Promise<Response>;
+  stream?(path: "/files/download" | "/files/upload" | "/exports/download" | "/db/export" | "/db/upload" | "/mail/import/upload", query: Record<string, string>, body?: ReadableStream<Uint8Array>, length?: number): Promise<Response>;
 }
 
 export type AgentTarget = { socket: string } | { url: string };

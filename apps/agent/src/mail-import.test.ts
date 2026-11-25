@@ -2,10 +2,12 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer, connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
+import { zstdCompressSync } from "node:zlib";
 import { join } from "node:path";
 import { SandboxHost } from "./host";
 import {
   decodeMutf7,
+  decompressMessage,
   folderPath,
   homePath,
   ImapClient,
@@ -18,6 +20,7 @@ import {
   parseCpanelEtc,
   parseInternalDate,
   parseTokens,
+  readMaildirMessage,
   roleOf,
   scanBackup,
   type MailboxSink,
@@ -98,6 +101,24 @@ describe("names and folders", () => {
     const inbox = await maildirMessages(box);
     expect(inbox.map(({ keywords }) => keywords)).toEqual([["$seen"], []]);
     expect(inbox[0]!.mtime.toISOString()).toBe("2024-03-01T10:00:00.000Z");
+  });
+
+  test("cPanel backups: compressed messages (gzip, zstd) and flags after _2, with the real size from S=", async () => {
+    const root = tempRoot();
+    const raw = message("z", "Compressed");
+    const name = (seq: number) => `17478702${seq}.M1P2.bh8988.banahosting.com,S=${Buffer.byteLength(raw)},W=99_2,S`;
+    put(root, "cur", name(1), "");
+    writeFileSync(join(root, "cur", name(1)), Bun.gzipSync(Buffer.from(raw)));
+    put(root, "cur", name(2), "");
+    writeFileSync(join(root, "cur", name(2)), zstdCompressSync(Buffer.from(raw)));
+    const messages = await maildirMessages(root);
+    expect(messages.map(({ keywords, size }) => ({ keywords, size }))).toEqual([
+      { keywords: ["$seen"], size: Buffer.byteLength(raw) },
+      { keywords: ["$seen"], size: Buffer.byteLength(raw) },
+    ]);
+    for (const item of messages) expect(new TextDecoder().decode(await readMaildirMessage(item.file))).toBe(raw);
+    // Not compressed: as it is.
+    expect(await decompressMessage(new TextEncoder().encode(raw))).toEqual(new TextEncoder().encode(raw));
   });
 
   test("cPanel etc: hashes it can use and quotas (0 is unlimited)", () => {
