@@ -201,11 +201,11 @@ async function writePanelConf(host: Host, config: string, files: Map<string, str
   await must(host, "chown", [`--reference=${LSWS}/conf`, HTTPD_CONFIG]);
 }
 
-async function syncOls({ sites, restart, hooks = null, redirects = [], acmeHosts = [] }: AgentOpParams<"ols.sync">, host: Host): Promise<AgentOpResult<"ols.sync">> {
+async function syncOls({ sites, restart, hooks = null, redirects = [], acmeHosts = [], webmail = [] }: AgentOpParams<"ols.sync">, host: Host): Promise<AgentOpResult<"ols.sync">> {
   const current = (await host.readFile(HTTPD_CONFIG)) ?? "";
   // Without IPv6 in the kernel, a listener on [ANY] would not bind and OLS would not start.
   const ipv6 = (await host.readFile("/proc/net/if_inet6")) !== null;
-  const { block, files } = renderPanelConf(sites, hooks, redirects, acmeHosts, ipv6);
+  const { block, files } = renderPanelConf(sites, hooks, redirects, acmeHosts, ipv6, webmail);
   const next = applyBlock(current, block);
   // What the current block uses, to compare, to undo, and to delete what stops being used.
   const firstLevel = await readFiles(host, includedPanelFiles(panelBlock(current), () => null));

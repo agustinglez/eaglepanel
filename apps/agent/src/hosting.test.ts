@@ -1,4 +1,4 @@
-import { DEFAULT_PHP_OPTIONS } from "@eaglepanel/shared";
+import { DEFAULT_PHP_OPTIONS, WEBMAIL_PHP_VERSION } from "@eaglepanel/shared";
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -309,6 +309,37 @@ describe("OLS configuration", () => {
       expect(v6.split("\n").slice(2)).toEqual(v4.split("\n").slice(2));
     }
     expect([...renderPanelConf([https], null).files.values()].join("\n")).not.toContain("[ANY]");
+  });
+
+  test("webmail: one vhost per domain with its certificate, HTTPS only, sharing one PHP of its own user", () => {
+    const webmail = [{ domain: "b.com", certZone: "b.com", originPull: false, suspended: false }, { domain: "a.com", certZone: "a.com", originPull: true, suspended: false }];
+    const { block, files } = renderPanelConf([], null, [], [], false, webmail);
+    const text = [block, ...files.values()].join("\n");
+    expect(block).toContain(`include ${PANEL_CONF_DIR}/webmail.conf`);
+    expect(block).toContain(`include ${PANEL_CONF_DIR}/webmail/a.com.conf`);
+    const processor = files.get(`${PANEL_CONF_DIR}/webmail.conf`)!;
+    expect(processor).toContain("extUser                 eaglepanel-webmail");
+    expect(processor).toContain("env                     ROUNDCUBE_CONFIG_DIR=/etc/eaglepanel/webmail");
+    expect(processor).toContain(`/lsphp${WEBMAIL_PHP_VERSION}/bin/lsphp`);
+    const vhost = files.get(`${PANEL_CONF_DIR}/webmail/a.com/vhost.conf`)!;
+    expect(vhost).toContain("docRoot                   /opt/roundcube/public_html");
+    expect(vhost).toContain("RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]");
+    expect(vhost).toContain("keyFile                 /usr/local/lsws/conf/eaglepanel-certs/a.com/origin.key");
+    expect(vhost).toContain("clientVerify");
+    expect(vhost).not.toContain("accesslog");
+    expect(listener(text, "eaglepanel-https")).toContain("map                     webmail_a.com webmail.a.com");
+    expect(listener(text, "eaglepanel-http ")).toContain("map                     webmail_b.com webmail.b.com");
+    // Without sites it still has a certificate for the listener: the first webmail's.
+    expect(listener(text, "eaglepanel-https")).toContain("certFile                /usr/local/lsws/conf/eaglepanel-certs/a.com/origin.crt");
+
+    const suspended = renderPanelConf([], null, [], [], false, [{ ...webmail[0]!, suspended: true }]).files.get(`${PANEL_CONF_DIR}/webmail/b.com/vhost.conf`)!;
+    expect(suspended).toContain("RewriteRule ^ - [R=503,L]");
+    expect(renderPanelConf([], null).files.has(`${PANEL_CONF_DIR}/webmail.conf`)).toBe(false);
+  });
+
+  test("webmail runs the installer's PHP", async () => {
+    const installer = await Bun.file(new URL("../../../deploy/install.sh", import.meta.url)).text();
+    expect(/^PHP_VERSION=(\d+)$/m.exec(installer)?.[1]).toBe(WEBMAIL_PHP_VERSION);
   });
 
   test("a listener is open only on its own family", () => {

@@ -191,7 +191,7 @@ describe("mail handlers against Stalwart", () => {
 
   test("status reads the hostname; wrong credentials or no server are reported", async () => {
     const { host, handlers } = setup();
-    expect(await handlers["mail.status"]({}, host)).toEqual({ installed: true, running: true, hostname: "mail.server.test" });
+    expect(await handlers["mail.status"]({}, host)).toEqual({ installed: true, running: true, hostname: "mail.server.test", webmail: false });
 
     const wrong = new FakeHost();
     wrong.files.set(MAIL_ADMIN_FILE, "admin:other");

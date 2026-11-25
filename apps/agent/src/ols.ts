@@ -1,4 +1,4 @@
-import { ACCOUNT_HOOK_PATH, APP_PORT, appAddresses, GLOBAL_HOOK_PATH, MAIL_ACME_PORT, PANEL_API_PORT, type AgentOpParams, type LogLevel, type PhpOptions } from "@eaglepanel/shared";
+import { ACCOUNT_HOOK_PATH, APP_PORT, appAddresses, GLOBAL_HOOK_PATH, MAIL_ACME_PORT, PANEL_API_PORT, webmailHostOf, WEBMAIL_PHP_VERSION, type AgentOpParams, type LogLevel, type PhpOptions } from "@eaglepanel/shared";
 
 export const LSWS = "/usr/local/lsws";
 export const HTTPD_CONFIG = `${LSWS}/conf/httpd_config.conf`;
@@ -472,6 +472,96 @@ export interface HooksSite {
 }
 
 export type RedirectSite = AgentOpParams<"ols.sync">["redirects"][number];
+export type WebmailSite = AgentOpParams<"ols.sync">["webmail"][number];
+
+// ---------------------------------------------------------------------------- Webmail (Roundcube)
+
+/** Installed by the installer with mail: the code is root's, read-only for the user that runs it. */
+export const ROUNDCUBE_DIR = "/opt/roundcube";
+/** Its configuration, outside the code: Roundcube reads it from ROUNDCUBE_CONFIG_DIR. */
+export const ROUNDCUBE_CONFIG_DIR = "/etc/eaglepanel/webmail";
+/** Its SQLite database, sessions, temporary files and logs. */
+export const ROUNDCUBE_DATA_DIR = "/var/lib/eaglepanel-webmail";
+export const WEBMAIL_USER = "eaglepanel-webmail";
+const WEBMAIL_PROCESSOR = "eaglepanel-webmail";
+const webmailProcessorPath = () => `${PANEL_CONF_DIR}/webmail.conf`;
+const webmailRegistrationPath = (domain: string) => `${PANEL_CONF_DIR}/webmail/${domain}.conf`;
+export const webmailVhostPath = (domain: string) => `${PANEL_CONF_DIR}/webmail/${domain}/vhost.conf`;
+export const webmailVhostName = (domain: string) => `webmail_${domain}`;
+
+/**
+ * One PHP for every domain's webmail, at the server level: a single process group, run by its own user, that can only
+ * read Roundcube and write its data directory.
+ */
+export function renderWebmailProcessor(): string {
+  return `extprocessor ${WEBMAIL_PROCESSOR} {
+  type                    lsapi
+  address                 uds://tmp/lshttpd/${WEBMAIL_PROCESSOR}.sock
+  maxConns                10
+  env                     PHP_LSAPI_CHILDREN=10
+  env                     LSAPI_AVOID_FORK=200M
+  env                     ROUNDCUBE_CONFIG_DIR=${ROUNDCUBE_CONFIG_DIR}
+  env                     PHP_INI_SCAN_DIR=:${PHP_SYSTEM_INI_DIR}
+  initTimeout             60
+  retryTimeout            0
+  persistConn             1
+  respBuffer              0
+  autoStart               2
+  path                    ${LSWS}/lsphp${WEBMAIL_PHP_VERSION}/bin/lsphp
+  backlog                 100
+  instances               1
+  extUser                 ${WEBMAIL_USER}
+  extGroup                ${WEBMAIL_USER}
+  priority                0
+  memSoftLimit            512M
+  memHardLimit            768M
+  procSoftLimit           100
+  procHardLimit           150
+}
+`;
+}
+
+/**
+ * Roundcube for a domain, only over HTTPS: port 80 sends to 443. Its public directory is the root, so the code,
+ * the configuration and the data are never reachable from the web. No access log: it would record who reads mail.
+ */
+export function renderWebmailVhost({ certZone, originPull, suspended }: WebmailSite): string {
+  const rules = suspended
+    ? "RewriteRule ^ - [R=503,L]\n"
+    : "RewriteCond %{HTTPS} !on\nRewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]\nRewriteRule ^/?favicon\\.ico$ /static.php/skins/elastic/images/favicon.ico [L]\n";
+  return `docRoot                   ${ROUNDCUBE_DIR}/public_html
+enableGzip                1
+
+index  {
+  useServer               0
+  indexFiles              index.php
+}
+
+rewrite  {
+  enable                  1
+  autoLoadHtaccess        0
+  rules                   <<<END_rules
+${rules}END_rules
+}
+
+# open_basedir without the trailing slash: PHP checks the real path, /opt/roundcube-<version>, not the link.
+phpIniOverride  {
+  php_value open_basedir "${ROUNDCUBE_DIR}:${ROUNDCUBE_CONFIG_DIR}/:${ROUNDCUBE_DATA_DIR}/"
+  php_value error_log "${ROUNDCUBE_DATA_DIR}/logs/php_error.log"
+  php_value upload_max_filesize "25M"
+  php_value post_max_size "30M"
+  php_flag display_errors off
+}
+
+context exp:(^|/)\\.(?!well-known(/|$)) {
+  allowBrowse             0
+}
+
+scripthandler  {
+  add                     lsapi:${WEBMAIL_PROCESSOR} php
+}
+${vhostSsl(certZone, originPull)}`;
+}
 
 /**
  * What the panel registers in OLS lives in its own directory, one file per environment: `httpd_config.conf` only
@@ -561,7 +651,9 @@ export interface PanelConf {
 }
 
 /** `ipv6`: the kernel has IPv6. Tested in WSL: `*:80` and `[ANY]:80` bind side by side and serve the same vhosts. */
-export function renderPanelConf(sites: SyncedSite[], hooks: HooksSite | null, redirects: RedirectSite[] = [], acmeHosts: string[] = [], ipv6 = false): PanelConf {
+export function renderPanelConf(
+  sites: SyncedSite[], hooks: HooksSite | null, redirects: RedirectSite[] = [], acmeHosts: string[] = [], ipv6 = false, webmail: WebmailSite[] = [],
+): PanelConf {
   const sorted = [...sites].sort((a, b) => a.site.localeCompare(b.site));
   const sortedRedirects = [...redirects].sort((a, b) => a.domain.localeCompare(b.domain));
   const files = new Map<string, string>();
@@ -601,6 +693,21 @@ export function renderPanelConf(sites: SyncedSite[], hooks: HooksSite | null, re
     files.set(redirectVhostPath(redirect.domain), renderRedirectVhost(redirect));
   }
 
+  const sortedWebmail = [...webmail].sort((a, b) => a.domain.localeCompare(b.domain));
+  if (sortedWebmail.length > 0) files.set(webmailProcessorPath(), renderWebmailProcessor());
+  for (const site of sortedWebmail) {
+    // allowSymbolLink: ROUNDCUBE_DIR is a link to the installed version, root's like everything under it.
+    files.set(webmailRegistrationPath(site.domain), `virtualhost ${webmailVhostName(site.domain)} {
+  vhRoot                  ${ROUNDCUBE_DIR}
+  configFile              ${relativeToLsws(webmailVhostPath(site.domain))}
+  allowSymbolLink         1
+  enableScript            1
+  restrained              1
+}
+`);
+    files.set(webmailVhostPath(site.domain), renderWebmailVhost(site));
+  }
+
   const acmeNames = [...new Set(acmeHosts)].sort();
   if (acmeNames.length > 0) {
     files.set(ACME_REGISTRATION_PATH, `virtualhost ${ACME_VHOST} {
@@ -625,6 +732,7 @@ export function renderPanelConf(sites: SyncedSite[], hooks: HooksSite | null, re
       return names.length > 0 ? [mapLine(redirectVhostName(redirect.domain), names)] : [];
     }),
     ...(hooks && (!secure || hooks.certZone) ? [mapLine(HOOKS_VHOST, [hooks.fqdn])] : []),
+    ...sortedWebmail.map((site) => mapLine(webmailVhostName(site.domain), [webmailHostOf(site.domain)])),
     // Port 80 only: on 443 these names are not OLS's (mail clients connect to Stalwart, on its own ports).
     ...(!secure && acmeNames.length > 0 ? [mapLine(ACME_VHOST, acmeNames)] : []),
   ];
@@ -647,7 +755,7 @@ ${httpMaps.join("\n")}
   // is requiring it on its vhost; a domain that does not require it keeps working even if the listener asks for it.
   const secureSites = sorted.filter((site) => site.certZone !== null);
   const secureRedirects = sortedRedirects.filter((redirect) => redirect.certZone !== null && redirect.hosts.some((host) => host.secure));
-  const fallbackZone = secureSites[0]?.certZone ?? secureRedirects[0]?.certZone ?? hooks?.certZone;
+  const fallbackZone = secureSites[0]?.certZone ?? secureRedirects[0]?.certZone ?? hooks?.certZone ?? sortedWebmail[0]?.certZone;
   const httpsMaps = maps(true);
   if (fallbackZone && httpsMaps.length > 0) {
     const originPull = secureSites.some((site) => site.originPull) || secureRedirects.some((redirect) => redirect.originPull);

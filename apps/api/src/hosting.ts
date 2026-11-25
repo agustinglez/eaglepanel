@@ -50,7 +50,7 @@ import type { Db } from "./db";
 import { registerAppRoutes } from "./apps";
 import { createBackups } from "./backups";
 import { registerMigrationRoutes } from "./migration";
-import { mailDomainsIn, mailReservedConflict, registerMailRoutes } from "./mail";
+import { mailDomainsIn, mailReservedConflict, registerMailRoutes, webmailCertificate } from "./mail";
 import type { DnsLookup } from "./mail-dns";
 import { accounts, appEnv, apps, certificates, databases, deployQueue, domains, hostnames, mailDomains, settings, vhosts } from "./db/schema";
 import type { JobRunner, JobStep } from "./jobs";
@@ -249,7 +249,15 @@ export function createHostingRoutes({ db, agent, jobs, dnsLookup }: HostingDeps)
     // The server mail name gets its certificate the same way.
     const mailServer = await agent.call("mail.status", {}).catch(() => null);
     if (mailServer?.hostname && !mailServer.hostname.endsWith(".invalid") && !acmeHosts.includes(mailServer.hostname)) acmeHosts.push(mailServer.hostname);
-    await agent.call("ols.sync", { sites, redirects, restart: options.restart, hooks: domain ? { fqdn: domain, certZone: zoneCovering(domain) } : null, acmeHosts });
+    // Roundcube for each mail domain whose certificate covers webmail.<domain>: never without HTTPS.
+    const webmail = mailServer?.installed && mailServer.webmail
+      ? db.select({ domain: mailDomains.domain }).from(mailDomains).all().flatMap(({ domain: zone }) => {
+        const certificate = webmailCertificate(db, zone);
+        const owner = db.select({ username: domains.username }).from(domains).where(eq(domains.fqdn, zone)).get()?.username;
+        return certificate ? [{ domain: zone, certZone: certificate.zone, originPull: certificate.originPull, suspended: owner ? accountRow(owner)?.suspended ?? false : false }] : [];
+      })
+      : [];
+    await agent.call("ols.sync", { sites, redirects, restart: options.restart, hooks: domain ? { fqdn: domain, certZone: zoneCovering(domain) } : null, acmeHosts, webmail });
   }
 
   async function writeSite(row: VhostRow) {

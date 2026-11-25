@@ -1,4 +1,5 @@
 import {
+  certCovers,
   DEFAULT_MAILBOX_QUOTA_MB,
   MAIL_CERT_RENEW_DAYS,
   MAX_MAILBOX_ALIASES,
@@ -8,10 +9,12 @@ import {
   isMailReserved,
   mailLocalPartSchema,
   mailQuotaMbSchema,
+  webmailHostOf,
   type DnsRecordDto,
   type MailCertificateDto,
   type MailDomainDto,
   type ServerMailDto,
+  type WebmailDto,
 } from "@eaglepanel/shared";
 import { and, asc, eq } from "drizzle-orm";
 import type { Context, Hono } from "hono";
@@ -19,7 +22,7 @@ import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import type { AgentClient } from "./agent-client";
 import type { Db } from "./db";
-import { domains, hostnames, mailDomains, mailForwarders, mailboxes, settings } from "./db/schema";
+import { certificates, domains, hostnames, mailDomains, mailForwarders, mailboxes, settings } from "./db/schema";
 import type { JobStep } from "./jobs";
 import { checkPtr, checkRecords, expectedRecords, mailHostOf, publicLookup, sameAddress, serverRecords, type DnsLookup } from "./mail-dns";
 
@@ -306,6 +309,7 @@ export function registerMailRoutes(routes: Hono, { db, agent, readBody, startJob
       return {
         domain: zone, enabled: false, available: status?.installed ?? false, catchAll: null, mailboxes: [], forwarders: [], mailHost, records: [], checkedAt: null, serverError: null,
         certificate: { state: "waiting", notAfter: null, error: null, attemptAt: null },
+        webmail: { url: `https://${webmailHostOf(zone)}/`, state: "not_installed" },
       };
     }
     let serverError: string | null = null;
@@ -350,7 +354,15 @@ export function registerMailRoutes(routes: Hono, { db, agent, readBody, startJob
       checkedAt: cached!.at,
       serverError,
       certificate: certificateDto(zone, domainCertificate(mailRow(zone) ?? row), pointed),
+      webmail: await webmailOf(zone),
     };
+  }
+
+  async function webmailOf(zone: string): Promise<WebmailDto> {
+    const url = `https://${webmailHostOf(zone)}/`;
+    const status = await agent.call("mail.status", {}).catch(() => null);
+    if (!status?.webmail) return { url, state: "not_installed" };
+    return { url, state: webmailCertificate(db, zone) ? "ready" : "no_certificate" };
   }
 
   routes.get("/accounts/:username/domains/:zone/mail", async (c) => {
@@ -594,6 +606,15 @@ export const mailDomainsIn = (db: Db, zones: string[]) =>
   zones.filter((zone) => db.select().from(mailDomains).where(eq(mailDomains.domain, zone)).get() !== undefined);
 
 /** A reserved mail name of a domain with mail: it cannot be added as a subdomain nor be used by an environment. */
+/**
+ * The domain's own certificate, if it covers `webmail.<domain>` (a wildcard does): Roundcube is only published over
+ * HTTPS, with the same certificate as the domain's environments.
+ */
+export function webmailCertificate(db: Db, zone: string): { zone: string; originPull: boolean } | null {
+  const row = db.select().from(certificates).where(eq(certificates.zone, zone)).get();
+  return row && certCovers(row.names, webmailHostOf(zone)) ? { zone: row.zone, originPull: row.originPull } : null;
+}
+
 export function mailReservedConflict(db: Db, fqdn: string): string | null {
   const domain = db.select({ domain: mailDomains.domain }).from(mailDomains).all().find((row) => isMailReserved(fqdn, row.domain));
   return domain ? `${fqdn} is reserved for the mail of ${domain.domain}` : null;

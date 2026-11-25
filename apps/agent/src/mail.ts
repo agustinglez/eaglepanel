@@ -2,6 +2,7 @@ import { MAIL_HTTP_PORT, mailHostOf, type AgentOpParams, type AgentOpResult, typ
 import type { Host } from "./host";
 import { connect } from "node:net";
 import { forgetCertificate, INSTALL_CONF, obtainCertificate } from "./mail-cert";
+import { ROUNDCUBE_CONFIG_DIR, ROUNDCUBE_DIR } from "./ols";
 
 /** Mail servers of large providers, always up: if none answers on port 25, the provider blocks it. */
 const PORT25_PROBES = ["gmail-smtp-in.l.google.com", "mx1.mail.icloud.com", "mx-aol.mail.gm0.yahoodns.net"];
@@ -212,17 +213,20 @@ export function createMailHandlers(jmapFor: (host: Host) => Jmap) {
 
   const handlers = {
     "mail.status": async (_params: AgentOpParams<"mail.status">, host: Host): Promise<AgentOpResult<"mail.status">> => {
-      if (host.sandbox) return { installed: true, running: true, hostname: "mail.sandbox.test" };
+      if (host.sandbox) return { installed: true, running: true, hostname: "mail.sandbox.test", webmail: true };
       // Turned off with `eagle mail off`, the binary and the data stay: what counts is whether the service is enabled.
       const installed = (await host.run("test", ["-x", STALWART_BIN])).code === 0
         && (await host.run("systemctl", ["is-enabled", "--quiet", "stalwart"])).code === 0;
-      if (!installed) return { installed, running: false, hostname: null };
+      if (!installed) return { installed, running: false, hostname: null, webmail: false };
+      // Its configuration is written last by the installer: without it Roundcube is not ready.
+      const webmail = (await host.readFile(`${ROUNDCUBE_CONFIG_DIR}/config.inc.php`)) !== null
+        && (await host.run("test", ["-f", `${ROUNDCUBE_DIR}/public_html/index.php`])).code === 0;
       try {
         const [settings] = await jmapFor(host).request([["x:SystemSettings/get", { ids: ["singleton"], properties: ["defaultHostname"] }]]);
         const list = (settings!.list as { defaultHostname?: string }[] | undefined) ?? [];
-        return { installed, running: true, hostname: list[0]?.defaultHostname || null };
+        return { installed, running: true, hostname: list[0]?.defaultHostname || null, webmail };
       } catch {
-        return { installed, running: false, hostname: null };
+        return { installed, running: false, hostname: null, webmail };
       }
     },
 

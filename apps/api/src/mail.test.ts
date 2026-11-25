@@ -10,7 +10,7 @@ import type { AgentClient } from "./agent-client";
 import { createApp } from "./app";
 import { hashPassword, setAdminCredentials } from "./auth";
 import { openDb, type Db } from "./db";
-import { auditLog, jobSteps } from "./db/schema";
+import { auditLog, certificates, jobSteps } from "./db/schema";
 import { JobRunner } from "./jobs";
 import { checkRecord, expectedRecords, joinTxtChunks, type DnsLookup } from "./mail-dns";
 import { createSiteAccount } from "./test-support";
@@ -49,7 +49,7 @@ const agent: AgentClient = {
     calls.push({ op, params });
     if (op === "php.versions") return { versions: ["85"] };
     if (op === "system.publicIp") return { ip: SERVER_IP, ip6: serverIp6 };
-    if (op === "mail.status") return { installed: mailInstalled, running: mailInstalled, hostname: mailInstalled ? mailHostname : null };
+    if (op === "mail.status") return { installed: mailInstalled, running: mailInstalled, hostname: mailInstalled ? mailHostname : null, webmail: mailInstalled };
     if (failOn === op) {
       failOn = null;
       throw new Error(`simulated failure in ${op}`);
@@ -327,6 +327,31 @@ describe("certificate of mail.<domain>", () => {
     expect(callsTo("mail.cert.issue")).toHaveLength(1);
     expect((await runJob(certPath)).status).toBe("succeeded");
     expect((await mail()).certificate).toMatchObject({ state: "valid", error: null });
+  });
+});
+
+describe("webmail", () => {
+  const webmailOf = async () => ((await (await app.request(`/api${MAIL}`, { headers: { cookie } })).json()) as MailDomainDto).webmail;
+  const published = () => (callsTo("ols.sync").at(-1) as { webmail: unknown[] }).webmail;
+
+  test("is published only with a certificate of the domain that covers webmail.<domain>", async () => {
+    await runJob(`${MAIL}/enable`);
+    expect(await webmailOf()).toEqual({ url: "https://webmail.example.com/", state: "no_certificate" });
+    expect(published()).toEqual([]);
+
+    db.insert(certificates).values({ zone: "example.com", username: "acme", names: ["example.com", "www.example.com"], notAfter: Date.now() + 86_400_000 }).run();
+    expect((await webmailOf()).state).toBe("no_certificate"); // without the wildcard it does not cover it
+
+    db.update(certificates).set({ names: ["*.example.com", "example.com"] }).run();
+    expect((await webmailOf()).state).toBe("ready");
+    await runJob(`${MAIL}/disable`);
+    await runJob(`${MAIL}/enable`);
+    expect(published()).toEqual([{ domain: "example.com", certZone: "example.com", originPull: false, suspended: false }]);
+  });
+
+  test("without mail installed it is not offered", async () => {
+    mailInstalled = false;
+    expect((await webmailOf()).state).toBe("not_installed");
   });
 });
 

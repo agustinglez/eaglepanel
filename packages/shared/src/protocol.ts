@@ -323,6 +323,8 @@ export const agentOps = {
       hooks: z.object({ fqdn: fqdnSchema, certZone: fqdnSchema.nullable() }).strict().nullable().optional(),
       /** Mail names (`mail.<domain>`): on port 80 they only answer the ACME validation, proxied to MAIL_ACME_PORT. */
       acmeHosts: z.array(fqdnSchema).default([]),
+      /** Mail domains with Roundcube at webmail.<domain>, each with the certificate of its domain. */
+      webmail: z.array(z.object({ domain: fqdnSchema, certZone: fqdnSchema, originPull: z.boolean(), suspended: z.boolean() }).strict()).default([]),
     }).strict(),
     result: z.object({ changed: z.boolean() }),
   },

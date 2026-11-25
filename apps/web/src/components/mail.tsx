@@ -466,7 +466,22 @@ function ClientSettingsCard({ base, data }: { base: string; data: MailDomainDto 
           <dd className="font-medium">{t("{{host}}, port 465 SSL/TLS, or 587 STARTTLS", { host: data.mailHost })}</dd>
           <dt className="text-muted-foreground">{t("Certificate")}</dt>
           <dd><CertificateState certificate={data.certificate} host={data.mailHost} /></dd>
+          <dt className="text-muted-foreground">{t("Webmail")}</dt>
+          <dd>
+            {data.webmail.state === "ready" && (
+              <a href={data.webmail.url} target="_blank" rel="noreferrer" className="font-medium underline-offset-4 hover:underline">{data.webmail.url}</a>
+            )}
+            {data.webmail.state === "no_certificate" && (
+              <span className="text-muted-foreground">{t("Not published: the domain has no certificate that covers {{host}}.", { host: new URL(data.webmail.url).host })}</span>
+            )}
+            {data.webmail.state === "not_installed" && <span className="text-muted-foreground">{t("Not installed on this server.")}</span>}
+          </dd>
         </dl>
+        {data.webmail.state === "ready" && (
+          <p className="text-sm text-muted-foreground">
+            {t("For webmail, {{host}} has to point to this server in DNS (an A record, with or without the Cloudflare proxy). Users sign in with the full address or just the part before the @.", { host: new URL(data.webmail.url).host })}
+          </p>
+        )}
         {state !== "valid" && state !== "expiring" && (
           <p className="text-sm text-muted-foreground">{t("Until it has one, mail programs warn that the connection is not trusted.")}</p>
         )}

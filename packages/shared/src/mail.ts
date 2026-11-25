@@ -34,6 +34,12 @@ export const MAX_FORWARDER_RECIPIENTS = 50;
  */
 export const MAIL_RESERVED_SUBDOMAINS = ["mail", "webmail", "mta-sts", "autoconfig", "autodiscover"] as const;
 
+/** lsphp that runs Roundcube: the installer's PHP_VERSION (a test checks they match). */
+export const WEBMAIL_PHP_VERSION = "85";
+
+/** Roundcube for a domain: `webmail.example.com`. */
+export const webmailHostOf = (domain: string) => `webmail.${domain}`;
+
 /** `mail.example.com` and the like, for a domain that has mail. */
 export const isMailReserved = (fqdn: string, domain: string) =>
   MAIL_RESERVED_SUBDOMAINS.some((label) => fqdn === `${label}.${domain}`);
@@ -63,7 +69,8 @@ export const mailOps = {
   /** Whether Stalwart is installed and answering, and the name it greets with (the server hostname for mail). */
   "mail.status": {
     params: z.object({}).strict(),
-    result: z.object({ installed: z.boolean(), running: z.boolean(), hostname: z.string().nullable() }),
+    /** `webmail`: Roundcube is installed (it comes with mail, from the installer). */
+    result: z.object({ installed: z.boolean(), running: z.boolean(), hostname: z.string().nullable(), webmail: z.boolean().default(false) }),
   },
   /** Creates the domain in Stalwart, or updates it. Stalwart generates its DKIM keys (RSA and Ed25519) by itself. */
   "mail.domain.set": {
@@ -222,4 +229,14 @@ export interface MailDomainDto {
   /** Mail is not installed on the server, or Stalwart is not answering. */
   serverError: string | null;
   certificate: MailCertificateDto;
+  webmail: WebmailDto;
+}
+
+/**
+ * Roundcube at `webmail.<domain>`, served over HTTPS with the domain's certificate (the one its environments use).
+ * `no_certificate`: the domain has none covering that name, and it is not published without one.
+ */
+export interface WebmailDto {
+  url: string;
+  state: "ready" | "no_certificate" | "not_installed";
 }
