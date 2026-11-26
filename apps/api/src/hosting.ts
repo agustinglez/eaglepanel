@@ -5,6 +5,7 @@ import {
   accountServiceSchema,
   certCovers,
   dbNameSchema,
+  dbTuningSchema,
   DEFAULT_LIMITS,
   DEFAULT_LOG_DAYS,
   DEFAULT_LOG_LEVEL,
@@ -1171,7 +1172,7 @@ export function createHostingRoutes({ db, agent, jobs, dnsLookup }: HostingDeps)
   routes.get("/settings/server", (c) => c.json({ hooksDomain: hooksDomain() } satisfies ServerSettingsDto));
 
   routes.get("/settings/mysql", async (c) => {
-    const state = await agent.call("mysql.diagnostics.get", {}).catch(() => ({ running: null, configured: false, memoryMb: null }));
+    const state = await agent.call("mysql.diagnostics.get", {}).catch(() => ({ engine: null, running: null, configured: false, memoryMb: null, ramMb: null, tuning: null, tuningRunning: null }));
     return c.json(state satisfies MysqlSettingsDto);
   });
 
@@ -1180,12 +1181,25 @@ export function createHostingRoutes({ db, agent, jobs, dnsLookup }: HostingDeps)
     const body = await readBody(c, z.object({ performanceSchema: z.boolean() }).strict());
     if ("error" in body) return c.json({ error: body.error }, 400);
     const enabled = body.data.performanceSchema;
-    return startJob(c, "mysql.diagnostics", `${enabled ? "Turn on" : "Turn off"} MySQL performance_schema`, [{
-      name: "Restart MySQL with the new setting",
+    return startJob(c, "mysql.diagnostics", `${enabled ? "Turn on" : "Turn off"} performance_schema`, [{
+      name: "Restart the database server with the new setting",
       run: async () => {
         await agent.call("mysql.diagnostics.set", { enabled });
       },
     }], enabled ? "on" : "off");
+  });
+
+  // Memory settings: the server restarts with them; if it does not start, the agent puts the previous ones back.
+  routes.post("/settings/mysql/tuning", async (c) => {
+    const body = await readBody(c, z.object({ tuning: dbTuningSchema }).strict());
+    if ("error" in body) return c.json({ error: body.error }, 400);
+    const { tuning } = body.data;
+    return startJob(c, "mysql.tuning", "Change the database server memory settings", [{
+      name: "Restart the database server with the new settings",
+      run: async () => {
+        await agent.call("mysql.tuning.set", { tuning });
+      },
+    }], `buffer pool ${tuning.bufferPoolMb} MB, ${tuning.maxConnections} connections`);
   });
 
   const serverSettingsSchema = z.object({ hooksDomain: fqdnSchema.nullable() }).strict();

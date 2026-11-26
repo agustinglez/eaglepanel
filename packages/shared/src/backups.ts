@@ -97,12 +97,15 @@ export const backupManifestSchema = z.object({
 });
 export type BackupManifest = z.infer<typeof backupManifestSchema>;
 
-/** caching_sha2_password hash in hexadecimal, as `SHOW CREATE USER` returns it with print_identified_with_as_hex. */
-export const mysqlAuthHashSchema = z.string().regex(/^0x[0-9A-F]{40,400}$/, "Invalid hash");
+/**
+ * The password hash of a database user. MySQL: caching_sha2_password in hexadecimal, as `SHOW CREATE USER` returns it
+ * with print_identified_with_as_hex. MariaDB: mysql_native_password, `*` and 40 hexadecimal digits.
+ */
+export const mysqlAuthHashSchema = z.string().regex(/^(0x[0-9A-F]{40,400}|\*[0-9A-F]{40})$/, "Invalid hash");
 
 /** Extracts the hash from the stored `CREATE USER`. `null` if it is not in the expected format: nothing else from that statement is used. */
 export function authHashOf(createUser: string): string | null {
-  const match = /IDENTIFIED WITH 'caching_sha2_password' AS (0x[0-9A-F]+)/.exec(createUser);
+  const match = /IDENTIFIED WITH 'caching_sha2_password' AS (0x[0-9A-F]+)/.exec(createUser) ?? /IDENTIFIED BY PASSWORD '(\*[0-9A-F]{40})'/.exec(createUser);
   return match && mysqlAuthHashSchema.safeParse(match[1]).success ? match[1]! : null;
 }
 

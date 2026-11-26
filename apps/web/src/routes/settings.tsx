@@ -1,6 +1,6 @@
 import { BackupSettingsCard } from "@/components/backups";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { GLOBAL_HOOK_PATH, type JobCreatedDto, type MeDto, type MysqlSettingsDto, type ServerSettingsDto, type WordPressSettingsDto } from "@eaglepanel/shared";
+import { DEFAULT_DB_TUNING, dbTuningSchema, GLOBAL_HOOK_PATH, type DbTuning, type JobCreatedDto, type MeDto, type MysqlSettingsDto, type ServerSettingsDto, type WordPressSettingsDto } from "@eaglepanel/shared";
 import { QRCodeSVG } from "qrcode.react";
 import { useState, type SyntheticEvent } from "react";
 import { useTranslation } from "react-i18next";
@@ -13,6 +13,7 @@ import { ServerMailCard } from "@/components/server-mail";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { api } from "@/lib/api";
 
 function CodeInput({ id, value, onChange }: { id: string; value: string; onChange: (value: string) => void }) {
@@ -164,7 +165,7 @@ function HooksDomainForm({ saved }: { saved: string | null }) {
   );
 }
 
-/** MySQL's performance_schema: off by default; on only while a slow database is being looked into. */
+/** performance_schema of MySQL or MariaDB: off by default; on only while a slow database is being looked into. */
 function MysqlCard() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -172,25 +173,124 @@ function MysqlCard() {
   const change = useJobAction((enabled: boolean) => api.post<JobCreatedDto>("/settings/mysql", { performanceSchema: enabled }));
   const data = current.data;
   const on = data?.running ?? data?.configured ?? false;
+  const engine = data?.engine === "mariadb" ? "MariaDB" : "MySQL";
 
   return (
     <Card className="max-w-3xl">
       <CardHeader>
-        <CardTitle>{t("MySQL diagnostics")}</CardTitle>
+        <CardTitle>{t("{{engine}} diagnostics", { engine })}</CardTitle>
         <CardDescription>
           {t("performance_schema records which queries run, how long they take and what they wait for. It reserves a few hundred MB of RAM, so it is off: turn it on to look into a slow database, and off again when done.")}
         </CardDescription>
-        {data && <CardAction><Badge variant={on ? "default" : "outline"}>{data.running === null ? t("MySQL is not answering") : on ? t("On") : t("Off")}</Badge></CardAction>}
+        {data && <CardAction><Badge variant={on ? "default" : "outline"}>{data.running === null ? t("{{engine}} is not answering", { engine }) : on ? t("On") : t("Off")}</Badge></CardAction>}
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
-        {data?.memoryMb != null && <p className="text-sm text-muted-foreground">{t("MySQL uses {{mb}} MB of RAM now.", { mb: data.memoryMb })}</p>}
+        {data?.memoryMb != null && <p className="text-sm text-muted-foreground">{t("{{engine}} uses {{mb}} MB of RAM now.", { engine, mb: data.memoryMb })}</p>}
         <div>
           <Button variant="outline" disabled={!data || data.running === null || change.isPending} onClick={() => change.mutate(!on)}>
             {on ? t("Turn off") : t("Turn on")}
           </Button>
         </div>
-        <p className="text-sm text-muted-foreground">{t("Changing it restarts MySQL: sites are a few seconds without their databases.")}</p>
+        <p className="text-sm text-muted-foreground">{t("Changing it restarts {{engine}}: sites are a few seconds without their databases.", { engine })}</p>
         <ActionFeedback action={change} onFinished={() => void queryClient.invalidateQueries({ queryKey: ["mysql-settings"] })} />
+      </CardContent>
+    </Card>
+  );
+}
+
+type TuningField = Exclude<keyof DbTuning, "xProtocol">;
+const TUNING_FIELDS: { key: TuningField; label: string; unit: string; hint: string }[] = [
+  { key: "bufferPoolMb", label: "Buffer pool", unit: "MB", hint: "Cache of data and indexes. Enough when it holds the databases that are in use; more is RAM the sites lose." },
+  { key: "logBufferMb", label: "Log buffer", unit: "MB", hint: "Writes waiting to reach the disk. A few MB are enough unless there are large imports." },
+  { key: "maxConnections", label: "Connections", unit: "", hint: "At the same time, for every site together. Each one reserves memory while it is open." },
+  { key: "tableOpenCache", label: "Open tables cache", unit: "", hint: "Tables kept open. Raise it if the server has many sites with many tables." },
+  { key: "tableDefinitionCache", label: "Table definitions cache", unit: "", hint: "Table structures kept in memory. 400 is the minimum." },
+];
+
+const tuningForm = (tuning: DbTuning) => Object.fromEntries(TUNING_FIELDS.map(({ key }) => [key, String(tuning[key])])) as Record<TuningField, string>;
+
+/** Memory settings of MySQL or MariaDB: small by default, raised here when the databases need it. */
+function DatabaseMemoryCard() {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const current = useQuery({ queryKey: ["mysql-settings"], queryFn: () => api.get<MysqlSettingsDto>("/settings/mysql") });
+  const data = current.data;
+  const saved = data?.tuning ?? null;
+  const [form, setForm] = useState<Record<TuningField, string> | null>(null);
+  const [xProtocol, setXProtocol] = useState<boolean | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const change = useJobAction((tuning: DbTuning) => api.post<JobCreatedDto>("/settings/mysql/tuning", { tuning }));
+  const engine = data?.engine === "mariadb" ? "MariaDB" : "MySQL";
+  const values = form ?? tuningForm(saved ?? DEFAULT_DB_TUNING);
+  const x = xProtocol ?? saved?.xProtocol ?? DEFAULT_DB_TUNING.xProtocol;
+
+  function submit(event: SyntheticEvent) {
+    event.preventDefault();
+    const parsed = dbTuningSchema.safeParse({ ...Object.fromEntries(TUNING_FIELDS.map(({ key }) => [key, Number(values[key])])), xProtocol: data?.engine === "mysql" && x });
+    if (!parsed.success) {
+      setError(parsed.error.issues[0] ? `${t(TUNING_FIELDS.find(({ key }) => key === parsed.error.issues[0]!.path[0])?.label ?? "Value")}: ${t(parsed.error.issues[0].message)}` : t("Invalid data"));
+      return;
+    }
+    setError(null);
+    change.mutate(parsed.data);
+  }
+
+  return (
+    <Card className="max-w-3xl">
+      <CardHeader>
+        <CardTitle>{t("{{engine}} memory", { engine })}</CardTitle>
+        <CardDescription>
+          {t("Small values by default: the databases of a hosting server are usually small, and every MB reserved here is RAM the sites do not have. Raise them when the databases grow.")}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        {data && !saved && <p className="text-sm text-muted-foreground">{t("{{engine}} uses its own defaults now (no settings from the panel). Saving writes these values.", { engine })}</p>}
+        {data?.ramMb != null && <p className="text-sm text-muted-foreground">{t("The server has {{mb}} MB of RAM.", { mb: data.ramMb })}</p>}
+        <form onSubmit={submit} className="flex flex-col gap-4">
+          <div className="grid gap-4 sm:grid-cols-2">
+            {TUNING_FIELDS.map(({ key, label, unit, hint }) => (
+              <div key={key} className="flex flex-col gap-1.5">
+                <Label htmlFor={`tuning-${key}`}>{unit ? `${t(label)} (${unit})` : t(label)}</Label>
+                <Input
+                  id={`tuning-${key}`}
+                  inputMode="numeric"
+                  value={values[key]}
+                  onChange={(event) => setForm({ ...values, [key]: event.target.value.replace(/\D/g, "") })}
+                  className="w-40"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t(hint)}
+                  {data?.tuningRunning && ` ${t("Now: {{value}}.", { value: data.tuningRunning[key] })}`}
+                </p>
+              </div>
+            ))}
+          </div>
+          {data?.engine === "mysql" && (
+            <div className="flex items-start gap-3">
+              <Switch id="tuning-x" checked={x} onCheckedChange={setXProtocol} />
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="tuning-x">{t("X Protocol")}</Label>
+                <p className="text-xs text-muted-foreground">{t("For MySQL Shell and the document store, on port 33060 (local only). PHP and WordPress do not use it.")}</p>
+              </div>
+            </div>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button type="submit" disabled={!data || data.running === null || change.isPending}>{t("Save and restart")}</Button>
+            <Button type="button" variant="outline" onClick={() => { setForm(tuningForm(DEFAULT_DB_TUNING)); setXProtocol(DEFAULT_DB_TUNING.xProtocol); setError(null); }}>
+              {t("Recommended values")}
+            </Button>
+          </div>
+        </form>
+        {error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}
+        <p className="text-sm text-muted-foreground">{t("Saving restarts {{engine}}: sites are a few seconds without their databases. If it does not start with the new values, the previous ones are put back.", { engine })}</p>
+        <ActionFeedback
+          action={change}
+          onFinished={() => {
+            setForm(null);
+            setXProtocol(null);
+            void queryClient.invalidateQueries({ queryKey: ["mysql-settings"] });
+          }}
+        />
       </CardContent>
     </Card>
   );
@@ -272,6 +372,7 @@ export function SettingsPage() {
       <HooksDomainCard />
       <WordfenceCard />
       <MysqlCard />
+      <DatabaseMemoryCard />
     </Page>
   );
 }

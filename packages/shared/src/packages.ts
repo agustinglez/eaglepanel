@@ -25,10 +25,12 @@ export const SYSTEM_COMPONENTS = [
   {
     id: "mysql",
     name: "MySQL",
-    packages: ["mysql-server", "mysql-community-server", "mysql-server-*", "mysql-client*", "mysql-common", "mysql-community-*"],
+    packages: ["mysql-server*", "mysql-community-server", "mysql-client*", "mysql-common", "mysql-community-*"],
     upstream: ["mysql-community-*"],
     cpe: "cpe:2.3:a:oracle:mysql",
   },
+  // Chosen instead of MySQL at installation: from the distribution.
+  { id: "mariadb", name: "MariaDB", packages: ["mariadb-server*", "mariadb-client*", "mariadb-common", "mariadb-plugin-*"] },
   { id: "redis", name: "Redis", packages: ["redis-server", "redis-tools", "redis"] },
   { id: "memcached", name: "Memcached", packages: ["memcached"] },
   { id: "vsftpd", name: "vsftpd", packages: ["vsftpd"] },

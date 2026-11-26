@@ -12,6 +12,7 @@ export default defineConfig({
   build: { assetsInlineLimit: 0 },
   server: {
     port: 5173,
-    proxy: { "/api": "http://127.0.0.1:8090" },
+    // The same port as the API (API_PORT in .env): another one when 8090 is taken, such as by WSL.
+    proxy: { "/api": `http://127.0.0.1:${process.env.API_PORT ?? 8090}` },
   },
 });

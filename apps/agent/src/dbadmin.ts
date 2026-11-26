@@ -29,6 +29,7 @@ import {
   type DbTableDto,
   type RowQuery,
 } from "@eaglepanel/shared";
+import { collationFix, dbClient, dbEngine, defaultCollation, dumpCommand } from "./db-engine";
 import { SandboxHost, type Host } from "./host";
 
 const MYSQL_SOCKET = "/run/mysqld/mysqld.sock";
@@ -59,8 +60,9 @@ export interface SqlClient {
 /** A single connection as root through the socket (auth_socket): every query of an operation goes through it. */
 export async function rootSql(database?: string): Promise<SqlClient> {
   const sql = new SQL({ adapter: "mysql", path: MYSQL_SOCKET, username: "root", database, max: 1, idleTimeout: 30 });
-  // Without this, information_schema returns sizes and row counts cached for up to a day.
-  await sql.unsafe("SET SESSION information_schema_stats_expiry = 0");
+  // Without this, MySQL's information_schema returns sizes and row counts cached for up to a day. MariaDB reads them
+  // fresh and has no such setting.
+  if (dbEngine() === "mysql") await sql.unsafe("SET SESSION information_schema_stats_expiry = 0");
   return {
     query: async (text, params = []) => [...(await sql.unsafe(text, params))] as Record<string, unknown>[],
     close: () => sql.close(),
@@ -275,11 +277,7 @@ export async function readRows(sql: SqlClient, database: string, table: string, 
 
 // ---------------------------------------------------------------------------- Export
 
-const dumpArgs = (database: string, structureOnly: boolean) => [
-  "mysqldump", "--protocol=socket", "-uroot", "--single-transaction", "--quick", "--routines", "--triggers", "--events",
-  "--hex-blob", "--default-character-set=utf8mb4", "--set-gtid-purged=OFF", "--no-tablespaces",
-  ...(structureOnly ? ["--no-data"] : []), database,
-];
+const dumpArgs = (database: string, structureOnly: boolean) => [...dumpCommand(), ...(structureOnly ? ["--no-data"] : []), database];
 
 /** mysqldump compressed on the fly. The download starts at once; a large database is never held in memory. */
 export function exportStream(database: string, structureOnly: boolean): ReadableStream<Uint8Array> {
@@ -386,7 +384,7 @@ async function run(cmd: string[], options: { stdin?: ReadableStream<Uint8Array> 
 async function loadDump(file: string, gzip: boolean, sedArgs: string[], mysqlArgs: string[]): Promise<void> {
   const source = Bun.spawn(gzip ? ["gzip", "-dc", file] : ["cat", file], { env: TOOL_ENV, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const filter = Bun.spawn(["sed", ...sedArgs], { env: TOOL_ENV, stdin: source.stdout, stdout: "pipe", stderr: "pipe" });
-  const mysql = Bun.spawn(["mysql", ...mysqlArgs], { env: TOOL_ENV, stdin: filter.stdout, stdout: "ignore", stderr: "pipe" });
+  const mysql = Bun.spawn([dbClient(), ...mysqlArgs], { env: TOOL_ENV, stdin: filter.stdout, stdout: "ignore", stderr: "pipe" });
   const [sourceErr, sourceCode, filterErr, filterCode, mysqlErr, mysqlCode] = await Promise.all([
     new Response(source.stderr).text(), source.exited,
     new Response(filter.stderr).text(), filter.exited,
@@ -405,7 +403,7 @@ async function isGzip(file: string): Promise<boolean> {
 async function recreate(sql: SqlClient, database: string): Promise<void> {
   // The privileges of the database user are on the name: they survive.
   await sql.query(`/* ep:drop */ DROP DATABASE IF EXISTS ${quoteName(database)}`);
-  await sql.query(`/* ep:createdb */ CREATE DATABASE ${quoteName(database)} CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`);
+  await sql.query(`/* ep:createdb */ CREATE DATABASE ${quoteName(database)} CHARACTER SET utf8mb4 COLLATE ${defaultCollation()}`);
   // Dropping it left the connection without a current database: SHOW CREATE gives unqualified names.
   await sql.query(`/* ep:use */ USE ${quoteName(database)}`);
 }
@@ -485,7 +483,7 @@ export async function importDatabase(host: Host, database: string, upload: strin
     try {
       await sql.query(`/* ep:grant */ GRANT ALL ON ${grantTarget(database)} TO '${user}'@'localhost'`);
       if (replace) await recreate(sql, database);
-      await loadDump(file, await isGzip(file), STRIP_DEFINER, [
+      await loadDump(file, await isGzip(file), [...STRIP_DEFINER, ...collationFix()], [
         `--defaults-extra-file=${credentials}`, "--protocol=socket", "--one-database", "--default-character-set=utf8mb4", database,
       ]);
       await reassignDefiners(sql, database, user, database);
@@ -633,8 +631,10 @@ export async function executeStatement(
     connection = await connect(user, password, database);
     const maxRows = full ? 1 : MAX_RESULT_ROWS;
     // One row more than shown: that is how it knows there were more, without reading them all.
-    await connection.run(`SET SESSION sql_select_limit = ${maxRows + 1}, SESSION max_execution_time = ${STATEMENT_TIMEOUT_SECONDS * 1000}`);
-    // max_execution_time only stops SELECT: anything else is cut by root.
+    // The time limit: MySQL's in milliseconds, MariaDB's in seconds (and it covers every statement).
+    const timeLimit = dbEngine() === "mariadb" ? `max_statement_time = ${STATEMENT_TIMEOUT_SECONDS}` : `max_execution_time = ${STATEMENT_TIMEOUT_SECONDS * 1000}`;
+    await connection.run(`SET SESSION sql_select_limit = ${maxRows + 1}, SESSION ${timeLimit}`);
+    // MySQL's max_execution_time only stops SELECT: anything else is cut by root.
     timer = setTimeout(() => {
       timedOut = true;
       void killUser(root, user).catch(() => undefined);

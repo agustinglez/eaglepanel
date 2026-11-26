@@ -46,6 +46,37 @@ import { wordpressOps } from "./wordpress";
 import { mailOps } from "./mail";
 
 const ok = z.object({ ok: z.literal(true) });
+/**
+ * Memory settings of MySQL or MariaDB (eaglepanel-tuning.cnf). Small by default: a hosting server's databases are
+ * usually small, and every MB reserved here is RAM the sites do not have. `xProtocol`: MySQL's X plugin (MySQL Shell,
+ * document store), which PHP and WordPress do not use; MariaDB has none.
+ */
+export const dbTuningSchema = z.object({
+  bufferPoolMb: z.number().int().min(16, "At least 16 MB").max(32768),
+  logBufferMb: z.number().int().min(1).max(512),
+  maxConnections: z.number().int().min(10, "At least 10 connections").max(2000),
+  tableOpenCache: z.number().int().min(100).max(20000),
+  tableDefinitionCache: z.number().int().min(400, "At least 400").max(20000),
+  xProtocol: z.boolean(),
+}).strict();
+export type DbTuning = z.infer<typeof dbTuningSchema>;
+/** What the installer writes. The same values as deploy/install.sh (a test checks it). */
+export const DEFAULT_DB_TUNING: DbTuning = { bufferPoolMb: 64, logBufferMb: 8, maxConnections: 50, tableOpenCache: 400, tableDefinitionCache: 400, xProtocol: false };
+
+/**
+ * performance_schema and memory of the database server. `engine`: what the installer set up, MySQL or MariaDB.
+ * `tuning`: what the file says (null: no file, the server's own defaults); `tuningRunning`: what runs now.
+ */
+const mysqlDiagnosticsSchema = z.object({
+  engine: z.enum(["mysql", "mariadb"]),
+  running: z.boolean().nullable(),
+  configured: z.boolean(),
+  memoryMb: z.number().nullable(),
+  ramMb: z.number().nullable(),
+  tuning: dbTuningSchema.nullable(),
+  tuningRunning: dbTuningSchema.nullable(),
+});
+
 /** A full git commit: what GitHub sends in `after`. */
 export const commitSchema = z.string().regex(/^[0-9a-f]{40}$/);
 export type VhostType = "php" | "app";
@@ -220,12 +251,17 @@ export const agentOps = {
    */
   "mysql.diagnostics.get": {
     params: z.object({}).strict(),
-    result: z.object({ running: z.boolean().nullable(), configured: z.boolean(), memoryMb: z.number().nullable() }),
+    result: mysqlDiagnosticsSchema,
   },
   /** Writes the setting and restarts MySQL (a few seconds without databases). */
   "mysql.diagnostics.set": {
     params: z.object({ enabled: z.boolean() }).strict(),
-    result: z.object({ running: z.boolean().nullable(), configured: z.boolean(), memoryMb: z.number().nullable() }),
+    result: mysqlDiagnosticsSchema,
+  },
+  /** Writes the memory settings and restarts the server; if it does not start with them, the previous ones go back. */
+  "mysql.tuning.set": {
+    params: z.object({ tuning: dbTuningSchema }).strict(),
+    result: mysqlDiagnosticsSchema,
   },
   ...backupOps,
   ...dbAdminOps,
@@ -524,11 +560,17 @@ export interface AccountDto {
 }
 
 /** Server settings. */
-/** Settings › MySQL: whether performance_schema runs (null: MySQL is not answering) and what MySQL uses now. */
+/** Settings › database server: performance_schema (null: not answering), memory used now and its settings. */
 export interface MysqlSettingsDto {
+  /** `null` when the agent did not answer. */
+  engine: "mysql" | "mariadb" | null;
   running: boolean | null;
   configured: boolean;
   memoryMb: number | null;
+  /** RAM of the server, to size the buffer pool. */
+  ramMb: number | null;
+  tuning: DbTuning | null;
+  tuningRunning: DbTuning | null;
 }
 
 export interface ServerSettingsDto {

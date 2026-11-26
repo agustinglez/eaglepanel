@@ -1,4 +1,5 @@
 import { chmod, mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dumpCommand } from "./db-engine";
 import { SandboxHost, type Host } from "./host";
 
 /**
@@ -46,7 +47,7 @@ export async function createExport(host: Host, { username, id, databases }: { us
     for (const database of databases) {
       const file = `${staging}/databases/${database}.sql`;
       if (host instanceof SandboxHost) await writeFile(file, `-- ${database} (sandbox)\n`);
-      else await run(["mysqldump", "--protocol=socket", "-uroot", "--single-transaction", "--quick", "--routines", "--triggers", "--events", "--hex-blob", "--default-character-set=utf8mb4", "--set-gtid-purged=OFF", "--no-tablespaces", database], file);
+      else await run([...dumpCommand(), database], file);
     }
     const homeParent = local(host, "/home");
     // It can be missing only in sandbox mode: on the server, a missing home directory is an error and is not created as root.

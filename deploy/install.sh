@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034
-# EaglePanel - unified installer. Installs or updates everything: the stack (OpenLiteSpeed, lsphp, MySQL, Redis,
+# EaglePanel - unified installer. Installs or updates everything: the stack (OpenLiteSpeed, lsphp, MySQL or MariaDB, Redis,
 # Memcached, vsftpd, Podman, restic, Bun), server hardening and the panel.
 #
 # Safe to run as many times as needed: each step checks the current state and changes only what is missing. If a
@@ -33,6 +33,9 @@
 #   --mail / --no-mail     install the mail server (Stalwart) or not. Asked on a first installation with a terminal;
 #                          without one, no mail. Later: eagle mail on|off
 #   --mail-hostname NAME   the server's name for mail (EHLO, PTR): mail.yourserver.com. By default, `hostname -f`
+#   --db mysql|mariadb     the database server: MySQL 8 or MariaDB (from the distribution). Asked on a first
+#                          installation with a terminal; without one, MySQL. The one installed is kept: switching
+#                          would mean moving every database
 #   --yes                  no questions: apply the plan (always the case without a terminal)
 #   Choices are saved: later runs do not need them again. To change panel access later: eagle net
 
@@ -118,6 +121,8 @@ PANEL_PORT=""
 MAIL_HOSTNAME=""
 # yes|no: whether this server runs mail. From --mail/--no-mail, the saved choice, or a question.
 MAIL=""
+# mysql|mariadb. From --db, what is already installed, the saved choice, or a question.
+DB_ENGINE=""
 NET_ONLY=0
 NET_STATUS=0
 UPGRADE=0
@@ -136,6 +141,7 @@ while [ $# -gt 0 ]; do
     --mail-hostname) MAIL_HOSTNAME="${2:-}"; shift ;;
     --mail) MAIL=yes ;;
     --no-mail) MAIL=no ;;
+    --db) DB_ENGINE="${2:-}"; shift ;;
     # Used by `eagle net`: panel access only, on an existing installation.
     --net-only) NET_ONLY=1 ;;
     --net-status) NET_STATUS=1 ;;
@@ -249,10 +255,16 @@ preflight() {
   kernel="$(uname -r | cut -d- -f1)"
   # nosymfollow, which isolates the accounts, exists since Linux 5.10.
   version_ge "$kernel" 5.10 || die "kernel $kernel does not support nosymfollow (5.10 or later is required)"
-  local free_gb
+  # The software takes about 2 GB (packages, the panel, the apps' image, apt's cache): 3 with margin. Plus 2 for the
+  # swap file, when the system step is going to create it (less than 8 GB of RAM and no swap).
+  local free_gb need_gb=3 why="for the software"
   free_gb="$(df -BG --output=avail / | tail -n 1 | tr -dc 0-9)"
-  [ "${free_gb:-0}" -ge 10 ] || die "${free_gb} GB free on /: at least 10 are required"
-  installed mariadb-server && die "MariaDB is installed and conflicts with MySQL. It is not removed automatically: that would delete data"
+  if [ -z "$(swapon --noheadings --show=NAME 2>/dev/null)" ] && [ "$(awk '/MemTotal/ { print int($2 / 1048576) }' /proc/meminfo)" -lt 8 ]; then
+    need_gb=5
+    why="3 for the software, 2 for the swap file it creates"
+  fi
+  [ "${free_gb:-0}" -ge "$need_gb" ] || die "${free_gb} GB free on /: $need_gb are needed ($why)"
+  choose_db
   [ -d /usr/local/CyberCP ] && die "CyberPanel is installed: refusing to install on top of it"
   systemctl is-active --quiet firewalld 2>/dev/null && die "firewalld is active: the installer uses ufw"
 
@@ -283,6 +295,53 @@ preflight() {
     grep -qE '^[a-zA-Z0-9._-]{3,64}$' <<<"$ADMIN_USER" || die "invalid admin username: $ADMIN_USER"
     choose_mail
   fi
+}
+
+# The database server: what is installed stays (servers from before the choice have MySQL); a new one is asked.
+# The names it leaves are used by every step that touches it.
+DB_NAME=MySQL
+DB_SERVICE=mysql
+DB_PKG=mysql-server
+DB_CLIENT=mysql
+db_label() { [ "$1" = mariadb ] && echo MariaDB || echo MySQL; }
+choose_db() {
+  local found=""
+  if installed mariadb-server || installed mariadb-server-core; then found=mariadb; fi
+  if installed mysql-server || installed mysql-community-server; then
+    [ -z "$found" ] || die "MySQL and MariaDB are both installed: remove one of them first (removing it may delete its data)"
+    found=mysql
+  fi
+  if [ -n "$found" ] && [ -n "$DB_ENGINE" ] && [ "$DB_ENGINE" != "$found" ]; then
+    die "$(db_label "$found") is already installed: it is not replaced by $(db_label "$DB_ENGINE"), that would mean moving every database"
+  fi
+  DB_ENGINE="${DB_ENGINE:-${found:-$(setting DB_ENGINE)}}"
+  if [ -z "$DB_ENGINE" ]; then
+    if [ "$CHECK_ONLY" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ] && [ ! -f "$SETTINGS" ]; then ask_db
+    else DB_ENGINE=mysql; fi
+  fi
+  case "$DB_ENGINE" in
+    mysql) DB_NAME=MySQL; DB_SERVICE=mysql; DB_PKG=mysql-server; DB_CLIENT=mysql ;;
+    mariadb) DB_NAME=MariaDB; DB_SERVICE=mariadb; DB_PKG=mariadb-server; DB_CLIENT=mariadb ;;
+    *) die "invalid database server: $DB_ENGINE (use --db mysql or --db mariadb)" ;;
+  esac
+  ok "databases: $DB_NAME"
+}
+
+ask_db() {
+  local answer
+  printf '\n  Database server for the sites:\n' >/dev/tty
+  printf '    1) MySQL 8: the most compatible, every app written for MySQL works\n' >/dev/tty
+  printf '    2) MariaDB: WordPress and PHP apps work the same, and it uses less RAM. Apps that need MySQL 8\n' >/dev/tty
+  printf '       (JSON columns with ->>, MySQL-only functions) do not\n' >/dev/tty
+  printf '  It stays: switching later means moving every database.\n' >/dev/tty
+  while :; do
+    answer="$(ask_tty '  Option [1]: ')"
+    case "${answer:-1}" in
+      1) DB_ENGINE=mysql; return ;;
+      2) DB_ENGINE=mariadb; return ;;
+      *) printf '  Choose 1 or 2.\n' >/dev/tty ;;
+    esac
+  done
 }
 
 # Whether this server runs mail. Servers that already have it keep it; a new one is asked (no, without a terminal).
@@ -373,6 +432,7 @@ PANEL_ADDRESS=$PANEL_ADDRESS
 PANEL_PORT=$PANEL_PORT
 MAIL=$MAIL
 MAIL_HOSTNAME=$MAIL_HOSTNAME
+DB_ENGINE=$DB_ENGINE
 EOF
 }
 
@@ -393,7 +453,7 @@ pkg_version() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null | sed -E 's/^[0-9
 plan_row() { PLAN_ROWS+=("$1|$2|$3"); }
 review() { REVIEW_KEYS+=("$1"); REVIEW_TITLE[$1]="$2"; REVIEW_CHANGES[$1]="$3"; REVIEW_NOTES[$1]="$4"; REVIEW_MANUAL[$1]="$5"; }
 joined() { local out; out="$(printf '%s, ' "$@")"; printf '%s' "${out%, }"; }
-mysql_var() { mysql --protocol=socket -uroot -N -B -e "SELECT @@$1" 2>/dev/null || true; }
+mysql_var() { "$DB_CLIENT" --protocol=socket -uroot -N -B -e "SELECT @@$1" 2>/dev/null || true; }
 ssh_ports() { local p; p="$(sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }' | sort -u || true)"; printf '%s\n' "${p:-22}"; }
 
 # Rules not managed by the panel that open 80/443 to anyone, numbered, last first (to delete them in that order).
@@ -522,14 +582,41 @@ plan_litespeed() {
 }
 
 mysql_cnf() {
+  if [ "$DB_ENGINE" = mariadb ]; then
+    # MariaDB has no X plugin and keeps binary logs off unless asked: an option it does not know stops it from starting.
+    cat <<'EOF'
+# Generated by the EaglePanel installer.
+[mysqld]
+bind-address = 127.0.0.1
+local_infile = 0
+EOF
+    return 0
+  fi
+  # loose-: with the X plugin off (Settings, the tuning file) its option does not exist, and MySQL would not start.
   cat <<'EOF'
 # Generated by the EaglePanel installer.
 [mysqld]
 bind-address = 127.0.0.1
-mysqlx-bind-address = 127.0.0.1
+loose-mysqlx-bind-address = 127.0.0.1
 disable_log_bin
 local_infile = 0
 EOF
+}
+# Memory settings, in a file of their own: written with small values only when missing, then Settings decides (the
+# agent's TUNING_CNF). A hosting server's databases are usually small: every MB reserved here is RAM the sites lose.
+MYSQL_TUNING_CNF=/etc/mysql/conf.d/eaglepanel-tuning.cnf
+mysql_tuning_cnf() {
+  cat <<'EOF'
+# Managed by EaglePanel (Settings). Do not edit by hand.
+[mysqld]
+innodb_buffer_pool_size = 64M
+innodb_log_buffer_size = 8M
+max_connections = 50
+table_open_cache = 400
+table_definition_cache = 400
+EOF
+  # MariaDB has no X plugin: the line would stop it from starting.
+  [ "$DB_ENGINE" = mariadb ] || echo 'mysqlx = OFF'
 }
 # performance_schema, in a file of its own: written off only when missing, then Settings › MySQL decides (the agent's
 # DIAGNOSTICS_CNF). It reserves a few hundred MB that a hosting server does not use.
@@ -558,22 +645,25 @@ mysql_settings_ok() {
 }
 
 plan_mysql() {
-  if ! command -v mysqld >/dev/null && ! installed mysql-server && ! installed mysql-community-server; then
-    plan_row "MySQL" "not installed" "install $([ "$OS_ID" = debian ] && echo "8.4 LTS from the Oracle repository" || echo "from $PRETTY_NAME")"
+  if ! installed "$DB_PKG" && ! installed mysql-community-server && ! installed mariadb-server-core; then
+    local from="from $PRETTY_NAME"
+    [ "$DB_ENGINE" = mysql ] && [ "$OS_ID" = debian ] && from="8.4 LTS from the Oracle repository"
+    plan_row "$DB_NAME" "not installed" "install $from"
     return 0
   fi
-  local version now changes="" notes="" manual="" bind xbind dbs
-  version="$(mysqld --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sed -n 1p || true)"
+  local version now changes="" notes="" manual="" bind xbind dbs unit="$DB_SERVICE.service"
+  version="$(pkg_version "$DB_PKG")"
+  [ -n "$version" ] || version="$(pkg_version mysql-community-server)"
   version="${version:-installed}"
   now="$version"
   if [ -f /etc/mysql/conf.d/eaglepanel.cnf ]; then
     : # Already the panel's: it is kept up to date without asking.
-  elif ! systemctl is-active --quiet mysql; then
+  elif ! systemctl is-active --quiet "$DB_SERVICE"; then
     now="$version, stopped"
-    changes+="add /etc/mysql/conf.d/eaglepanel.cnf: only local connections, no binary logs, no LOAD DATA LOCAL (MySQL is stopped: its current settings cannot be read)$NL"
+    changes+="add /etc/mysql/conf.d/eaglepanel.cnf: only local connections, no binary logs, no LOAD DATA LOCAL ($DB_NAME is stopped: its current settings cannot be read)$NL"
   elif [ -z "$(mysql_var version)" ]; then
-    BLOCKERS+=("MySQL: root cannot log in through the socket (sudo mysql). The panel manages databases that way: give root@localhost the auth_socket plugin back, then run the installer again")
-    plan_row "MySQL" "$version" "-"
+    BLOCKERS+=("$DB_NAME: root cannot log in through the socket (sudo $DB_CLIENT). The panel manages databases that way: give root@localhost socket authentication back, then run the installer again")
+    plan_row "$DB_NAME" "$version" "-"
     return 0
   elif ! mysql_settings_ok; then
     bind="$(mysql_var bind_address)"
@@ -581,32 +671,37 @@ plan_mysql() {
     [ "$bind" = 127.0.0.1 ] || { changes+="bind-address 127.0.0.1 (now $bind)$NL"; notes+="clients that connect from other hosts lose access$NL"; }
     [ -z "$xbind" ] || [ "$xbind" = 127.0.0.1 ] || changes+="mysqlx-bind-address 127.0.0.1 (now $xbind)$NL"
     if [ "$(mysql_var log_bin)" = 1 ]; then
-      changes+="binary logs off (now on): they are not charged to any account and can fill the disk$NL"
-      notes+="if this server is a replication source or you rely on point-in-time recovery, that stops working$NL"
+      if [ "$DB_ENGINE" = mariadb ]; then
+        notes+="binary logs are on: they are not charged to any account and can fill the disk. Turn them off in MariaDB's own files if this server is not a replication source$NL"
+      else
+        changes+="binary logs off (now on): they are not charged to any account and can fill the disk$NL"
+        notes+="if this server is a replication source or you rely on point-in-time recovery, that stops working$NL"
+      fi
     fi
     [ "$(mysql_var local_infile)" = 0 ] || changes+="local_infile off (LOAD DATA LOCAL)$NL"
-    changes+="these settings go in a new file, /etc/mysql/conf.d/eaglepanel.cnf, and MySQL is restarted$NL"
+    [ -z "$changes" ] || changes+="these settings go in a new file, /etc/mysql/conf.d/eaglepanel.cnf, and $DB_NAME is restarted$NL"
   fi
   if [ -n "$changes" ]; then
     manual+="cat >/etc/mysql/conf.d/eaglepanel.cnf <<'EOF'$NL$(mysql_cnf)${NL}EOF$NL"
   fi
-  if [ "$(systemctl show mysql.service -p RuntimeDirectoryPreserve --value 2>/dev/null || true)" != yes ]; then
-    changes+="systemd drop-in: keep /run/mysqld when MySQL stops (apps mount it to reach the socket)$NL"
-    manual+="mkdir -p /etc/systemd/system/mysql.service.d$NL"
-    manual+="cat >/etc/systemd/system/mysql.service.d/eaglepanel.conf <<'EOF'$NL$(mysql_dropin)${NL}EOF$NL"
+  if [ "$(systemctl show "$unit" -p RuntimeDirectoryPreserve --value 2>/dev/null || true)" != yes ]; then
+    changes+="systemd drop-in: keep /run/mysqld when $DB_NAME stops (apps mount it to reach the socket)$NL"
+    manual+="mkdir -p /etc/systemd/system/$unit.d$NL"
+    manual+="cat >/etc/systemd/system/$unit.d/eaglepanel.conf <<'EOF'$NL$(mysql_dropin)${NL}EOF$NL"
     manual+="systemctl daemon-reload$NL"
   fi
-  if [ ! -f "$MYSQL_DIAG_CNF" ] && [ -z "$changes" ]; then
-    plan_row "MySQL" "$now" "turn off performance_schema: a few hundred MB less RAM (Settings › MySQL turns it back on)"
+  if { [ ! -f "$MYSQL_DIAG_CNF" ] || [ ! -f "$MYSQL_TUNING_CNF" ]; } && [ -z "$changes" ]; then
+    plan_row "$DB_NAME" "$now" "less RAM: $([ -f "$MYSQL_DIAG_CNF" ] || echo "performance_schema off, ")small memory settings (both can be changed in Settings)"
     return 0
   fi
-  [ -f "$MYSQL_DIAG_CNF" ] || changes+="performance_schema off, in $MYSQL_DIAG_CNF: a few hundred MB less RAM (Settings › MySQL turns it back on)$NL"
-  [ -n "$changes" ] || { plan_row "MySQL" "$now" "already configured"; return 0; }
-  manual+="systemctl restart mysql$NL"
-  dbs="$(mysql --protocol=socket -uroot -N -B -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null || true)"
+  [ -f "$MYSQL_DIAG_CNF" ] || changes+="performance_schema off, in $MYSQL_DIAG_CNF: less RAM (Settings turns it back on)$NL"
+  [ -f "$MYSQL_TUNING_CNF" ] || changes+="small memory settings, in $MYSQL_TUNING_CNF: 64 MB buffer pool, 50 connections (Settings changes them)$NL"
+  [ -n "$changes" ] || { plan_row "$DB_NAME" "$now" "already configured"; return 0; }
+  manual+="systemctl restart $DB_SERVICE$NL"
+  dbs="$("$DB_CLIENT" --protocol=socket -uroot -N -B -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null || true)"
   if [[ "${dbs:-0}" =~ ^[1-9][0-9]*$ ]]; then notes+="$dbs existing database(s) are kept$NL"; fi
-  plan_row "MySQL" "$now" "configure (details below)"
-  review mysql "MySQL $version is already installed" "$changes" "$notes" "$manual"
+  plan_row "$DB_NAME" "$now" "configure (details below)"
+  review mysql "$DB_NAME $version is already installed" "$changes" "$notes" "$manual"
 }
 
 plan_services() {
@@ -1019,8 +1114,9 @@ cloudflare_ips() {
 
 # ---------------------------------------------------------------------------- MySQL
 mysql_server() {
-  step "MySQL"
-  if [ "$OS_ID" = "debian" ] && ! installed mysql-server && ! installed mysql-community-server; then
+  step "$DB_NAME"
+  local unit="$DB_SERVICE.service"
+  if [ "$DB_ENGINE" = mysql ] && [ "$OS_ID" = "debian" ] && ! installed mysql-server && ! installed mysql-community-server; then
     # Debian only ships MariaDB: MySQL 8.4 LTS from the Oracle repository, with its verified key.
     local url fingerprint
     read -r url fingerprint <<<"$MYSQL_KEY"
@@ -1032,9 +1128,11 @@ EOF
     # No root password: it logs in through the socket, as on Ubuntu. Nobody else can.
     printf 'mysql-community-server mysql-community-server/root-pass password \nmysql-community-server mysql-community-server/re-root-pass password \n' | debconf-set-selections
   fi
-  apt_install mysql-server
+  # Before the package: MariaDB's setup reads /etc/mysql/conf.d and stops without its system tables if it is missing.
   install -d -m 755 /etc/mysql/conf.d
-  systemctl start mysql >/dev/null 2>&1 || true
+  # MariaDB comes from the distribution: root logs in through the socket (unix_socket) out of the box.
+  if [ "$DB_ENGINE" = mariadb ]; then apt_install mariadb-server mariadb-client; else apt_install mysql-server; fi
+  systemctl start "$DB_SERVICE" >/dev/null 2>&1 || true
   # Local only; no binlogs (they are not charged to any account and filled the disk); no LOAD DATA LOCAL.
   # If the server already has those settings in its own files (configured by hand from the plan), nothing is added.
   local restart=0
@@ -1042,15 +1140,17 @@ EOF
     mysql_cnf | write_file /etc/mysql/conf.d/eaglepanel.cnf 644 && restart=1
   fi
   if [ ! -f "$MYSQL_DIAG_CNF" ]; then mysql_diag_cnf | write_file "$MYSQL_DIAG_CNF" 644 && restart=1; fi
-  [ "$restart" -eq 0 ] || systemctl restart mysql
-  # Apps get /run/mysqld mounted: if MySQL deleted it when stopping, on return it would create another one and the apps
-  # would keep looking at the old one, without a socket, until restarted.
-  if [ "$(systemctl show mysql.service -p RuntimeDirectoryPreserve --value 2>/dev/null || true)" != yes ] || [ -f /etc/systemd/system/mysql.service.d/eaglepanel.conf ]; then
-    if mysql_dropin | write_file /etc/systemd/system/mysql.service.d/eaglepanel.conf 644; then systemctl daemon-reload; fi
+  if [ ! -f "$MYSQL_TUNING_CNF" ]; then mysql_tuning_cnf | write_file "$MYSQL_TUNING_CNF" 644 && restart=1; fi
+  [ "$restart" -eq 0 ] || systemctl restart "$DB_SERVICE"
+  # Apps get /run/mysqld mounted: if the server deleted it when stopping, on return it would create another one and the
+  # apps would keep looking at the old one, without a socket, until restarted.
+  if [ "$(systemctl show "$unit" -p RuntimeDirectoryPreserve --value 2>/dev/null || true)" != yes ] || [ -f "/etc/systemd/system/$unit.d/eaglepanel.conf" ]; then
+    if mysql_dropin | write_file "/etc/systemd/system/$unit.d/eaglepanel.conf" 644; then systemctl daemon-reload; fi
   fi
-  systemctl enable --now mysql >/dev/null 2>&1
-  mysql --protocol=socket -uroot -N -e 'SELECT 1' >/dev/null 2>&1 || die "root cannot log in to MySQL through the socket"
-  ok "MySQL $(mysql --version | awk '{ print $3 }') on 127.0.0.1"
+  # Enabling MariaDB also creates its mysql.service alias: the agent and the apps' units use that name.
+  systemctl enable --now "$DB_SERVICE" >/dev/null 2>&1
+  "$DB_CLIENT" --protocol=socket -uroot -N -e 'SELECT 1' >/dev/null 2>&1 || die "root cannot log in to $DB_NAME through the socket"
+  ok "$DB_NAME $(mysql_var version | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+') on 127.0.0.1"
 }
 
 # ---------------------------------------------------------------------------- Redis and Memcached
@@ -2062,11 +2162,12 @@ verify() {
   if grep -qE "(\*|0\.0\.0\.0|\[::\]):(8088|7080|3306|33060|6379|11211|8090|8480)[[:space:]]" <<<"$listening"; then
     bad "an internal service is exposed to the network: $(grep -E "(\*|0\.0\.0\.0|\[::\]):(8088|7080|3306|33060|6379|11211|8090|8480)[[:space:]]" <<<"$listening" | awk '{ print $4 }' | paste -sd' ' -)"
   else
-    ok "MySQL, the OLS WebAdmin, the mail administration and the internal panel API are not exposed"
+    ok "$DB_NAME, the OLS WebAdmin, the mail administration and the internal panel API are not exposed"
   fi
   "$LSWS/lsphp$PHP_VERSION/bin/php" -m 2>/dev/null | grep -qx redis && ok "lsphp$PHP_VERSION with redis, memcached and mysqli" || bad "lsphp$PHP_VERSION is missing its extensions"
-  mysql --protocol=socket -uroot -N -e 'SELECT 1' >/dev/null 2>&1 && ok "MySQL responds" || bad "MySQL does not respond"
-  [ "$(systemctl show mysql.service -p RuntimeDirectoryPreserve --value)" = "yes" ] && ok "MySQL keeps its socket directory (apps)" || bad "MySQL deletes /run/mysqld when it stops: apps would lose the socket"
+  "$DB_CLIENT" --protocol=socket -uroot -N -e 'SELECT 1' >/dev/null 2>&1 && ok "$DB_NAME responds" || bad "$DB_NAME does not respond"
+  [ "$(systemctl show mysql.service -p RuntimeDirectoryPreserve --value)" = "yes" ] && ok "$DB_NAME keeps its socket directory (apps)" || bad "$DB_NAME deletes /run/mysqld when it stops: apps would lose the socket"
+  [ "$DB_ENGINE" = mysql ] || systemctl cat mysql.service >/dev/null 2>&1 && ok "$DB_NAME answers as mysql.service" || bad "$DB_NAME has no mysql.service alias: run systemctl enable mariadb"
   systemctl is-active --quiet vsftpd && ok "vsftpd running" || bad "vsftpd stopped"
   command -v inotifywait >/dev/null && ok "inotifywait (.htaccess changes)" || bad "inotifywait is missing: .htaccess changes need a manual OLS restart"
   command -v restic >/dev/null && ok "restic $(restic version | awk '{ print $2 }')" || bad "restic is missing"

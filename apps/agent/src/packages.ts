@@ -49,8 +49,13 @@ export function parseAptPolicy(output: string): Map<string, string | null> {
   return candidates;
 }
 
-/** Installed packages of a component, in the order of its patterns (the first one is the main package). */
+/**
+ * Installed packages of a component, in the order of its patterns (the first one is the main package). Without its
+ * main package the component is not on the server, even if a shared library matches (MariaDB brings mysql-common).
+ */
 export function componentPackages(def: SystemComponentDef, installed: InstalledPackage[]): InstalledPackage[] {
+  const main = def.packages[0];
+  if (main === undefined || !installed.some((pkg) => matchesPackagePattern(pkg.name, main))) return [];
   const result: InstalledPackage[] = [];
   for (const pattern of def.packages) {
     for (const pkg of installed) {

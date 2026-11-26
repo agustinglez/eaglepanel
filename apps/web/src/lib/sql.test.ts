@@ -19,7 +19,7 @@ describe("table forms", () => {
 
   test("create, add, change, indexes", () => {
     const id = { ...emptyColumn(), name: "id", type: "int", nullable: false };
-    expect(createTableSql("posts", [id], ["id"], "")).toBe("CREATE TABLE `posts` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci");
+    expect(createTableSql("posts", [id], ["id"], "")).toBe("CREATE TABLE `posts` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB");
     expect(addColumnSql("posts", { ...emptyColumn(), name: "t" }, { kind: "after", column: "id" })).toBe("ALTER TABLE `posts` ADD COLUMN `t` varchar(255) NULL AFTER `id`");
     expect(changeColumnSql("posts", "t", { ...emptyColumn(), name: "title", type: "text" })).toBe("ALTER TABLE `posts` CHANGE COLUMN `t` `title` text NULL");
     expect(addIndexSql("posts", "UNIQUE", "posts_slug", ["slug", "lang"])).toBe("ALTER TABLE `posts` ADD UNIQUE INDEX `posts_slug` (`slug`, `lang`)");

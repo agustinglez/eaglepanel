@@ -1,4 +1,5 @@
 import { siteDir, siteFtpLogin, type AccountService, type AgentOpParams } from "@eaglepanel/shared";
+import { dbClient, dbEngine, dbEngineName, defaultCollation } from "./db-engine";
 import type { CommandResult, Host } from "./host";
 
 // ---------------------------------------------------------------------------- FTP
@@ -152,7 +153,7 @@ const mysqlUser = (database: string) => `'${database}'@'localhost'`;
  * With `hideError`, MySQL could quote the failed SQL, and that SQL contains a password.
  */
 async function mysql(host: Host, sql: string, { hideError = false } = {}): Promise<string> {
-  const result = await host.run("mysql", ["--protocol=socket", "-uroot", "-N", "-B"], { stdin: sql });
+  const result = await host.run(dbClient(), ["--protocol=socket", "-uroot", "-N", "-B"], { stdin: sql });
   if (result.code !== 0) {
     throw new Error(hideError ? `MySQL rejected the operation (code ${result.code})` : `MySQL failed: ${result.stderr.trim().slice(0, 300)}`);
   }
@@ -166,18 +167,30 @@ async function killConnections(host: Host, databases: string[]): Promise<void> {
   const output = await mysql(host, `SELECT ID FROM information_schema.PROCESSLIST WHERE USER IN (${users});`);
   for (const id of output.split("\n").map((line) => line.trim()).filter((line) => /^\d+$/.test(line))) {
     // It may have ended between the two queries.
-    await host.run("mysql", ["--protocol=socket", "-uroot", "-N", "-B"], { stdin: `KILL ${id};` });
+    await host.run(dbClient(), ["--protocol=socket", "-uroot", "-N", "-B"], { stdin: `KILL ${id};` });
   }
 }
 
 export async function createDatabase(host: Host, { username, name, password }: AgentOpParams<"db.create">): Promise<void> {
   const database = `${username}_${name}`;
   await mysql(host, [
-    `CREATE DATABASE IF NOT EXISTS \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;`,
+    `CREATE DATABASE IF NOT EXISTS \`${database}\` CHARACTER SET utf8mb4 COLLATE ${defaultCollation()};`,
     `CREATE USER IF NOT EXISTS ${mysqlUser(database)} IDENTIFIED BY '${password}' WITH MAX_USER_CONNECTIONS ${MAX_USER_CONNECTIONS};`,
     `ALTER USER ${mysqlUser(database)} IDENTIFIED BY '${password}';`,
     `GRANT ALL ON ${grantTarget(database)} TO ${mysqlUser(database)};`,
   ].join("\n"), { hideError: true });
+}
+
+/**
+ * MySQL saves caching_sha2_password (0x...), MariaDB mysql_native_password (*...). Each engine takes only its own:
+ * MySQL 8.4 ships without mysql_native_password and MariaDB has no caching_sha2_password.
+ */
+function identifiedByHash(authHash: string): string {
+  const from = authHash.startsWith("*") ? "mariadb" : "mysql";
+  if (from !== dbEngine()) {
+    throw new Error(`The database user was saved by ${dbEngineName(from)} and this server runs ${dbEngineName()}: its password cannot be carried over. Create the database in the panel, load the backup into it and set the password in the site`);
+  }
+  return from === "mariadb" ? `IDENTIFIED BY PASSWORD '${authHash}'` : `IDENTIFIED WITH caching_sha2_password AS ${authHash}`;
 }
 
 /**
@@ -187,8 +200,8 @@ export async function createDatabase(host: Host, { username, name, password }: A
  */
 export async function recreateDatabase(host: Host, database: string, authHash: string): Promise<void> {
   await mysql(host, [
-    `CREATE DATABASE IF NOT EXISTS \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;`,
-    `CREATE USER IF NOT EXISTS ${mysqlUser(database)} IDENTIFIED WITH caching_sha2_password AS ${authHash} WITH MAX_USER_CONNECTIONS ${MAX_USER_CONNECTIONS};`,
+    `CREATE DATABASE IF NOT EXISTS \`${database}\` CHARACTER SET utf8mb4 COLLATE ${defaultCollation()};`,
+    `CREATE USER IF NOT EXISTS ${mysqlUser(database)} ${identifiedByHash(authHash)} WITH MAX_USER_CONNECTIONS ${MAX_USER_CONNECTIONS};`,
     `GRANT ALL ON ${grantTarget(database)} TO ${mysqlUser(database)};`,
   ].join("\n"), { hideError: true });
 }

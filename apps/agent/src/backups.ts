@@ -9,6 +9,7 @@ import {
 } from "@eaglepanel/shared";
 import { KEYS } from "./apps";
 import { workerCommand } from "./files-runner";
+import { collationFix, dbClient, dbEngine, defaultCollation, dumpCommand } from "./db-engine";
 import type { Host } from "./host";
 import { certPath, keyPath } from "./ols";
 import { FTP_USERS, parseFtpUsers } from "./services";
@@ -68,14 +69,22 @@ async function exec(cmd: string[], env: Record<string, string>, stdin?: string):
   return { code, stdout, stderr };
 }
 
-/** `producer | consumer` without a shell. Fails if either one fails. */
-async function pipe(producer: { cmd: string[]; env: Record<string, string> }, consumer: { cmd: string[]; env: Record<string, string>; cwd?: string }): Promise<void> {
+/** `producer | [filter |] consumer` without a shell. Fails if any of them fails. */
+async function pipe(
+  producer: { cmd: string[]; env: Record<string, string> },
+  consumer: { cmd: string[]; env: Record<string, string>; cwd?: string },
+  filter?: { cmd: string[]; env: Record<string, string> },
+): Promise<void> {
   const first = Bun.spawn(producer.cmd, { env: producer.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const second = Bun.spawn(consumer.cmd, { env: consumer.env, cwd: consumer.cwd, stdin: first.stdout, stdout: "pipe", stderr: "pipe" });
-  const [firstErr, firstCode, secondErr, secondCode] = await Promise.all([
-    new Response(first.stderr).text(), first.exited, new Response(second.stderr).text(), second.exited,
+  const middle = filter ? Bun.spawn(filter.cmd, { env: filter.env, stdin: first.stdout, stdout: "pipe", stderr: "pipe" }) : null;
+  const second = Bun.spawn(consumer.cmd, { env: consumer.env, cwd: consumer.cwd, stdin: middle ? middle.stdout : first.stdout, stdout: "pipe", stderr: "pipe" });
+  const [firstErr, firstCode, middleErr, middleCode, secondErr, secondCode] = await Promise.all([
+    new Response(first.stderr).text(), first.exited,
+    middle ? new Response(middle.stderr).text() : Promise.resolve(""), middle ? middle.exited : Promise.resolve(0),
+    new Response(second.stderr).text(), second.exited,
   ]);
   if (firstCode !== 0) throw new Error(`${producer.cmd[0]} failed: ${tail(firstErr)}`);
+  if (middleCode !== 0) throw new Error(`${filter!.cmd[0]} failed: ${tail(middleErr)}`);
   if (secondCode !== 0) throw new Error(`${consumer.cmd.includes("tar") ? "tar" : consumer.cmd[0]} failed: ${tail(secondErr)}`);
 }
 
@@ -118,10 +127,12 @@ export async function serverSecrets(host: Host, { username, databases, zones, ap
   const ftpHash = parseFtpUsers(await host.readFile(FTP_USERS)).get(username) ?? null;
   const mysqlUsers: ServerSecrets["mysqlUsers"] = [];
   for (const database of databases) {
-    // In hexadecimal: the caching_sha2_password hash has bytes that do not survive as text.
+    // MySQL, in hexadecimal: the caching_sha2_password hash has bytes that do not survive as text. MariaDB's is text
+    // already, and it has no such setting.
     const user = `'${database}'@'localhost'`;
-    const result = await host.run("mysql", ["--protocol=socket", "-uroot", "-N", "-B", "-r"], {
-      stdin: `SET SESSION print_identified_with_as_hex = ON;\nSHOW CREATE USER ${user};\nSHOW GRANTS FOR ${user};\n`,
+    const hex = dbEngine() === "mysql" ? "SET SESSION print_identified_with_as_hex = ON;\n" : "";
+    const result = await host.run(dbClient(), ["--protocol=socket", "-uroot", "-N", "-B", "-r"], {
+      stdin: `${hex}SHOW CREATE USER ${user};\nSHOW GRANTS FOR ${user};\n`,
     });
     if (result.code !== 0) continue;
     const [createUser, ...grants] = result.stdout.split("\n").filter(Boolean);
@@ -185,8 +196,7 @@ export async function backupAccount(host: Host, params: AgentOpParams<"backup.ac
       ...tags(username, run, "database", [`db:${database}`]),
       "--stdin-filename", databasePath(username, database),
       "--stdin-from-command", "--",
-      "mysqldump", "--protocol=socket", "-uroot", "--single-transaction", "--quick", "--routines", "--triggers", "--events",
-      "--hex-blob", "--default-character-set=utf8mb4", "--set-gtid-purged=OFF", "--no-tablespaces", database,
+      ...dumpCommand(), database,
     ]);
   }
   return { snapshots };
@@ -315,13 +325,17 @@ export async function restoreDatabase(host: Host, repo: ResticRepo, { username, 
   if (!database.startsWith(`${username}_`)) throw new Error("The database does not belong to this account");
   const found = await snapshotFor(repo, snapshot, username, "database");
   if (found.database !== database) throw new Error("That backup belongs to another database");
-  const reset = await host.run("mysql", ["--protocol=socket", "-uroot", "-N", "-B"], {
-    stdin: `DROP DATABASE IF EXISTS \`${database}\`;\nCREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;\n`,
+  const reset = await host.run(dbClient(), ["--protocol=socket", "-uroot", "-N", "-B"], {
+    stdin: `DROP DATABASE IF EXISTS \`${database}\`;\nCREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE ${defaultCollation()};\n`,
   });
   if (reset.code !== 0) throw new Error(`MySQL failed: ${tail(reset.stderr)}`);
   const resticBin = Bun.which("restic", { PATH: BASE_PATH }) ?? "restic";
+  const toolEnv = { PATH: BASE_PATH, HOME: "/root", LC_ALL: "C" };
+  const fix = collationFix();
   await pipe(
     { cmd: [resticBin, "dump", found.id, databasePath(username, database)], env: resticEnv(repo) },
-    { cmd: ["mysql", "--protocol=socket", "-uroot", "--one-database", "--default-character-set=utf8mb4", database], env: { PATH: BASE_PATH, HOME: "/root", LC_ALL: "C" } },
+    { cmd: [dbClient(), "--protocol=socket", "-uroot", "--one-database", "--default-character-set=utf8mb4", database], env: toolEnv },
+    // A copy made on MySQL loaded into MariaDB (a migration): its collations are translated on the way.
+    fix.length > 0 ? { cmd: ["sed", "-E", ...fix], env: toolEnv } : undefined,
   );
 }

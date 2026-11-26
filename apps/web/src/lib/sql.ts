@@ -65,10 +65,11 @@ export function columnDefinition(spec: ColumnSpec): string {
   return parts.join(" ");
 }
 
+/** Without a charset: the table takes the database's (utf8mb4 with the collation of MySQL or MariaDB). */
 export function createTableSql(table: string, columns: ColumnSpec[], primary: string[], comment: string): string {
   const lines = columns.map((column) => `  ${columnDefinition(column)}`);
   if (primary.length > 0) lines.push(`  PRIMARY KEY (${primary.map(quoteName).join(", ")})`);
-  return `CREATE TABLE ${quoteName(table.trim())} (\n${lines.join(",\n")}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci${comment.trim() ? ` COMMENT=${quoteLiteral(comment.trim())}` : ""}`;
+  return `CREATE TABLE ${quoteName(table.trim())} (\n${lines.join(",\n")}\n) ENGINE=InnoDB${comment.trim() ? ` COMMENT=${quoteLiteral(comment.trim())}` : ""}`;
 }
 
 export type ColumnPosition = { kind: "end" } | { kind: "first" } | { kind: "after"; column: string };

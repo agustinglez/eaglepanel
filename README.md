@@ -48,6 +48,36 @@ sudo bash deploy/install.sh --firewall cloudflare
 
 More options in [Installer options and updates](#installer-options-and-updates).
 
+## Minimum requirements
+
+| | Minimum | Recommended |
+|---|---|---|
+| CPU | 1 vCPU | 2 vCPU (builds of apps) |
+| RAM | 1 GB | 2 GB with mail |
+| Free disk on `/` | 5 GB (3 if the server already has swap) | 20 GB or more, depending on the sites |
+| Network | a public IPv4 | IPv4 and IPv6 |
+
+- A fresh server: as `root` (or with `sudo`), with systemd, Linux 5.10 or later, and ports 80 and 443 free. It refuses to install over CyberPanel, or with firewalld active.
+- With less than 8 GB of RAM and no swap, the installer adds a 2 GB swap file: a cushion for peaks (an app build, a large import), so the kernel does not kill the database when RAM runs out for a moment.
+- The software takes about 2 GB of disk; the rest is for the sites, their databases and mail.
+
+Disk per part, approximate (measured on Ubuntu 26.04):
+
+| Part | Disk |
+|---|---|
+| Panel (`/opt/eaglepanel`) | ~280 MB |
+| OpenLiteSpeed and PHP 8.5 | ~190 MB |
+| Bun image for the apps (Podman) | ~390 MB |
+| MySQL or MariaDB | ~250 MB |
+| Mail (optional): Stalwart 149 MB, lego 41 MB, Roundcube 35 MB | ~225 MB |
+| Bun 103 MB and restic 21 MB | ~125 MB |
+| apt's cache from the installation | ~260 MB |
+| **Total** | **~1.7 GB** |
+| Swap file, when it is created | 2 GB |
+- Mail: the provider must allow outgoing port 25, and the IP needs reverse DNS (PTR) pointing to the server's mail name.
+
+What it uses, measured on a server with a few sites: the panel ~160 MB, OpenLiteSpeed and PHP ~120 MB, the database ~115 MB with MariaDB or ~135 MB with MySQL (with the installer's memory settings), mail (Stalwart) ~135 MB. With everything installed the whole server used about 850 MB with MySQL's own defaults; the memory settings take about 150 MB off that, and without mail it is about 135 MB less.
+
 ## Supported systems
 
 The server where EaglePanel is installed:
